@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.env
+# never commit cached tokens
+token-cache.json
+*.log
+run-tunnel.sh
+# your NixOS system flake lives here for editing but isn't part of this repo
+system-flake.nix

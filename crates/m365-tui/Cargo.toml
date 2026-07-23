@@ -1,0 +1,22 @@
+[package]
+name = "m365-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified terminal client for Outlook and Microsoft Teams over Microsoft Graph."
+
+[[bin]]
+name = "m365"
+path = "src/main.rs"
+
+[dependencies]
+m365-core = { path = "../m365-core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util.workspace = true

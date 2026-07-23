@@ -1,0 +1,22 @@
+[package]
+name = "m365-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared engine for the M365 TUI: auth, Microsoft Graph client, models, subscriptions, event bus."
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+directories.workspace = true
+dotenvy.workspace = true
+redis.workspace = true
+futures-util.workspace = true

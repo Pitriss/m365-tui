@@ -1,0 +1,54 @@
+# Real-time infrastructure for the M365 TUI.
+#
+#   redis       message bus between the webhook and the TUI (TUI runs on the host)
+#   webhook     receives Graph change notifications, publishes them to Redis
+#   cloudflared tunnel giving the webhook a public HTTPS hostname (no open ports)
+#
+# The TUI itself is NOT in here — it's an interactive terminal app you run on the
+# host; it connects to Redis on localhost:6379.
+#
+# Values come from the repo-root .env (see .env.example).
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    container_name: m365-tui-redis
+    ports:
+      - "127.0.0.1:6379:6379"   # host access for the TUI
+
+  webhook:
+    build:
+      context: .
+      dockerfile: crates/webhook/Dockerfile
+    restart: unless-stopped
+    environment:
+      M365_REDIS_URL: "redis://redis:6379"
+      M365_CLIENT_STATE: "${M365_CLIENT_STATE}"
+      WEBHOOK_BIND: "0.0.0.0:8080"
+      RUST_LOG: "info"
+    container_name: m365-tui-webhook
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"   # optional: local handshake testing
+    depends_on:
+      - redis
+
+  # Named tunnel (recommended): create a tunnel in the Cloudflare Zero Trust
+  # dashboard, route a hostname -> http://webhook:8080, and paste its token as
+  # CLOUDFLARE_TUNNEL_TOKEN in .env. That hostname is your M365_TUNNEL_BASE_URL.
+  #
+  # For a throwaway dev URL instead, comment out the token line and use:
+  #   command: tunnel --no-autoupdate --url http://webhook:8080
+  # then read the printed https://*.trycloudflare.com host from the logs.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    container_name: m365-tui-tunnel
+    env_file:
+      - .env
+    depends_on:
+      - webhook

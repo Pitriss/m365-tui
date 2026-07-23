@@ -1,0 +1,46 @@
+//! Teams team/channel endpoints.
+
+use anyhow::Result;
+use serde_json::json;
+
+use crate::graph::GraphClient;
+use crate::models::{Channel, ChatMessage, Team};
+
+/// Teams the signed-in user has joined.
+pub async fn joined_teams(graph: &GraphClient) -> Result<Vec<Team>> {
+    graph.get_collection("me/joinedTeams?$select=id,displayName,description").await
+}
+
+/// Channels within a team.
+pub async fn list_channels(graph: &GraphClient, team_id: &str) -> Result<Vec<Channel>> {
+    graph
+        .get_collection(&format!("teams/{team_id}/channels?$select=id,displayName,description"))
+        .await
+}
+
+/// Top-level messages in a channel (replies are fetched separately by Graph).
+pub async fn list_messages(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    top: u32,
+) -> Result<Vec<ChatMessage>> {
+    let path = format!("teams/{team_id}/channels/{channel_id}/messages?$top={top}");
+    graph.get_page(&path).await
+}
+
+/// Post a plain-text message to a channel.
+pub async fn send_message(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    text: &str,
+) -> Result<ChatMessage> {
+    let payload = json!({ "body": { "contentType": "text", "content": text } });
+    graph
+        .post_json(
+            &format!("teams/{team_id}/channels/{channel_id}/messages"),
+            &payload,
+        )
+        .await
+}

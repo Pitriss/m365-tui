@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/m365-core",
+    "crates/m365-tui",
+    "crates/webhook",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["rootHytx"]
+
+# Shared dependency versions. Minor versions are pinned so the crate APIs match
+# the code in this repo even as newer releases land in the registry.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+directories = "5"
+dotenvy = "0.15"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio"] }
+futures-util = "0.3"
+
+# Keep debug builds snappy; the TUI is I/O-bound anyway.
+[profile.dev]
+opt-level = 0

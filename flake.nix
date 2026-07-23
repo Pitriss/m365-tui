@@ -1,0 +1,91 @@
+{
+  description = "m365-tui — unified terminal client for Outlook and Microsoft Teams over Microsoft Graph";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs =
+    { self, nixpkgs }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
+      lib = pkgs.lib;
+
+      # Only the source Cargo needs — never copy target/, .git, .env, logs.
+      src = lib.cleanSourceWith {
+        src = ./.;
+        filter =
+          path: type:
+          let
+            base = baseNameOf path;
+          in
+          base != "target"
+          && base != ".git"
+          && base != ".direnv"
+          && base != ".env"
+          && !(lib.hasSuffix ".log" base);
+      };
+
+      common = {
+        version = "0.1.0";
+        inherit src;
+        cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        # reqwest uses rustls, so no OpenSSL is needed at build or runtime.
+        doCheck = false;
+      };
+
+      mkBin =
+        { pname, cratePkg, description, mainProgram }:
+        pkgs.rustPlatform.buildRustPackage (
+          common
+          // {
+            inherit pname;
+            cargoBuildFlags = [
+              "-p"
+              cratePkg
+            ];
+            meta = {
+              inherit description mainProgram;
+              license = lib.licenses.mit;
+              platforms = lib.platforms.linux;
+            };
+          }
+        );
+    in
+    {
+      packages.${system} = rec {
+        m365 = mkBin {
+          pname = "m365-tui";
+          cratePkg = "m365-tui";
+          description = "Unified TUI for Outlook and Microsoft Teams";
+          mainProgram = "m365";
+        };
+
+        m365-webhook = mkBin {
+          pname = "m365-webhook";
+          cratePkg = "webhook";
+          description = "Microsoft Graph change-notification receiver for m365-tui";
+          mainProgram = "m365-webhook";
+        };
+
+        default = m365;
+      };
+
+      # `nix develop` gives a working Rust toolchain (nixpkgs, not the broken
+      # rustup one on this host).
+      devShells.${system}.default = pkgs.mkShell {
+        packages = with pkgs; [
+          rustc
+          cargo
+          rustfmt
+          clippy
+          pkg-config
+        ];
+        RUST_BACKTRACE = "1";
+      };
+
+      formatter.${system} = pkgs.nixfmt-rfc-style;
+    };
+}
