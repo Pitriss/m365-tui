@@ -14,6 +14,7 @@ use m365_core::models::{
 use m365_core::{calendar, chats, channels, mail, Session};
 use tokio::sync::mpsc;
 
+use crate::content;
 use crate::navigation;
 
 /// Messages sent from background tasks to the UI loop.
@@ -106,6 +107,8 @@ pub struct OutlookState {
     /// Guards against firing multiple "load more" requests at once.
     pub loading_more: bool,
     pub reading: Option<MailMessage>,
+    /// Cached Markdown of the open message body (HTML→md done once, not per frame).
+    pub reading_md: Option<String>,
     pub calendar: Vec<CalEvent>,
 }
 
@@ -118,6 +121,8 @@ pub struct TeamsState {
     pub channels: Vec<m365_core::models::Channel>,
     pub channel_sel: usize,
     pub messages: Vec<ChatMessage>,
+    /// Cached Markdown per message, index-aligned with `messages`.
+    pub messages_md: Vec<String>,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: String,
@@ -135,6 +140,7 @@ impl Default for TeamsState {
             channels: Vec::new(),
             channel_sel: 0,
             messages: Vec::new(),
+            messages_md: Vec::new(),
             open_chat_id: None,
             open_channel: None,
             composer: String::new(),
@@ -399,7 +405,17 @@ impl App {
                 }
                 self.outlook.messages_next = next;
             }
-            AppMessage::MessageBody(m) => self.outlook.reading = Some(m),
+            AppMessage::MessageBody(m) => {
+                let (ct, raw) = match &m.body {
+                    Some(b) => (
+                        b.content_type.as_deref(),
+                        b.content.clone().unwrap_or_default(),
+                    ),
+                    None => (Some("text"), m.body_preview.clone().unwrap_or_default()),
+                };
+                self.outlook.reading_md = Some(content::body_to_markdown(ct, &raw));
+                self.outlook.reading = Some(m);
+            }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
             AppMessage::Chats(c) => {
                 self.teams.chats = c;
@@ -407,7 +423,7 @@ impl App {
             }
             AppMessage::ChatMessages { chat_id, messages } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
-                    self.teams.messages = messages;
+                    self.set_teams_messages(messages);
                 }
             }
             AppMessage::Teams(t) => self.teams.teams = t,
@@ -423,7 +439,7 @@ impl App {
                 messages,
             } => {
                 if self.teams.open_channel.as_ref() == Some(&(team_id, channel_id)) {
-                    self.teams.messages = messages;
+                    self.set_teams_messages(messages);
                 }
             }
             AppMessage::Done(s) => {
@@ -466,6 +482,19 @@ impl App {
             }
             ChangeKind::Other => {}
         }
+    }
+
+    /// Set the Teams conversation messages and pre-render their Markdown once
+    /// (HTML→md is the expensive part; keep it off the render path).
+    fn set_teams_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.teams.messages_md = messages
+            .iter()
+            .map(|m| {
+                let ct = m.body.as_ref().and_then(|b| b.content_type.as_deref());
+                content::body_to_markdown(ct, &m.text())
+            })
+            .collect();
+        self.teams.messages = messages;
     }
 
     fn refresh_current(&mut self) {
@@ -695,6 +724,7 @@ impl App {
                     self.teams.open_chat_id = Some(id.clone());
                     self.teams.open_channel = None;
                     self.teams.messages.clear();
+                    self.teams.messages_md.clear();
                     self.load_chat_messages(id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -713,6 +743,7 @@ impl App {
                     self.teams.open_channel = Some((team_id.clone(), ch_id.clone()));
                     self.teams.open_chat_id = None;
                     self.teams.messages.clear();
+                    self.teams.messages_md.clear();
                     self.load_channel_messages(team_id, ch_id);
                     self.teams.focus = TeamsFocus::Messages;
                 }

@@ -12,6 +12,7 @@ use crate::app::{
     filter_commands, App, Compose, ComposeKind, Overlay, OutlookFocus, Screen, TeamsFocus,
     TeamsMode,
 };
+use crate::content;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -156,14 +157,8 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             kv("Date", &m.received_date_time.clone().unwrap_or_default()),
             Line::raw(""),
         ];
-        let body = m
-            .body
-            .as_ref()
-            .and_then(|b| b.content.clone())
-            .or_else(|| m.body_preview.clone())
-            .unwrap_or_default();
-        for l in strip_html(&body).lines() {
-            lines.push(Line::raw(l.to_string()));
+        if let Some(md) = &app.outlook.reading_md {
+            lines.extend(content::markdown_to_text(md).lines);
         }
         Paragraph::new(lines).wrap(Wrap { trim: false })
     } else {
@@ -234,7 +229,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(cols[1]);
 
     let mut lines: Vec<Line> = Vec::new();
-    for m in &app.teams.messages {
+    for (i, m) in app.teams.messages.iter().enumerate() {
         if m.deleted_date_time.is_some() {
             continue;
         }
@@ -250,8 +245,13 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(ts.to_string(), Style::default().fg(DIM)),
         ]));
-        for l in strip_html(&m.text()).lines() {
-            lines.push(Line::raw(format!("  {l}")));
+        if let Some(md) = app.teams.messages_md.get(i) {
+            // Indent each rendered line two spaces under the author.
+            for line in content::markdown_to_text(md).lines {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(line.spans);
+                lines.push(Line::from(spans));
+            }
         }
     }
     if lines.is_empty() {
@@ -488,27 +488,6 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
-}
-
-/// Very small HTML-to-text: drop tags and decode a few common entities. Good
-/// enough for reading mail/messages in a terminal.
-fn strip_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
 }
 
 fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
