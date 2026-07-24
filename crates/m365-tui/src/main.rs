@@ -27,6 +27,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+/// How often to poll the server to refresh the current view.
+const POLL_SECONDS: u64 = 20;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -79,16 +82,31 @@ async fn run_tui(session: Session) -> Result<()> {
     let (tx, mut app_rx) = mpsc::channel::<AppMessage>(256);
     let (change_tx, mut change_rx) = mpsc::channel::<ChangeEvent>(256);
 
-    // Real-time: only if a tunnel URL is configured. Otherwise the app runs in
-    // poll/refresh mode (still fully functional, just not push-driven).
+    // Real-time push: only if a tunnel URL is configured.
     if session.config.notification_url().is_some() {
         spawn_realtime(&session, change_tx);
     } else {
         let _ = tx
-            .send(AppMessage::Status(
-                "poll mode (no M365_TUNNEL_BASE_URL set — real-time push disabled)".into(),
-            ))
+            .send(AppMessage::Status(format!(
+                "poll mode — refreshing every {POLL_SECONDS}s (set M365_TUNNEL_BASE_URL for instant push)"
+            )))
             .await;
+    }
+
+    // Periodic poll so the current view refreshes from the server regardless of
+    // whether push is configured.
+    {
+        let poll_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(POLL_SECONDS));
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                if poll_tx.send(AppMessage::Poll).await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     let mut app = App::new(session, tx);

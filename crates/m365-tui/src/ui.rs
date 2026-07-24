@@ -9,10 +9,8 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, App, Compose, ComposeKind, Overlay, OutlookFocus, Screen, TeamsFocus,
-    TeamsMode,
+    filter_commands, App, Compose, Overlay, OutlookFocus, Screen, TeamsFocus, TeamsMode,
 };
-use crate::content;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -50,12 +48,17 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!(" {name} "), Style::default().fg(DIM))
         }
     };
+    let sync = match &app.last_sync {
+        Some(t) => format!("⟳ synced {t}"),
+        None => "⟳ syncing…".to_string(),
+    };
     let line = Line::from(vec![
         tab("Outlook (F2)", app.screen == Screen::Outlook),
         Span::raw("  "),
         tab("Teams (F2)", app.screen == Screen::Teams),
         Span::raw("   "),
-        Span::styled("Ctrl+P palette · ? help · q quit", Style::default().fg(DIM)),
+        Span::styled("Ctrl+P palette · ? help · q quit   ", Style::default().fg(DIM)),
+        Span::styled(sync, Style::default().fg(Color::Green)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -157,12 +160,12 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             kv("Date", &m.received_date_time.clone().unwrap_or_default()),
             Line::raw(""),
         ];
-        if let Some(md) = &app.outlook.reading_md {
-            lines.extend(content::markdown_to_text(md).lines);
+        if let Some(body) = &app.outlook.reading_body {
+            lines.extend(body.lines.iter().cloned());
         }
         Paragraph::new(lines).wrap(Wrap { trim: false })
     } else {
-        Paragraph::new("Select a message and press Enter to read.\n\nKeys: c compose · r reply · / search · g calendar · Tab focus")
+        Paragraph::new("Select a message and press Enter to read.\n\nKeys: c compose · r reply · a reply-all · f forward · / search · g calendar · Tab focus")
             .style(Style::default().fg(DIM))
     };
     f.render_widget(
@@ -245,11 +248,11 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(ts.to_string(), Style::default().fg(DIM)),
         ]));
-        if let Some(md) = app.teams.messages_md.get(i) {
+        if let Some(body) = app.teams.messages_rendered.get(i) {
             // Indent each rendered line two spaces under the author.
-            for line in content::markdown_to_text(md).lines {
+            for line in &body.lines {
                 let mut spans = vec![Span::raw("  ")];
-                spans.extend(line.spans);
+                spans.extend(line.spans.iter().cloned());
                 lines.push(Line::from(spans));
             }
         }
@@ -260,10 +263,20 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ));
     }
+    // Clamp the scroll offset so we can't scroll past the content.
+    let total = lines.len() as u16;
+    let scroll = app.teams.msg_scroll.min(total.saturating_sub(1));
+    let focused = app.teams.focus == TeamsFocus::Messages;
+    let title = if focused {
+        "Conversation (j/k scroll)"
+    } else {
+        "Conversation"
+    };
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel_block("Conversation", app.teams.focus == TeamsFocus::Messages)),
+            .scroll((scroll, 0))
+            .block(panel_block(title, focused)),
         right[0],
     );
 
@@ -294,10 +307,11 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Global:  F2 switch app · Ctrl+P palette · ? help · q / Ctrl+C quit\n\
  \n\
  Outlook: Tab cycle panes · j/k move · Enter open · c compose\n\
-          r reply · / search · g calendar\n\
+          r reply · a reply-all · f forward · / search · g calendar\n\
  \n\
- Teams:   Tab cycle panes · j/k move · Enter open · t chats/channels\n\
-          Esc / ← / h back to list · i type message · Enter send\n\
+ Teams:   Tab cycle panes · Enter open · t chats/channels\n\
+          j/k scroll conversation · Esc / ← / h back to list\n\
+          i type message · Enter send\n\
  \n\
  Compose: Tab next field · Ctrl+S send · Esc cancel\n\
  \n\
@@ -374,23 +388,25 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
 fn render_compose(f: &mut Frame, c: &Compose) {
     let area = centered(70, 70, f.area());
     f.render_widget(Clear, area);
-    let is_reply = matches!(c.kind, ComposeKind::ReplyMail { .. });
-    let title = if is_reply { "Reply" } else { "Compose mail" };
-    let block = popup_block(title);
+    let block = popup_block(c.kind.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let constraints = if is_reply {
-        vec![Constraint::Min(0), Constraint::Length(1)]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ]
-    };
+    let fields = c.kind.fields();
+    let show_to = fields.contains(&0);
+    let show_subject = fields.contains(&1);
+
+    // header rows (To/Subject) + "Body:" label + body area + hint line
+    let mut constraints = Vec::new();
+    if show_to {
+        constraints.push(Constraint::Length(1));
+    }
+    if show_subject {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // Body: label
+    constraints.push(Constraint::Min(0)); // body
+    constraints.push(Constraint::Length(1)); // hint
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -404,36 +420,32 @@ fn render_compose(f: &mut Frame, c: &Compose) {
         }
     };
 
-    if is_reply {
-        f.render_widget(
-            Paragraph::new(c.body.clone())
-                .style(cur(2))
-                .wrap(Wrap { trim: false }),
-            rows[0],
-        );
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                "Ctrl+S send · Esc cancel",
-                Style::default().fg(DIM),
-            )),
-            rows[1],
-        );
-    } else {
-        f.render_widget(Paragraph::new(format!("To:      {}", c.to)).style(cur(0)), rows[0]);
-        f.render_widget(Paragraph::new(format!("Subject: {}", c.subject)).style(cur(1)), rows[1]);
-        f.render_widget(Paragraph::new("Body:").style(cur(2)), rows[2]);
-        f.render_widget(
-            Paragraph::new(c.body.clone()).style(cur(2)).wrap(Wrap { trim: false }),
-            rows[3],
-        );
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                "Tab next field · Ctrl+S send · Esc cancel",
-                Style::default().fg(DIM),
-            )),
-            rows[4],
-        );
+    let mut i = 0;
+    if show_to {
+        f.render_widget(Paragraph::new(format!("To:      {}", c.to)).style(cur(0)), rows[i]);
+        i += 1;
     }
+    if show_subject {
+        f.render_widget(
+            Paragraph::new(format!("Subject: {}", c.subject)).style(cur(1)),
+            rows[i],
+        );
+        i += 1;
+    }
+    f.render_widget(Paragraph::new("Body:").style(cur(2)), rows[i]);
+    i += 1;
+    f.render_widget(
+        Paragraph::new(c.body.clone()).style(cur(2)).wrap(Wrap { trim: false }),
+        rows[i],
+    );
+    i += 1;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Tab next field · Ctrl+S send · Esc cancel",
+            Style::default().fg(DIM),
+        )),
+        rows[i],
+    );
 }
 
 // ---------------------------------------------------------------------------

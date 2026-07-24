@@ -12,6 +12,7 @@ use m365_core::models::{
     Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Team, User,
 };
 use m365_core::{calendar, chats, channels, mail, Session};
+use ratatui::text::Text;
 use tokio::sync::mpsc;
 
 use crate::content;
@@ -45,12 +46,21 @@ pub enum AppMessage {
     Done(String),
     /// Result of a cross-navigation request to open a chat by email.
     OpenChat(Option<String>),
+    /// Periodic tick: refresh the current view from the server.
+    Poll,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Outlook,
     Teams,
+}
+
+/// Which kind of reply the user asked for.
+enum ReplyMode {
+    Reply,
+    ReplyAll,
+    Forward,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,9 +92,32 @@ pub enum Overlay {
     Calendar,
 }
 
+#[allow(clippy::enum_variant_names)] // the "Mail" suffix distinguishes from Teams compose
 pub enum ComposeKind {
     NewMail,
     ReplyMail { id: String },
+    ReplyAllMail { id: String },
+    ForwardMail { id: String },
+}
+
+impl ComposeKind {
+    /// Which compose fields are shown/editable: 0 = To, 1 = Subject, 2 = Body.
+    pub fn fields(&self) -> &'static [usize] {
+        match self {
+            ComposeKind::NewMail => &[0, 1, 2],
+            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. } => &[2],
+            ComposeKind::ForwardMail { .. } => &[0, 2],
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self {
+            ComposeKind::NewMail => "Compose mail",
+            ComposeKind::ReplyMail { .. } => "Reply",
+            ComposeKind::ReplyAllMail { .. } => "Reply all",
+            ComposeKind::ForwardMail { .. } => "Forward",
+        }
+    }
 }
 
 pub struct Compose {
@@ -107,8 +140,8 @@ pub struct OutlookState {
     /// Guards against firing multiple "load more" requests at once.
     pub loading_more: bool,
     pub reading: Option<MailMessage>,
-    /// Cached Markdown of the open message body (HTML→md done once, not per frame).
-    pub reading_md: Option<String>,
+    /// Cached styled body of the open message (HTML parsed once, not per frame).
+    pub reading_body: Option<Text<'static>>,
     pub calendar: Vec<CalEvent>,
 }
 
@@ -121,8 +154,10 @@ pub struct TeamsState {
     pub channels: Vec<m365_core::models::Channel>,
     pub channel_sel: usize,
     pub messages: Vec<ChatMessage>,
-    /// Cached Markdown per message, index-aligned with `messages`.
-    pub messages_md: Vec<String>,
+    /// Cached styled body per message, index-aligned with `messages`.
+    pub messages_rendered: Vec<Text<'static>>,
+    /// Line scroll offset for the conversation pane.
+    pub msg_scroll: u16,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: String,
@@ -140,7 +175,8 @@ impl Default for TeamsState {
             channels: Vec::new(),
             channel_sel: 0,
             messages: Vec::new(),
-            messages_md: Vec::new(),
+            messages_rendered: Vec::new(),
+            msg_scroll: 0,
             open_chat_id: None,
             open_channel: None,
             composer: String::new(),
@@ -159,6 +195,8 @@ pub struct App {
     pub overlay: Option<Overlay>,
     pub status: String,
     pub me: Option<User>,
+    /// Wall-clock of the last poll refresh (shown in the tab bar).
+    pub last_sync: Option<String>,
     pub should_quit: bool,
 }
 
@@ -186,6 +224,7 @@ impl App {
             overlay: None,
             status: "loading…".into(),
             me: None,
+            last_sync: None,
             should_quit: false,
         }
     }
@@ -344,6 +383,22 @@ impl App {
         });
     }
 
+    fn reply_all_mail(&self, id: String, comment: String) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            mail::reply_all(&s.graph, &id, &comment).await?;
+            Ok(AppMessage::Done("reply-all sent".into()))
+        });
+    }
+
+    fn forward_mail(&self, id: String, to: Vec<String>, comment: String) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            mail::forward(&s.graph, &id, &to, &comment).await?;
+            Ok(AppMessage::Done("message forwarded".into()))
+        });
+    }
+
     fn open_chat_with_email(&self, email: String) {
         let s = self.session.clone();
         let me_id = self.me.as_ref().map(|m| m.id.clone());
@@ -371,18 +426,27 @@ impl App {
                 self.me = Some(u);
             }
             AppMessage::Folders(f) => {
+                let first_load = self.outlook.folders.is_empty();
                 self.outlook.folders = f;
-                // Prefer Inbox as the initial selection.
-                if let Some(i) = self
-                    .outlook
-                    .folders
-                    .iter()
-                    .position(|f| f.display_name.as_deref() == Some("Inbox"))
-                {
-                    self.outlook.folder_sel = i;
-                }
-                if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
-                    self.load_messages(f.id.clone());
+                if first_load {
+                    // Prefer Inbox as the initial selection, then load it.
+                    if let Some(i) = self
+                        .outlook
+                        .folders
+                        .iter()
+                        .position(|f| f.display_name.as_deref() == Some("Inbox"))
+                    {
+                        self.outlook.folder_sel = i;
+                    }
+                    if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
+                        self.load_messages(f.id.clone());
+                    }
+                } else {
+                    // Refresh (poll): keep the user's selection, just clamp it.
+                    self.outlook.folder_sel = self
+                        .outlook
+                        .folder_sel
+                        .min(self.outlook.folders.len().saturating_sub(1));
                 }
             }
             AppMessage::Messages {
@@ -400,7 +464,11 @@ impl App {
                     };
                 } else {
                     self.outlook.messages = items;
-                    self.outlook.msg_sel = 0;
+                    // Preserve the user's selection across poll refreshes; clamp it.
+                    self.outlook.msg_sel = self
+                        .outlook
+                        .msg_sel
+                        .min(self.outlook.messages.len().saturating_sub(1));
                     self.outlook.loading_more = false;
                 }
                 self.outlook.messages_next = next;
@@ -413,7 +481,7 @@ impl App {
                     ),
                     None => (Some("text"), m.body_preview.clone().unwrap_or_default()),
                 };
-                self.outlook.reading_md = Some(content::body_to_markdown(ct, &raw));
+                self.outlook.reading_body = Some(content::render_body(ct, &raw));
                 self.outlook.reading = Some(m);
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
@@ -457,6 +525,26 @@ impl App {
             AppMessage::OpenChat(None) => {
                 self.status = "that sender isn't a Teams user in your directory".into();
             }
+            AppMessage::Poll => self.poll(),
+        }
+    }
+
+    /// Refresh the current view from the server. Driven by a periodic timer so
+    /// the UI stays live even without the push tunnel.
+    fn poll(&mut self) {
+        self.last_sync = Some(now_hms());
+        // Mail: refresh folder unread counts + the open folder's messages.
+        self.load_folders();
+        if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
+            self.load_messages(f.id.clone());
+        }
+        // Teams: refresh chat list + whichever conversation is open.
+        self.load_chats();
+        if let Some(id) = self.teams.open_chat_id.clone() {
+            self.load_chat_messages(id);
+        }
+        if let Some((t, c)) = self.teams.open_channel.clone() {
+            self.load_channel_messages(t, c);
         }
     }
 
@@ -487,11 +575,11 @@ impl App {
     /// Set the Teams conversation messages and pre-render their Markdown once
     /// (HTML→md is the expensive part; keep it off the render path).
     fn set_teams_messages(&mut self, messages: Vec<ChatMessage>) {
-        self.teams.messages_md = messages
+        self.teams.messages_rendered = messages
             .iter()
             .map(|m| {
                 let ct = m.body.as_ref().and_then(|b| b.content_type.as_deref());
-                content::body_to_markdown(ct, &m.text())
+                content::render_body(ct, &m.text())
             })
             .collect();
         self.teams.messages = messages;
@@ -588,17 +676,9 @@ impl App {
             KeyCode::Char('/') => {
                 self.overlay = Some(Overlay::Search { query: String::new() });
             }
-            KeyCode::Char('r') => {
-                if let Some(m) = self.current_mail() {
-                    self.overlay = Some(Overlay::Compose(Compose {
-                        kind: ComposeKind::ReplyMail { id: m.id.clone() },
-                        to: String::new(),
-                        subject: String::new(),
-                        body: String::new(),
-                        field: 2,
-                    }));
-                }
-            }
+            KeyCode::Char('r') => self.open_reply(ReplyMode::Reply),
+            KeyCode::Char('a') => self.open_reply(ReplyMode::ReplyAll),
+            KeyCode::Char('f') => self.open_reply(ReplyMode::Forward),
             KeyCode::Up | KeyCode::Char('k') => self.outlook_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
             KeyCode::Enter => self.outlook_enter(),
@@ -632,6 +712,7 @@ impl App {
         match self.outlook_focus {
             OutlookFocus::Folders => {
                 if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
+                    self.outlook.msg_sel = 0;
                     self.load_messages(f.id.clone());
                     self.outlook_focus = OutlookFocus::Messages;
                 }
@@ -648,6 +729,26 @@ impl App {
 
     fn current_mail(&self) -> Option<&MailMessage> {
         self.outlook.messages.get(self.outlook.msg_sel)
+    }
+
+    fn open_reply(&mut self, mode: ReplyMode) {
+        let Some(m) = self.current_mail() else {
+            self.status = "select a message first".into();
+            return;
+        };
+        let id = m.id.clone();
+        let (kind, field) = match mode {
+            ReplyMode::Reply => (ComposeKind::ReplyMail { id }, 2),
+            ReplyMode::ReplyAll => (ComposeKind::ReplyAllMail { id }, 2),
+            ReplyMode::Forward => (ComposeKind::ForwardMail { id }, 0),
+        };
+        self.overlay = Some(Overlay::Compose(Compose {
+            kind,
+            to: String::new(),
+            subject: String::new(),
+            body: String::new(),
+            field,
+        }));
     }
 
     fn on_key_teams(&mut self, key: KeyEvent) {
@@ -699,6 +800,15 @@ impl App {
     }
 
     fn teams_move(&mut self, delta: i32) {
+        // In the conversation pane, j/k scroll the messages.
+        if self.teams.focus == TeamsFocus::Messages {
+            self.teams.msg_scroll = if delta > 0 {
+                self.teams.msg_scroll.saturating_add(1)
+            } else {
+                self.teams.msg_scroll.saturating_sub(1)
+            };
+            return;
+        }
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
                 self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams.chats.len());
@@ -724,7 +834,8 @@ impl App {
                     self.teams.open_chat_id = Some(id.clone());
                     self.teams.open_channel = None;
                     self.teams.messages.clear();
-                    self.teams.messages_md.clear();
+                    self.teams.messages_rendered.clear();
+                    self.teams.msg_scroll = 0;
                     self.load_chat_messages(id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -743,7 +854,8 @@ impl App {
                     self.teams.open_channel = Some((team_id.clone(), ch_id.clone()));
                     self.teams.open_chat_id = None;
                     self.teams.messages.clear();
-                    self.teams.messages_md.clear();
+                    self.teams.messages_rendered.clear();
+                    self.teams.msg_scroll = 0;
                     self.load_channel_messages(team_id, ch_id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -834,20 +946,12 @@ impl App {
     }
 
     fn on_key_compose(&mut self, key: KeyEvent, c: &mut Compose) {
-        let is_reply = matches!(c.kind, ComposeKind::ReplyMail { .. });
         match key.code {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.submit_compose(c);
                 return;
             }
-            KeyCode::Tab => {
-                // Replies only have the body field.
-                if is_reply {
-                    c.field = 2;
-                } else {
-                    c.field = (c.field + 1) % 3;
-                }
-            }
+            KeyCode::Tab => c.field = next_field(c.kind.fields(), c.field),
             KeyCode::Backspace => {
                 field_mut(c).pop();
             }
@@ -855,7 +959,7 @@ impl App {
                 if c.field == 2 {
                     field_mut(c).push('\n');
                 } else {
-                    c.field = (c.field + 1) % 3;
+                    c.field = next_field(c.kind.fields(), c.field);
                 }
             }
             KeyCode::Char(ch) => field_mut(c).push(ch),
@@ -877,13 +981,7 @@ impl App {
     fn submit_compose(&mut self, c: &mut Compose) {
         match &c.kind {
             ComposeKind::NewMail => {
-                let to: Vec<String> = c
-                    .to
-                    .split([',', ';', ' '])
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect();
+                let to: Vec<String> = parse_recipients(&c.to);
                 if to.is_empty() {
                     self.status = "add at least one recipient".into();
                     self.overlay = Some(Overlay::Compose(std::mem::replace(
@@ -897,6 +995,18 @@ impl App {
             ComposeKind::ReplyMail { id } => {
                 self.reply_mail(id.clone(), c.body.clone());
             }
+            ComposeKind::ReplyAllMail { id } => {
+                self.reply_all_mail(id.clone(), c.body.clone());
+            }
+            ComposeKind::ForwardMail { id } => {
+                let to: Vec<String> = parse_recipients(&c.to);
+                if to.is_empty() {
+                    self.status = "add at least one recipient to forward to".into();
+                    self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
+                    return;
+                }
+                self.forward_mail(id.clone(), to, c.body.clone());
+            }
         }
         self.overlay = None;
     }
@@ -908,6 +1018,7 @@ impl App {
         }
         let s = self.session.clone();
         self.status = format!("searching \"{query}\"…");
+        self.outlook.msg_sel = 0;
         self.spawn(async move {
             let results = mail::search(&s.graph, &query, 50).await?;
             Ok(AppMessage::Messages {
@@ -946,6 +1057,25 @@ impl App {
             _ => {}
         }
     }
+}
+
+fn now_hms() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Split a comma/semicolon/space-separated recipients string into addresses.
+fn parse_recipients(s: &str) -> Vec<String> {
+    s.split([',', ';', ' '])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Given the allowed field ids and the current one, return the next (wrapping).
+fn next_field(fields: &[usize], current: usize) -> usize {
+    let pos = fields.iter().position(|&f| f == current).unwrap_or(0);
+    fields[(pos + 1) % fields.len()]
 }
 
 fn empty_compose() -> Compose {

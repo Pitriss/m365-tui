@@ -106,3 +106,17 @@ pub async fn reply_all(graph: &GraphClient, id: &str, comment: &str) -> Result<(
         .post_action(&format!("me/messages/{id}/replyAll"), &json!({ "comment": comment }))
         .await
 }
+
+/// Forward a message to new recipients with an optional comment.
+pub async fn forward(graph: &GraphClient, id: &str, to: &[String], comment: &str) -> Result<()> {
+    let recipients: Vec<_> = to
+        .iter()
+        .map(|addr| json!({ "emailAddress": { "address": addr } }))
+        .collect();
+    graph
+        .post_action(
+            &format!("me/messages/{id}/forward"),
+            &json!({ "comment": comment, "toRecipients": recipients }),
+        )
+        .await
+}

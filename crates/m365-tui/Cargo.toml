@@ -20,5 +20,5 @@ chrono.workspace = true
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util.workspace = true
-htmd = "0.5.4"
-pulldown-cmark = "0.13.4"
+html5ever = "0.38"
+markup5ever_rcdom = "0.38"

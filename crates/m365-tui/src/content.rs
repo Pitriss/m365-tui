@@ -1,44 +1,54 @@
 //! Turning Graph message/mail bodies into styled terminal text.
 //!
 //! Both Outlook mail and Teams messages arrive as HTML (or occasionally plain
-//! text). We convert HTML → Markdown once (cached by the caller), then render
-//! that Markdown into a styled ratatui [`Text`] here. Using our own
-//! `pulldown-cmark` walk (rather than the `tui-markdown` crate) keeps us off its
-//! ratatui-0.30 requirement and gives full control over the styling.
+//! text). We render the HTML **directly** to a styled ratatui [`Text`] by
+//! walking the parsed DOM — no Markdown round-trip (that produced escaping and
+//! table artifacts). The result is cached by the caller so parsing happens once,
+//! not every frame.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use html5ever::parse_document;
+use html5ever::tendril::TendrilSink;
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
+const LINK: Color = Color::LightBlue;
 const CODE_FG: Color = Color::Rgb(220, 185, 130);
 const CODE_BG: Color = Color::Rgb(40, 40, 52);
 
-/// Convert a Graph body to Markdown. HTML is converted with `htmd`; anything
-/// else (plain text) is passed through verbatim so stray `*`/`_` aren't
-/// misread as emphasis.
-pub fn body_to_markdown(content_type: Option<&str>, raw: &str) -> String {
+/// Render a Graph body to styled text. HTML is parsed and walked; plain text is
+/// split into lines verbatim.
+pub fn render_body(content_type: Option<&str>, raw: &str) -> Text<'static> {
     let is_html = content_type
         .map(|c| c.eq_ignore_ascii_case("html"))
-        .unwrap_or(false);
+        .unwrap_or_else(|| looks_like_html(raw));
     if is_html {
-        htmd::convert(raw).unwrap_or_else(|_| strip_html(raw))
+        render_html(raw)
     } else {
-        raw.to_string()
+        Text::from(
+            raw.lines()
+                .map(|l| Line::raw(l.to_string()))
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
-/// Render Markdown into styled terminal text.
-pub fn markdown_to_text(md: &str) -> Text<'static> {
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TABLES);
+fn looks_like_html(s: &str) -> bool {
+    let s = s.trim_start();
+    s.starts_with('<') && s.contains('>')
+}
+
+/// Parse HTML and walk the DOM into styled lines.
+pub fn render_html(html: &str) -> Text<'static> {
+    let dom = parse_document(RcDom::default(), Default::default())
+        .from_utf8()
+        .read_from(&mut html.as_bytes())
+        .unwrap_or_default();
 
     let mut r = Renderer::default();
-    for ev in Parser::new_ext(md, opts) {
-        r.event(ev);
-    }
+    r.walk(&dom.document, Style::default());
     r.finish()
 }
 
@@ -46,25 +56,14 @@ pub fn markdown_to_text(md: &str) -> Text<'static> {
 struct Renderer {
     lines: Vec<Line<'static>>,
     spans: Vec<Span<'static>>,
-    /// Inline style stack (top = current); pushed by strong/emphasis/link/…
-    style_stack: Vec<Style>,
-    /// List nesting; `Some(n)` = ordered with next number `n`, `None` = bullet.
-    list_stack: Vec<Option<u64>>,
-    in_code_block: bool,
     blockquote: usize,
-    link_url: Option<String>,
+    list_stack: Vec<Option<u64>>,
+    in_pre: bool,
+    /// Depth of skip-containers (script/style/head) currently open.
+    skip: usize,
 }
 
 impl Renderer {
-    fn cur_style(&self) -> Style {
-        self.style_stack.last().copied().unwrap_or_default()
-    }
-
-    fn push_style(&mut self, f: impl FnOnce(Style) -> Style) {
-        let base = self.cur_style();
-        self.style_stack.push(f(base));
-    }
-
     fn line_has_content(&self) -> bool {
         self.spans.iter().any(|s| !s.content.trim().is_empty())
     }
@@ -74,17 +73,26 @@ impl Renderer {
         self.lines.push(Line::from(spans));
     }
 
-    /// Add a blank separator unless the previous line is already blank.
+    /// Finish the current line (if it has content) and start a fresh one.
+    fn newline(&mut self) {
+        self.flush_line();
+        self.start_block_line();
+    }
+
+    /// Blank separator unless the previous line is already blank/empty.
     fn ensure_blank(&mut self) {
+        if self.line_has_content() {
+            self.flush_line();
+        }
         if let Some(last) = self.lines.last() {
             let blank = last.spans.iter().all(|s| s.content.trim().is_empty());
             if !blank {
                 self.lines.push(Line::from(""));
             }
         }
+        self.start_block_line();
     }
 
-    /// Begin a line with blockquote + list-depth indentation.
     fn start_block_line(&mut self) {
         let mut prefix = String::new();
         for _ in 0..self.blockquote {
@@ -99,93 +107,133 @@ impl Renderer {
         }
     }
 
-    fn event(&mut self, ev: Event) {
-        match ev {
-            Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
-            Event::Text(t) => {
-                if self.in_code_block {
-                    let text = t.to_string();
-                    let mut parts = text.split('\n').peekable();
-                    while let Some(part) = parts.next() {
-                        self.spans
-                            .push(Span::styled(part.to_string(), Style::default().fg(CODE_FG)));
-                        if parts.peek().is_some() {
-                            self.flush_line();
-                            self.start_block_line();
-                            self.spans.push(Span::raw("    "));
-                        }
-                    }
-                } else {
-                    let style = self.cur_style();
-                    self.spans.push(Span::styled(t.to_string(), style));
+    fn push_text(&mut self, raw: &str, style: Style) {
+        if self.skip > 0 {
+            return;
+        }
+        if self.in_pre {
+            let mut parts = raw.split('\n').peekable();
+            while let Some(part) = parts.next() {
+                self.spans
+                    .push(Span::styled(part.to_string(), Style::default().fg(CODE_FG)));
+                if parts.peek().is_some() {
+                    self.newline();
+                    self.spans.push(Span::raw("    "));
                 }
             }
-            Event::Code(t) => {
-                self.spans.push(Span::styled(
-                    format!(" {t} "),
-                    Style::default().fg(CODE_FG).bg(CODE_BG),
-                ));
-            }
-            Event::SoftBreak => {
-                let style = self.cur_style();
+            return;
+        }
+        let mut text = collapse_ws(raw);
+        if text.trim().is_empty() {
+            // Keep a single separating space only if the line already has text.
+            if self.line_has_content() && !self.spans.last().is_some_and(ends_with_space) {
                 self.spans.push(Span::styled(" ", style));
             }
-            Event::HardBreak => {
-                self.flush_line();
-                self.start_block_line();
+            return;
+        }
+        if !self.line_has_content() {
+            text = text.trim_start().to_string();
+        }
+        self.spans.push(Span::styled(text, style));
+    }
+
+    fn walk(&mut self, node: &Handle, style: Style) {
+        match &node.data {
+            NodeData::Document => self.walk_children(node, style),
+            NodeData::Text { contents } => {
+                let text = contents.borrow().to_string();
+                self.push_text(&text, style);
             }
-            Event::Rule => {
+            NodeData::Element { name, attrs, .. } => {
+                let tag = name.local.as_ref().to_ascii_lowercase();
+                self.element(&tag, node, attrs, style);
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_children(&mut self, node: &Handle, style: Style) {
+        for child in node.children.borrow().iter() {
+            self.walk(child, style);
+        }
+    }
+
+    fn element(
+        &mut self,
+        tag: &str,
+        node: &Handle,
+        attrs: &std::cell::RefCell<Vec<html5ever::Attribute>>,
+        style: Style,
+    ) {
+        match tag {
+            "script" | "style" | "head" | "title" | "noscript" => {
+                self.skip += 1;
+                self.walk_children(node, style);
+                self.skip -= 1;
+            }
+            "br" => self.newline(),
+            "hr" => {
                 self.ensure_blank();
                 self.lines
                     .push(Line::styled("─".repeat(40), Style::default().fg(DIM)));
                 self.lines.push(Line::from(""));
             }
-            Event::TaskListMarker(done) => {
-                self.spans
-                    .push(Span::raw(if done { "[x] " } else { "[ ] " }));
-            }
-            // Html / InlineHtml / FootnoteReference / etc. — ignored.
-            _ => {}
-        }
-    }
-
-    fn start(&mut self, tag: Tag) {
-        match tag {
-            Tag::Paragraph => {
-                if self.list_stack.is_empty() {
-                    self.ensure_blank();
-                    self.start_block_line();
-                }
-                // Inside a list item the line is already open from Tag::Item.
-            }
-            Tag::Heading { level, .. } => {
+            "p" | "div" | "section" | "article" | "header" | "footer" | "table" => {
                 self.ensure_blank();
-                self.start_block_line();
-                let hashes = match level {
-                    HeadingLevel::H1 => "# ",
-                    HeadingLevel::H2 => "## ",
-                    HeadingLevel::H3 => "### ",
-                    _ => "#### ",
-                };
-                self.spans
-                    .push(Span::styled(hashes.to_string(), Style::default().fg(ACCENT)));
-                self.push_style(|s| s.fg(ACCENT).add_modifier(Modifier::BOLD));
-            }
-            Tag::BlockQuote(_) => self.blockquote += 1,
-            Tag::CodeBlock(_) => {
+                self.walk_children(node, style);
                 self.ensure_blank();
-                self.in_code_block = true;
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.ensure_blank();
+                let hashes = "#".repeat(tag[1..].parse::<usize>().unwrap_or(1));
+                self.spans
+                    .push(Span::styled(format!("{hashes} "), Style::default().fg(ACCENT)));
+                self.walk_children(node, style.fg(ACCENT).add_modifier(Modifier::BOLD));
+                self.ensure_blank();
+            }
+            "strong" | "b" => self.walk_children(node, style.add_modifier(Modifier::BOLD)),
+            "em" | "i" => self.walk_children(node, style.add_modifier(Modifier::ITALIC)),
+            "u" | "ins" => self.walk_children(node, style.add_modifier(Modifier::UNDERLINED)),
+            "s" | "strike" | "del" => {
+                self.walk_children(node, style.add_modifier(Modifier::CROSSED_OUT))
+            }
+            "code" if !self.in_pre => {
+                // Inline code: render children as code-styled text.
+                self.walk_children(node, style.fg(CODE_FG).bg(CODE_BG));
+            }
+            "pre" => {
+                self.ensure_blank();
+                self.in_pre = true;
                 self.start_block_line();
                 self.spans.push(Span::raw("    "));
+                self.walk_children(node, style);
+                self.in_pre = false;
+                self.ensure_blank();
             }
-            Tag::List(start) => {
+            "blockquote" => {
+                self.ensure_blank();
+                self.blockquote += 1;
+                self.walk_children(node, style.fg(DIM));
+                self.blockquote = self.blockquote.saturating_sub(1);
+                self.ensure_blank();
+            }
+            "ul" => {
                 if self.line_has_content() {
                     self.flush_line();
                 }
-                self.list_stack.push(start);
+                self.list_stack.push(None);
+                self.walk_children(node, style);
+                self.list_stack.pop();
             }
-            Tag::Item => {
+            "ol" => {
+                if self.line_has_content() {
+                    self.flush_line();
+                }
+                self.list_stack.push(Some(1));
+                self.walk_children(node, style);
+                self.list_stack.pop();
+            }
+            "li" => {
                 if self.line_has_content() {
                     self.flush_line();
                 }
@@ -200,54 +248,38 @@ impl Renderer {
                 };
                 self.spans
                     .push(Span::styled(marker, Style::default().fg(ACCENT)));
-            }
-            Tag::Emphasis => self.push_style(|s| s.add_modifier(Modifier::ITALIC)),
-            Tag::Strong => self.push_style(|s| s.add_modifier(Modifier::BOLD)),
-            Tag::Strikethrough => self.push_style(|s| s.add_modifier(Modifier::CROSSED_OUT)),
-            Tag::Link { dest_url, .. } => {
-                self.link_url = Some(dest_url.to_string());
-                self.push_style(|s| s.fg(ACCENT).add_modifier(Modifier::UNDERLINED));
-            }
-            // Images, tables, footnotes, etc. — content flows through as text.
-            _ => {}
-        }
-    }
-
-    fn end(&mut self, tag: TagEnd) {
-        match tag {
-            TagEnd::Paragraph => {
-                if self.list_stack.is_empty() {
-                    self.flush_line();
-                }
-            }
-            TagEnd::Heading(_) => {
-                self.style_stack.pop();
-                self.flush_line();
-            }
-            TagEnd::BlockQuote(_) => self.blockquote = self.blockquote.saturating_sub(1),
-            TagEnd::CodeBlock => {
-                self.flush_line();
-                self.in_code_block = false;
-            }
-            TagEnd::List(_) => {
-                self.list_stack.pop();
-            }
-            TagEnd::Item => {
+                self.walk_children(node, style);
                 if self.line_has_content() {
                     self.flush_line();
                 }
             }
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
-                self.style_stack.pop();
-            }
-            TagEnd::Link => {
-                self.style_stack.pop();
-                if let Some(url) = self.link_url.take() {
-                    self.spans
-                        .push(Span::styled(format!(" ({url})"), Style::default().fg(DIM)));
+            "a" => {
+                let link_style = style.fg(LINK).add_modifier(Modifier::UNDERLINED);
+                self.walk_children(node, link_style);
+                if let Some(href) = attr(attrs, "href") {
+                    if !href.is_empty() && !href.starts_with('#') && !href.starts_with("mailto:") {
+                        self.spans
+                            .push(Span::styled(format!(" ({href})"), Style::default().fg(DIM)));
+                    }
                 }
             }
-            _ => {}
+            "img" => {
+                if let Some(alt) = attr(attrs, "alt") {
+                    if !alt.is_empty() {
+                        self.push_text(&format!("[{alt}]"), style.fg(DIM));
+                    }
+                }
+            }
+            "tr" => {
+                self.walk_children(node, style);
+                self.newline();
+            }
+            "td" | "th" => {
+                self.walk_children(node, style);
+                self.spans.push(Span::styled("  ", Style::default().fg(DIM)));
+            }
+            // Inline/neutral wrappers: keep the current style.
+            _ => self.walk_children(node, style),
         }
     }
 
@@ -255,7 +287,6 @@ impl Renderer {
         if self.line_has_content() {
             self.flush_line();
         }
-        // Trim leading/trailing blank lines.
         while self
             .lines
             .first()
@@ -274,52 +305,78 @@ impl Renderer {
     }
 }
 
-/// Minimal HTML→text fallback if `htmd` conversion fails: drop tags and decode a
-/// few common entities.
-pub fn strip_html(s: &str) -> String {
+fn ends_with_space(s: &Span) -> bool {
+    s.content.ends_with(' ')
+}
+
+fn attr(attrs: &std::cell::RefCell<Vec<html5ever::Attribute>>, name: &str) -> Option<String> {
+    attrs
+        .borrow()
+        .iter()
+        .find(|a| a.name.local.as_ref().eq_ignore_ascii_case(name))
+        .map(|a| a.value.to_string())
+}
+
+/// Collapse runs of ASCII/Unicode whitespace to single spaces (HTML semantics).
+fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
         }
     }
-    out.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn renders_common_markdown_without_panic() {
-        let md = "# Title\n\nSome **bold** and *italic* and `code`.\n\n- one\n- two\n\n> quote\n\n[link](https://example.com)";
-        let text = markdown_to_text(md);
-        assert!(!text.lines.is_empty());
-        // The heading text should be present somewhere.
-        let joined: String = text
-            .lines
+    fn flat(text: &Text) -> String {
+        text.lines
             .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(joined.contains("Title"));
-        assert!(joined.contains("bold"));
-        assert!(joined.contains("example.com"));
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn html_body_becomes_markdown() {
-        let md = body_to_markdown(Some("html"), "<p>Hello <strong>world</strong></p>");
-        assert!(md.contains("world"));
-        // plain text passes through untouched
-        assert_eq!(body_to_markdown(Some("text"), "a * b"), "a * b");
+    fn renders_html_without_tags() {
+        let html = "<div><h2>Hi</h2><p>Some <b>bold</b> and <a href=\"https://x.io\">a link</a>.</p><ul><li>one</li><li>two</li></ul></div>";
+        let text = render_html(html);
+        let s = flat(&text);
+        assert!(s.contains("Hi"));
+        assert!(s.contains("bold"));
+        assert!(s.contains("a link"));
+        assert!(s.contains("https://x.io"));
+        assert!(s.contains("• one"));
+        assert!(!s.contains('<'), "tags leaked: {s}");
+    }
+
+    #[test]
+    fn plain_text_passthrough() {
+        let text = render_body(Some("text"), "line one\nline two * star");
+        assert_eq!(flat(&text), "line one\nline two * star");
+    }
+
+    #[test]
+    fn script_and_style_are_dropped() {
+        let text = render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
+        let s = flat(&text);
+        assert!(s.contains("visible"));
+        assert!(!s.contains("alert"));
+        assert!(!s.contains("color:red"));
     }
 }
