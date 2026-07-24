@@ -29,6 +29,22 @@ pub async fn list_messages(
     graph.get_page(&path).await
 }
 
+/// React to a channel message with an emoji (unicode, e.g. "👍").
+pub async fn set_reaction(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    emoji: &str,
+) -> Result<()> {
+    graph
+        .post_action(
+            &format!("teams/{team_id}/channels/{channel_id}/messages/{message_id}/setReaction"),
+            &json!({ "reactionType": emoji }),
+        )
+        .await
+}
+
 /// Post a plain-text message to a channel.
 pub async fn send_message(
     graph: &GraphClient,

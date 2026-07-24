@@ -43,6 +43,21 @@ pub async fn send_message(graph: &GraphClient, chat_id: &str, text: &str) -> Res
         .await
 }
 
+/// React to a chat message with an emoji (unicode, e.g. "👍").
+pub async fn set_reaction(
+    graph: &GraphClient,
+    chat_id: &str,
+    message_id: &str,
+    emoji: &str,
+) -> Result<()> {
+    graph
+        .post_action(
+            &format!("chats/{chat_id}/messages/{message_id}/setReaction"),
+            &json!({ "reactionType": emoji }),
+        )
+        .await
+}
+
 /// Create (or return existing) 1:1 chat with another user by their id.
 pub async fn create_one_on_one(
     graph: &GraphClient,

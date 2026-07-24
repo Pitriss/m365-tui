@@ -281,6 +281,15 @@ pub struct ChatMessage {
     pub message_type: Option<String>,
     #[serde(default)]
     pub deleted_date_time: Option<String>,
+    #[serde(default)]
+    pub reactions: Vec<MessageReaction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReaction {
+    #[serde(default)]
+    pub reaction_type: Option<String>,
 }
 
 impl ChatMessage {
@@ -297,6 +306,37 @@ impl ChatMessage {
             .as_ref()
             .and_then(|b| b.content.clone())
             .unwrap_or_default()
+    }
+
+    /// A short display of reactions, e.g. `👍 ❤️`. Maps the classic Teams
+    /// reaction names to emoji; unicode reactions pass through as-is.
+    pub fn reactions_summary(&self) -> Option<String> {
+        if self.reactions.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for r in &self.reactions {
+            let ty = r.reaction_type.as_deref().unwrap_or("");
+            let e = match ty {
+                "like" => "👍",
+                "heart" => "❤️",
+                "laugh" => "😆",
+                "surprised" => "😮",
+                "sad" => "😢",
+                "angry" => "😠",
+                other => other,
+            };
+            if !e.is_empty() {
+                out.push_str(e);
+                out.push(' ');
+            }
+        }
+        let out = out.trim_end().to_string();
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 }
 

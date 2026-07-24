@@ -90,7 +90,12 @@ pub enum Overlay {
     Search { query: String },
     Compose(Compose),
     Calendar,
+    /// Emoji reaction picker for the selected Teams message.
+    React,
 }
+
+/// Emoji reactions offered in the picker, keyed 1-7.
+pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
 
 #[allow(clippy::enum_variant_names)] // the "Mail" suffix distinguishes from Teams compose
 pub enum ComposeKind {
@@ -156,8 +161,8 @@ pub struct TeamsState {
     pub messages: Vec<ChatMessage>,
     /// Cached styled body per message, index-aligned with `messages`.
     pub messages_rendered: Vec<Text<'static>>,
-    /// Line scroll offset for the conversation pane.
-    pub msg_scroll: u16,
+    /// Selected message index in the conversation pane (drives scroll + react).
+    pub msg_sel: usize,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: String,
@@ -176,7 +181,7 @@ impl Default for TeamsState {
             channel_sel: 0,
             messages: Vec::new(),
             messages_rendered: Vec::new(),
-            msg_scroll: 0,
+            msg_sel: 0,
             open_chat_id: None,
             open_channel: None,
             composer: String::new(),
@@ -583,6 +588,10 @@ impl App {
             })
             .collect();
         self.teams.messages = messages;
+        self.teams.msg_sel = self
+            .teams
+            .msg_sel
+            .min(self.teams.messages.len().saturating_sub(1));
     }
 
     fn refresh_current(&mut self) {
@@ -792,6 +801,11 @@ impl App {
                 };
             }
             KeyCode::Char('i') => self.teams.focus = TeamsFocus::Composer,
+            KeyCode::Char('e')
+                if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
+            {
+                self.overlay = Some(Overlay::React);
+            }
             KeyCode::Up | KeyCode::Char('k') => self.teams_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.teams_move(1),
             KeyCode::Enter => self.teams_enter(),
@@ -800,14 +814,24 @@ impl App {
     }
 
     fn teams_move(&mut self, delta: i32) {
-        // In the conversation pane, j/k scroll the messages.
+        // In the conversation pane, j/k move the selected message (skipping
+        // deleted ones); the selection drives both scroll and reactions.
         if self.teams.focus == TeamsFocus::Messages {
-            self.teams.msg_scroll = if delta > 0 {
-                self.teams.msg_scroll.saturating_add(1)
-            } else {
-                self.teams.msg_scroll.saturating_sub(1)
-            };
-            return;
+            let n = self.teams.messages.len() as i32;
+            if n == 0 {
+                return;
+            }
+            let mut i = self.teams.msg_sel as i32;
+            loop {
+                i += delta.signum();
+                if i < 0 || i >= n {
+                    return; // at an edge; keep current selection
+                }
+                if self.teams.messages[i as usize].deleted_date_time.is_none() {
+                    self.teams.msg_sel = i as usize;
+                    return;
+                }
+            }
         }
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
@@ -835,7 +859,7 @@ impl App {
                     self.teams.open_channel = None;
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
-                    self.teams.msg_scroll = 0;
+                    self.teams.msg_sel = 0;
                     self.load_chat_messages(id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -855,7 +879,7 @@ impl App {
                     self.teams.open_chat_id = None;
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
-                    self.teams.msg_scroll = 0;
+                    self.teams.msg_sel = 0;
                     self.load_channel_messages(team_id, ch_id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -883,6 +907,27 @@ impl App {
         }
     }
 
+    /// React to the currently-selected message with `emoji`.
+    fn react_selected(&mut self, emoji: &str) {
+        let Some(msg) = self.teams.messages.get(self.teams.msg_sel) else {
+            return;
+        };
+        let message_id = msg.id.clone();
+        let emoji = emoji.to_string();
+        let s = self.session.clone();
+        if let Some(chat_id) = self.teams.open_chat_id.clone() {
+            self.spawn(async move {
+                chats::set_reaction(&s.graph, &chat_id, &message_id, &emoji).await?;
+                Ok(AppMessage::Done("reaction added".into()))
+            });
+        } else if let Some((team_id, channel_id)) = self.teams.open_channel.clone() {
+            self.spawn(async move {
+                channels::set_reaction(&s.graph, &team_id, &channel_id, &message_id, &emoji).await?;
+                Ok(AppMessage::Done("reaction added".into()))
+            });
+        }
+    }
+
     // -- overlay input -----------------------------------------------------
 
     fn on_key_overlay(&mut self, key: KeyEvent) {
@@ -895,6 +940,17 @@ impl App {
         match overlay {
             Some(Overlay::Help) | Some(Overlay::Calendar) => {
                 // any key besides Esc closes
+            }
+            Some(Overlay::React) => {
+                if let KeyCode::Char(c @ '1'..='7') = key.code {
+                    let idx = (c as u8 - b'1') as usize;
+                    if let Some(emoji) = REACTIONS.get(idx) {
+                        self.react_selected(emoji);
+                    }
+                    // picked -> close (overlay already taken)
+                } else {
+                    self.overlay = Some(Overlay::React); // ignore other keys
+                }
             }
             Some(Overlay::Search { mut query }) => match key.code {
                 KeyCode::Enter => {

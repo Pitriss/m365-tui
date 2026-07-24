@@ -231,30 +231,50 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(cols[1]);
 
+    let focused = app.teams.focus == TeamsFocus::Messages;
     let mut lines: Vec<Line> = Vec::new();
+    // Line index where each message starts, so we can scroll the selected one
+    // to the top of the pane.
+    let mut msg_starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
     for (i, m) in app.teams.messages.iter().enumerate() {
+        msg_starts.push(lines.len());
+        let selected = focused && i == app.teams.msg_sel;
+        let marker = if selected { "▶ " } else { "  " };
+        let author_style = Style::default()
+            .fg(if selected { Color::Cyan } else { Color::LightGreen })
+            .add_modifier(Modifier::BOLD);
+
         if m.deleted_date_time.is_some() {
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::styled("(message deleted)", Style::default().fg(DIM)),
+            ]));
             continue;
         }
+
         let ts = m
             .created_date_time
             .as_deref()
             .map(|t| t.split('T').nth(1).unwrap_or(t).trim_end_matches('Z'))
             .unwrap_or("");
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", m.author()),
-                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(marker, Style::default().fg(ACCENT)),
+            Span::styled(format!("{} ", m.author()), author_style),
             Span::styled(ts.to_string(), Style::default().fg(DIM)),
         ]));
         if let Some(body) = app.teams.messages_rendered.get(i) {
-            // Indent each rendered line two spaces under the author.
+            // Indent each rendered line four spaces under the author.
             for line in &body.lines {
-                let mut spans = vec![Span::raw("  ")];
+                let mut spans = vec![Span::raw("    ")];
                 spans.extend(line.spans.iter().cloned());
                 lines.push(Line::from(spans));
             }
+        }
+        if let Some(reactions) = m.reactions_summary() {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(reactions, Style::default().fg(DIM)),
+            ]));
         }
     }
     if lines.is_empty() {
@@ -263,12 +283,15 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ));
     }
-    // Clamp the scroll offset so we can't scroll past the content.
+    // Scroll so the selected message sits near the top of the pane.
     let total = lines.len() as u16;
-    let scroll = app.teams.msg_scroll.min(total.saturating_sub(1));
-    let focused = app.teams.focus == TeamsFocus::Messages;
+    let scroll = msg_starts
+        .get(app.teams.msg_sel)
+        .map(|&s| s as u16)
+        .unwrap_or(0)
+        .min(total.saturating_sub(1));
     let title = if focused {
-        "Conversation (j/k scroll)"
+        "Conversation (j/k select · e react)"
     } else {
         "Conversation"
     };
@@ -310,7 +333,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           r reply · a reply-all · f forward · / search · g calendar\n\
  \n\
  Teams:   Tab cycle panes · Enter open · t chats/channels\n\
-          j/k scroll conversation · Esc / ← / h back to list\n\
+          j/k select message · e react · Esc / ← / h back to list\n\
           i type message · Enter send\n\
  \n\
  Compose: Tab next field · Ctrl+S send · Esc cancel\n\
@@ -382,6 +405,21 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             );
         }
         Overlay::Compose(c) => render_compose(f, c),
+        Overlay::React => {
+            let area = centered(50, 24, f.area());
+            f.render_widget(Clear, area);
+            let picks: String = crate::app::REACTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("{}  {e}   ", i + 1))
+                .collect();
+            f.render_widget(
+                Paragraph::new(format!("React to the selected message:\n\n{picks}\n\nPress 1-7 · Esc cancel"))
+                    .wrap(Wrap { trim: false })
+                    .block(popup_block("Add reaction")),
+                area,
+            );
+        }
     }
 }
 
