@@ -44,10 +44,11 @@ verifies `clientState`, and republishes a small "something changed" signal.
 
 ## Prerequisites
 
-- Rust toolchain. **On this NixOS machine** the rustup toolchain is broken, so
-  use the provided dev shell (nixpkgs `rustc` + `cargo`):
+- Rust toolchain. On NixOS the rustup toolchain may be broken, so use the flake
+  dev shell (nixpkgs `rustc` + `cargo`):
   ```sh
-  nix-shell            # or: nix-shell --run 'cargo build'
+  nix develop                      # drop into a shell with the toolchain
+  nix develop -c cargo build       # or run a single command in it
   ```
 - Docker + Docker Compose (only for real-time push).
 - A **work/school Microsoft 365 account** (Teams messaging APIs don't work with
@@ -64,8 +65,8 @@ In the [Entra admin center](https://entra.microsoft.com) → *App registrations*
 3. **API permissions** → *Microsoft Graph* → *Delegated*, add:
    `User.Read`, `People.Read`, `Mail.ReadWrite`, `Mail.Send`,
    `Calendars.ReadWrite`, `Chat.ReadWrite`, `ChannelMessage.Send`,
-   `ChannelMessage.Read.All`, `Presence.Read.All` (and `offline_access`,
-   `openid`, `profile`).
+   `ChannelMessage.Read.All`, `Presence.Read.All`, `Presence.ReadWrite`
+   (and `offline_access`, `openid`, `profile`).
    - **`ChannelMessage.Read.All` requires admin consent.** If you're not an
      admin, click *Grant admin consent* is unavailable — ask IT, or start
      Outlook-only by trimming scopes (see `M365_SCOPES` in `.env`).
@@ -88,13 +89,13 @@ fully functional, just not instant.
 ## 3. Build & run
 
 ```sh
-nix-shell --run 'cargo build --release'
+nix develop -c cargo build --release
 
 # Auth smoke test (device-code login, prints your identity):
-nix-shell --run 'cargo run -p m365-tui -- whoami'
+nix develop -c cargo run -p m365-tui -- whoami
 
 # Launch the TUI:
-nix-shell --run 'cargo run -p m365-tui'
+nix develop -c cargo run -p m365-tui
 ```
 
 ### Via the Nix flake
@@ -123,7 +124,7 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 
 | Scope   | Keys |
 |---------|------|
-| Global  | `F2` switch app · `Ctrl+P` command palette · `?` help · `q`/`Ctrl+C` quit |
+| Global  | `F2` switch app · `Ctrl+P` command palette · `p` set presence · `?` help · `q`/`Ctrl+C` quit |
 | Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
 | Compose | `Tab` next field · `Ctrl+S` send · `Esc` cancel |
@@ -171,7 +172,7 @@ commented `command:` in `docker-compose.yml`, then read the printed
 ## Tests
 
 ```sh
-nix-shell --run 'cargo test --workspace'
+nix develop -c cargo test --workspace
 ```
 
 ## Releases

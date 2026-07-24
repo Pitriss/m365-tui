@@ -9,9 +9,9 @@ use std::future::Future;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Team, User,
+    Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
 };
-use m365_core::{calendar, chats, channels, mail, Session};
+use m365_core::{calendar, chats, channels, mail, people, Session};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
@@ -46,6 +46,8 @@ pub enum AppMessage {
     Done(String),
     /// Result of a cross-navigation request to open a chat by email.
     OpenChat(Option<String>),
+    /// The signed-in user's presence (status), for the tab-bar indicator.
+    Presence(Presence),
     /// Periodic tick: refresh the current view from the server.
     Poll,
 }
@@ -92,10 +94,22 @@ pub enum Overlay {
     Calendar,
     /// Emoji reaction picker for the selected Teams message.
     React,
+    /// Presence (status) picker for the signed-in user.
+    Presence,
 }
 
 /// Emoji reactions offered in the picker, keyed 1-7.
 pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
+
+/// Presence options: (label, availability, activity). Keyed 1-6.
+pub const PRESENCE_OPTIONS: &[(&str, &str, &str)] = &[
+    ("Available", "Available", "Available"),
+    ("Busy", "Busy", "Busy"),
+    ("Do not disturb", "DoNotDisturb", "DoNotDisturb"),
+    ("Be right back", "BeRightBack", "BeRightBack"),
+    ("Away", "Away", "Away"),
+    ("Appear offline", "Offline", "OffWork"),
+];
 
 #[allow(clippy::enum_variant_names)] // the "Mail" suffix distinguishes from Teams compose
 pub enum ComposeKind {
@@ -200,6 +214,8 @@ pub struct App {
     pub overlay: Option<Overlay>,
     pub status: String,
     pub me: Option<User>,
+    /// The user's current presence (shown in the tab bar).
+    pub my_presence: Option<Presence>,
     /// Wall-clock of the last poll refresh (shown in the tab bar).
     pub last_sync: Option<String>,
     pub should_quit: bool,
@@ -229,6 +245,7 @@ impl App {
             overlay: None,
             status: "loading…".into(),
             me: None,
+            my_presence: None,
             last_sync: None,
             should_quit: false,
         }
@@ -237,6 +254,7 @@ impl App {
     /// Kick off the initial data loads.
     pub fn bootstrap(&mut self) {
         self.load_whoami();
+        self.load_presence();
         self.load_folders();
         self.load_chats();
     }
@@ -260,6 +278,28 @@ impl App {
     fn load_whoami(&self) {
         let s = self.session.clone();
         self.spawn(async move { Ok(AppMessage::Whoami(s.whoami().await?)) });
+    }
+
+    fn load_presence(&self) {
+        let s = self.session.clone();
+        self.spawn(async move { Ok(AppMessage::Presence(people::my_presence(&s.graph).await?)) });
+    }
+
+    fn set_presence(&self, availability: String, activity: String) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            people::set_preferred_presence(&s.graph, &availability, &activity).await?;
+            // Report back the effective presence for the indicator.
+            Ok(AppMessage::Presence(people::my_presence(&s.graph).await?))
+        });
+    }
+
+    fn clear_presence(&self) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            people::clear_preferred_presence(&s.graph).await?;
+            Ok(AppMessage::Presence(people::my_presence(&s.graph).await?))
+        });
     }
 
     fn load_folders(&self) {
@@ -530,6 +570,12 @@ impl App {
             AppMessage::OpenChat(None) => {
                 self.status = "that sender isn't a Teams user in your directory".into();
             }
+            AppMessage::Presence(p) => {
+                if let Some(a) = &p.availability {
+                    self.status = format!("presence: {a}");
+                }
+                self.my_presence = Some(p);
+            }
             AppMessage::Poll => self.poll(),
         }
     }
@@ -652,6 +698,10 @@ impl App {
             }
             (KeyCode::Char('?'), _) => {
                 self.overlay = Some(Overlay::Help);
+                return;
+            }
+            (KeyCode::Char('p'), KeyModifiers::NONE) => {
+                self.overlay = Some(Overlay::Presence);
                 return;
             }
             _ => {}
@@ -952,6 +1002,20 @@ impl App {
                     self.overlay = Some(Overlay::React); // ignore other keys
                 }
             }
+            Some(Overlay::Presence) => match key.code {
+                KeyCode::Char(c @ '1'..='6') => {
+                    let idx = (c as u8 - b'1') as usize;
+                    if let Some((_, availability, activity)) = PRESENCE_OPTIONS.get(idx) {
+                        self.status = "setting presence…".into();
+                        self.set_presence(availability.to_string(), activity.to_string());
+                    }
+                }
+                KeyCode::Char('c') => {
+                    self.status = "clearing presence…".into();
+                    self.clear_presence();
+                }
+                _ => self.overlay = Some(Overlay::Presence), // ignore other keys
+            },
             Some(Overlay::Search { mut query }) => match key.code {
                 KeyCode::Enter => {
                     let q = query.clone();

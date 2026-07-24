@@ -52,12 +52,14 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         Some(t) => format!("⟳ synced {t}"),
         None => "⟳ syncing…".to_string(),
     };
+    let (dot, avail) = presence_indicator(app);
     let line = Line::from(vec![
         tab("Outlook (F2)", app.screen == Screen::Outlook),
         Span::raw("  "),
         tab("Teams (F2)", app.screen == Screen::Teams),
         Span::raw("   "),
-        Span::styled("Ctrl+P palette · ? help · q quit   ", Style::default().fg(DIM)),
+        Span::styled("Ctrl+P palette · p presence · ? help · q quit   ", Style::default().fg(DIM)),
+        Span::styled(format!("{dot} {avail}  "), presence_style(app)),
         Span::styled(sync, Style::default().fg(Color::Green)),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -327,7 +329,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F2 switch app · Ctrl+P palette · ? help · q / Ctrl+C quit\n\
+ Global:  F2 switch app · Ctrl+P palette · p set presence · ? help · q quit\n\
  \n\
  Outlook: Tab cycle panes · j/k move · Enter open · c compose\n\
           r reply · a reply-all · f forward · / search · g calendar\n\
@@ -420,6 +422,22 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 area,
             );
         }
+        Overlay::Presence => {
+            let area = centered(46, 55, f.area());
+            f.render_widget(Clear, area);
+            let mut body = String::new();
+            if let Some(a) = app.my_presence.as_ref().and_then(|p| p.availability.as_deref()) {
+                body.push_str(&format!("Current: {a}\n\n"));
+            }
+            for (i, (label, _, _)) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
+                body.push_str(&format!("{}  {label}\n", i + 1));
+            }
+            body.push_str("\nc  Clear (revert to automatic)\nEsc cancel");
+            f.render_widget(
+                Paragraph::new(body).block(popup_block("Set presence")),
+                area,
+            );
+        }
     }
 }
 
@@ -489,6 +507,31 @@ fn render_compose(f: &mut Frame, c: &Compose) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Tab-bar presence dot symbol + availability label.
+fn presence_indicator(app: &App) -> (&'static str, String) {
+    let avail = app
+        .my_presence
+        .as_ref()
+        .and_then(|p| p.availability.clone())
+        .unwrap_or_else(|| "…".into());
+    ("●", avail)
+}
+
+fn presence_style(app: &App) -> Style {
+    let color = match app
+        .my_presence
+        .as_ref()
+        .and_then(|p| p.availability.as_deref())
+        .unwrap_or("")
+    {
+        "Available" | "AvailableIdle" => Color::Green,
+        "Busy" | "BusyIdle" | "DoNotDisturb" => Color::Red,
+        "Away" | "BeRightBack" => Color::Yellow,
+        _ => DIM,
+    };
+    Style::default().fg(color)
+}
 
 fn selectable_list<'a>(items: Vec<ListItem<'a>>, title: &'a str, focused: bool) -> List<'a> {
     List::new(items)

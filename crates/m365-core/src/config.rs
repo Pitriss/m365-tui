@@ -22,6 +22,7 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "ChannelMessage.Send",
     "ChannelMessage.Read.All",
     "Presence.Read.All",
+    "Presence.ReadWrite", // set your own presence (setUserPreferredPresence)
 ];
 
 #[derive(Debug, Clone)]

@@ -13,6 +13,34 @@ pub async fn me(graph: &GraphClient) -> Result<User> {
         .await
 }
 
+/// The signed-in user's current presence.
+pub async fn my_presence(graph: &GraphClient) -> Result<Presence> {
+    graph.get_json("me/presence").await
+}
+
+/// Set the signed-in user's preferred presence (the sticky "set status" in
+/// Teams). Valid pairs: Available/Available, Busy/Busy,
+/// DoNotDisturb/DoNotDisturb, BeRightBack/BeRightBack, Away/Away, Offline/OffWork.
+pub async fn set_preferred_presence(
+    graph: &GraphClient,
+    availability: &str,
+    activity: &str,
+) -> Result<()> {
+    graph
+        .post_action(
+            "me/presence/setUserPreferredPresence",
+            &json!({ "availability": availability, "activity": activity }),
+        )
+        .await
+}
+
+/// Clear the preferred presence, reverting to automatically-calculated status.
+pub async fn clear_preferred_presence(graph: &GraphClient) -> Result<()> {
+    graph
+        .post_action("me/presence/clearUserPreferredPresence", &json!({}))
+        .await
+}
+
 /// Relevant people for the signed-in user, optionally filtered by a search term
 /// (matches name or email).
 pub async fn relevant_people(graph: &GraphClient, search: Option<&str>) -> Result<Vec<Person>> {
