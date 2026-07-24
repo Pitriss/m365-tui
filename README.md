@@ -5,15 +5,21 @@ Microsoft Graph API in Rust. One process, two screens (switch with `F2`), with
 cross-navigation between them and near-real-time updates via a
 Cloudflare-tunnelled webhook.
 
-- **Outlook** — folders, message list, reading pane, compose/reply, search, and
-  a 7-day calendar view with RSVP.
-- **Teams** — chats and channels, message view, an inline composer, and
-  presence-aware labels.
+- **Outlook** — folders, message list with scroll-to-load-more, an HTML-rendered
+  reading pane, compose / reply / reply-all / forward, full-text search, and a
+  7-day calendar view with RSVP.
+- **Teams** — chats and channels, a message pane with per-message selection,
+  an inline composer, **emoji reactions**, and presence-aware labels.
+- **Rich rendering** — mail and Teams message bodies are HTML; they're rendered
+  directly to styled terminal text (headings, bold/italic, lists, code,
+  blockquotes, links) — no raw tags.
 - **Cross-navigation** — from an email, open a Teams chat with its sender
   (command palette → *chat with selected email's sender*).
-- **Real-time** — Graph change notifications hit a webhook behind a Cloudflare
-  tunnel, which publishes to Redis; the TUI reacts with a targeted delta fetch
-  ("notify-then-delta"). Falls back to polling when no tunnel is configured.
+- **Live updates** — a background poll refreshes the current view every 20s
+  (a `⟳ synced HH:MM:SS` indicator shows in the tab bar). For *instant* push,
+  Graph change notifications hit a webhook behind a Cloudflare tunnel, which
+  publishes to Redis; the TUI reacts with a targeted delta fetch
+  ("notify-then-delta").
 
 ## Architecture
 
@@ -91,6 +97,24 @@ nix-shell --run 'cargo run -p m365-tui -- whoami'
 nix-shell --run 'cargo run -p m365-tui'
 ```
 
+### Via the Nix flake
+
+```sh
+nix run  github:rootHytx/m365-tui          # run without installing
+nix build github:rootHytx/m365-tui         # build ./result/bin/m365
+```
+
+Or add it to a system/home-manager flake as an input (`m365-tui.url =
+"github:rootHytx/m365-tui"`) and reference
+`m365-tui.packages.${system}.default`.
+
+### Prebuilt binary
+
+Grab the static `x86_64-linux` tarball from the
+[latest release](https://github.com/rootHytx/m365-tui/releases/latest) — it
+contains `m365` and `m365-webhook` and runs as-is (musl, no glibc dependency, so
+it works on NixOS too).
+
 On first launch you'll get a device-code prompt: open the URL, enter the code,
 and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 (mode `0600`) and refreshed silently thereafter.
@@ -100,9 +124,10 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 | Scope   | Keys |
 |---------|------|
 | Global  | `F2` switch app · `Ctrl+P` command palette · `?` help · `q`/`Ctrl+C` quit |
-| Outlook | `Tab` cycle panes · `j`/`k` move · `Enter` open · `c` compose · `r` reply · `/` search · `g` calendar |
-| Teams   | `Tab` cycle panes · `j`/`k` move · `Enter` open · `t` chats↔channels · `i` type · `Enter` send · `Esc` leave composer |
+| Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
+| Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
 | Compose | `Tab` next field · `Ctrl+S` send · `Esc` cancel |
+| React   | `1`–`7` pick emoji · `Esc` cancel |
 
 Logs go to `$TMPDIR/m365-tui.log` (set `RUST_LOG=debug` for detail).
 
@@ -147,6 +172,18 @@ commented `command:` in `docker-compose.yml`, then read the printed
 
 ```sh
 nix-shell --run 'cargo test --workspace'
+```
+
+## Releases
+
+Pushing a tag matching `v*.*` triggers `.github/workflows/release.yml`, which
+builds a static `x86_64-unknown-linux-musl` binary of both `m365` and
+`m365-webhook`, packages them into a tarball (with a SHA-256 checksum), and
+publishes a GitHub Release with auto-generated notes.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Out of scope

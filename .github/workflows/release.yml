@@ -1,0 +1,58 @@
+name: release
+
+# Build and publish a GitHub Release whenever a version tag is pushed.
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*.*"
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      # Static musl build so the binaries run anywhere (incl. NixOS) with no
+      # glibc dependency. reqwest uses rustls, so no OpenSSL is needed.
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET" -p m365-tui -p webhook
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="m365-tui-${GITHUB_REF_NAME}-x86_64-linux-musl"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/m365" "dist/$name/"
+          cp "target/$TARGET/release/m365-webhook" "dist/$name/"
+          cp README.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
