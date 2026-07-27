@@ -47,7 +47,12 @@ pub enum AppMessage {
     /// Result of a cross-navigation request to open a chat by email.
     OpenChat(Option<String>),
     /// The signed-in user's presence (status), for the tab-bar indicator.
-    Presence(Presence),
+    /// `requested` is set when this followed an explicit change, so we can tell
+    /// the user if the effective presence didn't match what they asked for.
+    Presence {
+        presence: Presence,
+        requested: Option<String>,
+    },
     /// Periodic tick: refresh the current view from the server.
     Poll,
 }
@@ -274,7 +279,11 @@ impl App {
         tokio::spawn(async move {
             let msg = match fut.await {
                 Ok(m) => m,
-                Err(e) => AppMessage::Error(format!("{e:#}")),
+                Err(e) => {
+                    // Also record it: the status line is transient, the log isn't.
+                    tracing::warn!("background task failed: {e:#}");
+                    AppMessage::Error(format!("{e:#}"))
+                }
             };
             let _ = tx.send(msg).await;
         });
@@ -287,15 +296,24 @@ impl App {
 
     fn load_presence(&self) {
         let s = self.session.clone();
-        self.spawn(async move { Ok(AppMessage::Presence(people::my_presence(&s.graph).await?)) });
+        self.spawn(async move {
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: None,
+            })
+        });
     }
 
     fn set_presence(&self, availability: String, activity: String) {
         let s = self.session.clone();
         self.spawn(async move {
             people::set_preferred_presence(&s.graph, &availability, &activity).await?;
-            // Report back the effective presence for the indicator.
-            Ok(AppMessage::Presence(people::my_presence(&s.graph).await?))
+            // Read back the *effective* presence, which Graph derives from the
+            // preferred value plus any active Teams session.
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: Some(availability),
+            })
         });
     }
 
@@ -303,7 +321,10 @@ impl App {
         let s = self.session.clone();
         self.spawn(async move {
             people::clear_preferred_presence(&s.graph).await?;
-            Ok(AppMessage::Presence(people::my_presence(&s.graph).await?))
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: None,
+            })
         });
     }
 
@@ -575,11 +596,21 @@ impl App {
             AppMessage::OpenChat(None) => {
                 self.status = "that sender isn't a Teams user in your directory".into();
             }
-            AppMessage::Presence(p) => {
-                if let Some(a) = &p.availability {
-                    self.status = format!("presence: {a}");
-                }
-                self.my_presence = Some(p);
+            AppMessage::Presence {
+                presence,
+                requested,
+            } => {
+                let effective = presence.availability.clone().unwrap_or_default();
+                self.status = match requested {
+                    // Graph accepted the preferred status but the effective one
+                    // only changes while a Teams client session is active.
+                    Some(req) if !effective.eq_ignore_ascii_case(&req) => format!(
+                        "preferred status '{req}' saved, but Teams reports '{effective}' — it applies once you're signed in to a Teams client"
+                    ),
+                    Some(req) => format!("presence set to {req}"),
+                    None => format!("presence: {effective}"),
+                };
+                self.my_presence = Some(presence);
             }
             AppMessage::Poll => self.poll(),
         }
