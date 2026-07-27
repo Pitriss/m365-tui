@@ -492,6 +492,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 body.push_str(&format!("{}  {label}\n", i + 1));
             }
             body.push_str("\nc  Clear (revert to automatic)\nEsc cancel");
+            if !app.session.config.can_write_presence() {
+                body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");
+            }
             f.render_widget(
                 Paragraph::new(body).block(popup_block("Set presence")),
                 area,

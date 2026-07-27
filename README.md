@@ -65,8 +65,10 @@ In the [Entra admin center](https://entra.microsoft.com) → *App registrations*
 3. **API permissions** → *Microsoft Graph* → *Delegated*, add:
    `User.Read`, `People.Read`, `Mail.ReadWrite`, `Mail.Send`,
    `Calendars.ReadWrite`, `Chat.ReadWrite`, `ChannelMessage.Send`,
-   `ChannelMessage.Read.All`, `Presence.Read.All`, `Presence.ReadWrite`
-   (and `offline_access`, `openid`, `profile`).
+   `ChannelMessage.Read.All`, `Presence.Read.All` (and `offline_access`,
+   `openid`, `profile`).
+   - Optionally `Presence.ReadWrite` to *change* your own status — see
+     [Changing your status](#changing-your-status).
    - **`ChannelMessage.Read.All` requires admin consent.** If you're not an
      admin, click *Grant admin consent* is unavailable — ask IT, or start
      Outlook-only by trimming scopes (see `M365_SCOPES` in `.env`).
@@ -130,6 +132,28 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 | Copying | `y` yank focused message · `Y` yank whole view · `z` copy mode |
 | Compose | `Tab` next field · `Ctrl+S` send · `Esc` cancel |
 | React   | `1`–`7` pick emoji · `Esc` cancel |
+
+### Changing your status
+
+`p` shows your presence and offers Available / Busy / DND / Be right back / Away
+/ Appear offline (Graph `setUserPreferredPresence`, same as Teams' sticky status).
+
+Reading your status works out of the box. **Setting** it needs the extra
+`Presence.ReadWrite` scope, which is **opt-in** — adding a scope invalidates any
+existing consent grant, and in tenants that disallow user consent every sign-in
+then requires fresh admin approval. To enable it:
+
+1. Add the `Presence.ReadWrite` delegated permission to the app registration and
+   grant admin consent.
+2. Set `M365_PRESENCE_WRITE=1` in `.env`.
+3. Re-authenticate: `rm ~/.config/m365-tui/token-cache.json` then
+   `m365 login`.
+
+Without it, the picker is read-only and says so.
+
+> **If sign-in starts asking for admin approval,** the requested scope set no
+> longer matches what was consented. Either get the new set approved, or pin the
+> old one via `M365_SCOPES` in `.env` and re-login.
 
 ### Copying text
 

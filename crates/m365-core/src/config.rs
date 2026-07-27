@@ -9,6 +9,11 @@ pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
 /// The delegated scopes the app requests. `offline_access` is required for
 /// refresh tokens; `openid`/`profile` give us the signed-in user's identity.
+///
+/// Keep this list stable: changing it invalidates existing consent, and in
+/// tenants that disallow user consent every sign-in then needs a fresh admin
+/// approval. New optional capabilities should be opt-in (see
+/// [`PRESENCE_WRITE_SCOPE`]) rather than added here.
 pub const DEFAULT_SCOPES: &[&str] = &[
     "openid",
     "profile",
@@ -22,8 +27,12 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "ChannelMessage.Send",
     "ChannelMessage.Read.All",
     "Presence.Read.All",
-    "Presence.ReadWrite", // set your own presence (setUserPreferredPresence)
 ];
+
+/// Needed only to *set* your own presence (`setUserPreferredPresence`).
+/// Opt in with `M365_PRESENCE_WRITE=1`; requires the permission to be added to
+/// the app registration and consented.
+pub const PRESENCE_WRITE_SCOPE: &str = "Presence.ReadWrite";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -56,7 +65,16 @@ impl Config {
             Ok(s) if !s.trim().is_empty() => {
                 s.split_whitespace().map(|s| s.to_string()).collect()
             }
-            _ => DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
+            _ => {
+                let mut s: Vec<String> = DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
+                // Presence *writing* is opt-in: adding a scope invalidates any
+                // existing consent grant, which is disruptive in tenants that
+                // require admin approval.
+                if env_flag("M365_PRESENCE_WRITE") {
+                    s.push(PRESENCE_WRITE_SCOPE.to_string());
+                }
+                s
+            }
         };
 
         let tunnel_base_url = std::env::var("M365_TUNNEL_BASE_URL")
@@ -98,6 +116,13 @@ impl Config {
         self.scopes.join(" ")
     }
 
+    /// Whether the token we request can set presence.
+    pub fn can_write_presence(&self) -> bool {
+        self.scopes
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(PRESENCE_WRITE_SCOPE))
+    }
+
     pub fn devicecode_endpoint(&self) -> String {
         format!(
             "https://login.microsoftonline.com/{}/oauth2/v2.0/devicecode",
@@ -124,6 +149,16 @@ impl Config {
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
     }
+}
+
+/// True for `1`, `true`, `yes`, `on` (case-insensitive).
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
 }
 
 fn env_required(key: &str) -> Result<String> {

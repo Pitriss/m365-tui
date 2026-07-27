@@ -1098,13 +1098,23 @@ impl App {
                 KeyCode::Char(c @ '1'..='6') => {
                     let idx = (c as u8 - b'1') as usize;
                     if let Some((_, availability, activity)) = PRESENCE_OPTIONS.get(idx) {
-                        self.status = "setting presence…".into();
-                        self.set_presence(availability.to_string(), activity.to_string());
+                        if !self.session.config.can_write_presence() {
+                            self.status =
+                                "setting presence needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
+                        } else {
+                            self.status = "setting presence…".into();
+                            self.set_presence(availability.to_string(), activity.to_string());
+                        }
                     }
                 }
                 KeyCode::Char('c') => {
-                    self.status = "clearing presence…".into();
-                    self.clear_presence();
+                    if !self.session.config.can_write_presence() {
+                        self.status =
+                            "setting presence needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
+                    } else {
+                        self.status = "clearing presence…".into();
+                        self.clear_presence();
+                    }
                 }
                 _ => self.overlay = Some(Overlay::Presence), // ignore other keys
             },
