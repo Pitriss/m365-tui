@@ -25,6 +25,13 @@ pub fn render(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
+    // Copy mode takes over the whole frame: one hint row plus borderless,
+    // full-width text so a terminal drag-select grabs only the message body.
+    if app.copy_mode {
+        render_copy_mode(f, app);
+        return;
+    }
+
     render_tabs(f, chunks[0], app);
     match app.screen {
         Screen::Outlook => render_outlook(f, chunks[1], app),
@@ -35,6 +42,35 @@ pub fn render(f: &mut Frame, app: &App) {
     if let Some(overlay) = &app.overlay {
         render_overlay(f, app, overlay);
     }
+}
+
+/// Full-screen, borderless view of the current message/conversation. No side
+/// panes and no borders, so mouse selection captures exactly the text.
+fn render_copy_mode(f: &mut Frame, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(f.area());
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " COPY MODE — drag to select · y yank all · j/k scroll · z/Esc exit ",
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+        ))),
+        rows[0],
+    );
+
+    let lines = match app.screen {
+        Screen::Outlook => email_lines(app).unwrap_or_default(),
+        Screen::Teams => conversation_lines(app, false).0,
+    };
+    let total = lines.len() as u16;
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.copy_scroll.min(total.saturating_sub(1)), 0)),
+        rows[1],
+    );
 }
 
 fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
@@ -155,25 +191,89 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     );
 
     // Reading pane
-    let reading = if let Some(m) = &app.outlook.reading {
-        let mut lines = vec![
-            kv("Subject", &m.subject.clone().unwrap_or_default()),
-            kv("From", &m.sender_name()),
-            kv("Date", &m.received_date_time.clone().unwrap_or_default()),
-            Line::raw(""),
-        ];
-        if let Some(body) = &app.outlook.reading_body {
-            lines.extend(body.lines.iter().cloned());
-        }
-        Paragraph::new(lines).wrap(Wrap { trim: false })
-    } else {
-        Paragraph::new("Select a message and press Enter to read.\n\nKeys: c compose · r reply · a reply-all · f forward · / search · g calendar · Tab focus")
-            .style(Style::default().fg(DIM))
+    let reading = match email_lines(app) {
+        Some(lines) => Paragraph::new(lines).wrap(Wrap { trim: false }),
+        None => Paragraph::new("Select a message and press Enter to read.\n\nKeys: c compose · r reply · a reply-all · f forward · / search · g calendar · z copy-mode · y yank")
+            .style(Style::default().fg(DIM)),
     };
     f.render_widget(
         reading.block(panel_block("Reading", app.outlook_focus == OutlookFocus::Reading)),
         cols[2],
     );
+}
+
+/// Headers + rendered body of the open email, or `None` if nothing is open.
+/// Shared by the reading pane and copy mode.
+pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
+    let m = app.outlook.reading.as_ref()?;
+    let mut lines = vec![
+        kv("Subject", &m.subject.clone().unwrap_or_default()),
+        kv("From", &m.sender_name()),
+        kv("Date", &m.received_date_time.clone().unwrap_or_default()),
+        Line::raw(""),
+    ];
+    if let Some(body) = &app.outlook.reading_body {
+        lines.extend(body.lines.iter().cloned());
+    }
+    Some(lines)
+}
+
+/// Lines of the open Teams conversation, plus the starting line index of each
+/// message. `selectable` adds the `▶` cursor and selection highlight (off in
+/// copy mode so the text copies cleanly).
+pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
+    for (i, m) in app.teams.messages.iter().enumerate() {
+        starts.push(lines.len());
+        let selected = selectable && i == app.teams.msg_sel;
+        let marker = if !selectable {
+            ""
+        } else if selected {
+            "▶ "
+        } else {
+            "  "
+        };
+        let indent = if selectable { "    " } else { "  " };
+
+        if m.deleted_date_time.is_some() {
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
+                Span::styled("(message deleted)", Style::default().fg(DIM)),
+            ]));
+            continue;
+        }
+
+        let ts = m
+            .created_date_time
+            .as_deref()
+            .map(|t| t.split('T').nth(1).unwrap_or(t).trim_end_matches('Z'))
+            .unwrap_or("");
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("{} ", m.author()),
+                Style::default()
+                    .fg(if selected { Color::Cyan } else { Color::LightGreen })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(ts.to_string(), Style::default().fg(DIM)),
+        ]));
+        if let Some(body) = app.teams.messages_rendered.get(i) {
+            for line in &body.lines {
+                let mut spans = vec![Span::raw(indent)];
+                spans.extend(line.spans.iter().cloned());
+                lines.push(Line::from(spans));
+            }
+        }
+        if let Some(reactions) = m.reactions_summary() {
+            lines.push(Line::from(vec![
+                Span::raw(indent),
+                Span::styled(reactions, Style::default().fg(DIM)),
+            ]));
+        }
+    }
+    (lines, starts)
 }
 
 // ---------------------------------------------------------------------------
@@ -234,51 +334,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
-    let mut lines: Vec<Line> = Vec::new();
-    // Line index where each message starts, so we can scroll the selected one
-    // to the top of the pane.
-    let mut msg_starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
-    for (i, m) in app.teams.messages.iter().enumerate() {
-        msg_starts.push(lines.len());
-        let selected = focused && i == app.teams.msg_sel;
-        let marker = if selected { "▶ " } else { "  " };
-        let author_style = Style::default()
-            .fg(if selected { Color::Cyan } else { Color::LightGreen })
-            .add_modifier(Modifier::BOLD);
-
-        if m.deleted_date_time.is_some() {
-            lines.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT)),
-                Span::styled("(message deleted)", Style::default().fg(DIM)),
-            ]));
-            continue;
-        }
-
-        let ts = m
-            .created_date_time
-            .as_deref()
-            .map(|t| t.split('T').nth(1).unwrap_or(t).trim_end_matches('Z'))
-            .unwrap_or("");
-        lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(ACCENT)),
-            Span::styled(format!("{} ", m.author()), author_style),
-            Span::styled(ts.to_string(), Style::default().fg(DIM)),
-        ]));
-        if let Some(body) = app.teams.messages_rendered.get(i) {
-            // Indent each rendered line four spaces under the author.
-            for line in &body.lines {
-                let mut spans = vec![Span::raw("    ")];
-                spans.extend(line.spans.iter().cloned());
-                lines.push(Line::from(spans));
-            }
-        }
-        if let Some(reactions) = m.reactions_summary() {
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(reactions, Style::default().fg(DIM)),
-            ]));
-        }
-    }
+    let (mut lines, msg_starts) = conversation_lines(app, focused);
     if lines.is_empty() {
         lines.push(Line::styled(
             "Select a conversation and press Enter.",
@@ -293,7 +349,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(0)
         .min(total.saturating_sub(1));
     let title = if focused {
-        "Conversation (j/k select · e react)"
+        "Conversation (j/k select · e react · z copy-mode)"
     } else {
         "Conversation"
     };
@@ -330,6 +386,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  M365 TUI — keys\n\
  \n\
  Global:  F2 switch app · Ctrl+P palette · p set presence · ? help · q quit\n\
+ \n\
+ Copying: y yank focused message · Y yank whole view\n\
+          z copy mode (full-width, borderless — drag-select cleanly)\n\
  \n\
  Outlook: Tab cycle panes · j/k move · Enter open · c compose\n\
           r reply · a reply-all · f forward · / search · g calendar\n\

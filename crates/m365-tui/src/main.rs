@@ -6,6 +6,7 @@
 //!   m365 login      run device-code login and exit
 
 mod app;
+mod clipboard;
 mod content;
 mod navigation;
 mod ui;

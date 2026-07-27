@@ -127,8 +127,24 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 | Global  | `F2` switch app · `Ctrl+P` command palette · `p` set presence · `?` help · `q`/`Ctrl+C` quit |
 | Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
+| Copying | `y` yank focused message · `Y` yank whole view · `z` copy mode |
 | Compose | `Tab` next field · `Ctrl+S` send · `Esc` cancel |
 | React   | `1`–`7` pick emoji · `Esc` cancel |
+
+### Copying text
+
+Terminal selection is linear across the whole screen, so dragging over the
+reading pane would otherwise also grab the list pane beside it. Two ways around
+that:
+
+- **`y` / `Y`** — copy straight to the system clipboard, no mouse involved. `y`
+  copies the focused item (open email body, or selected Teams message); `Y`
+  copies the whole view (email with headers, or the entire conversation). Uses
+  `wl-copy`/`xclip`/`xsel` when available, else the OSC 52 escape sequence (which
+  also works over SSH).
+- **`z` copy mode** — redraws the current message/conversation full-width with no
+  borders and no side panes, so a normal terminal drag-select captures exactly the
+  text. `j`/`k` scroll, `y` yanks everything, `z`/`Esc` exits.
 
 Logs go to `$TMPDIR/m365-tui.log` (set `RUST_LOG=debug` for detail).
 

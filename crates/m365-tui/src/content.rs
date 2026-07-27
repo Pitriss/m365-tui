@@ -317,6 +317,23 @@ fn attr(attrs: &std::cell::RefCell<Vec<html5ever::Attribute>>, name: &str) -> Op
         .map(|a| a.value.to_string())
 }
 
+/// Flatten styled text back to plain text (one string per line, trailing
+/// whitespace trimmed) for the clipboard.
+pub fn plain(text: &Text) -> String {
+    text.lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Collapse runs of ASCII/Unicode whitespace to single spaces (HTML semantics).
 fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

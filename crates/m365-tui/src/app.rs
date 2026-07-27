@@ -218,6 +218,9 @@ pub struct App {
     pub my_presence: Option<Presence>,
     /// Wall-clock of the last poll refresh (shown in the tab bar).
     pub last_sync: Option<String>,
+    /// Borderless full-width view for clean terminal text selection.
+    pub copy_mode: bool,
+    pub copy_scroll: u16,
     pub should_quit: bool,
 }
 
@@ -247,6 +250,8 @@ impl App {
             me: None,
             my_presence: None,
             last_sync: None,
+            copy_mode: false,
+            copy_scroll: 0,
             should_quit: false,
         }
     }
@@ -663,6 +668,51 @@ impl App {
         }
     }
 
+    // -- clipboard ---------------------------------------------------------
+
+    /// Copy the focused item: the open email's body, or the selected Teams
+    /// message's body.
+    fn yank_current(&mut self) {
+        let text = match self.screen {
+            Screen::Outlook => self.outlook.reading_body.as_ref().map(content::plain),
+            Screen::Teams => self
+                .teams
+                .messages_rendered
+                .get(self.teams.msg_sel)
+                .map(content::plain),
+        };
+        match text {
+            Some(t) if !t.trim().is_empty() => self.copy_to_clipboard(&t, "message"),
+            _ => self.status = "nothing to copy — open a message first".into(),
+        }
+    }
+
+    /// Copy everything in the current view: the whole email (with headers) or
+    /// the whole conversation.
+    fn yank_all(&mut self) {
+        let text = match self.screen {
+            Screen::Outlook => crate::ui::email_lines(self)
+                .map(|lines| lines_to_plain(&lines))
+                .unwrap_or_default(),
+            Screen::Teams => lines_to_plain(&crate::ui::conversation_lines(self, false).0),
+        };
+        if text.trim().is_empty() {
+            self.status = "nothing to copy".into();
+        } else {
+            self.copy_to_clipboard(&text, "all");
+        }
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str, what: &str) {
+        match crate::clipboard::copy(text) {
+            Ok(via) => {
+                let bytes = text.len();
+                self.status = format!("copied {what} to clipboard ({bytes} bytes, via {via})");
+            }
+            Err(e) => self.status = format!("copy failed: {e:#}"),
+        }
+    }
+
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -672,14 +722,56 @@ impl App {
             return;
         }
 
+        // Copy mode swallows input so stray keys can't fire actions while the
+        // user is selecting text.
+        if self.copy_mode {
+            match key.code {
+                KeyCode::Char('z') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.copy_mode = false;
+                }
+                KeyCode::Char('y') => self.yank_all(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.copy_scroll = self.copy_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.copy_scroll = self.copy_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => self.copy_scroll = self.copy_scroll.saturating_add(20),
+                KeyCode::PageUp => self.copy_scroll = self.copy_scroll.saturating_sub(20),
+                KeyCode::Char('g') => self.copy_scroll = 0,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // While typing a Teams message, only Ctrl-modified/function keys act
+        // globally — otherwise letters like q/p/z would be stolen from the text.
+        let typing = self.screen == Screen::Teams && self.teams.focus == TeamsFocus::Composer;
+
         // Global bindings.
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::NONE) => {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 return;
             }
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q'), KeyModifiers::NONE) if !typing => {
                 self.should_quit = true;
+                return;
+            }
+            (KeyCode::Char('z'), KeyModifiers::NONE) if !typing => {
+                self.copy_mode = true;
+                self.copy_scroll = 0;
+                return;
+            }
+            (KeyCode::Char('y'), KeyModifiers::NONE) if !typing => {
+                self.yank_current();
+                return;
+            }
+            (KeyCode::Char('Y'), _) if !typing => {
+                self.yank_all();
                 return;
             }
             (KeyCode::F(2), _) => {
@@ -696,11 +788,11 @@ impl App {
                 });
                 return;
             }
-            (KeyCode::Char('?'), _) => {
+            (KeyCode::Char('?'), _) if !typing => {
                 self.overlay = Some(Overlay::Help);
                 return;
             }
-            (KeyCode::Char('p'), KeyModifiers::NONE) => {
+            (KeyCode::Char('p'), KeyModifiers::NONE) if !typing => {
                 self.overlay = Some(Overlay::Presence);
                 return;
             }
@@ -1177,6 +1269,22 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Flatten rendered lines to plain text for the clipboard.
+fn lines_to_plain(lines: &[ratatui::text::Line<'_>]) -> String {
+    lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn now_hms() -> String {
