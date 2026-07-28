@@ -8,8 +8,12 @@ Cloudflare-tunnelled webhook.
 - **Outlook** — folders, message list with scroll-to-load-more, an HTML-rendered
   reading pane, compose / reply / reply-all / forward, full-text search, and a
   7-day calendar view with RSVP.
-- **Teams** — chats and channels, a message pane with per-message selection,
-  an inline composer, **emoji reactions**, and presence-aware labels.
+- **Teams** — chats and channels, a message pane with per-message selection and
+  a pinned Today/Yesterday/date header, an inline composer, **emoji reactions**,
+  and presence-aware labels.
+- **Paging** — mail and Teams messages load 50 at a time; scrolling to the end
+  of either list pulls the next page, and periodic refreshes merge in new items
+  without dropping the pages you've already scrolled back through.
 - **Rich rendering** — mail and Teams message bodies are HTML; they're rendered
   directly to styled terminal text (headings, bold/italic, lists, code,
   blockquotes, links) — no raw tags.
@@ -128,7 +132,7 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 |---------|------|
 | Global  | `F2` switch app · `Ctrl+P` command palette · `p` set presence · `?` help · `q`/`Ctrl+C` quit |
 | Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
-| Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
+| Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message (scroll to end loads older) · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
 | Copying | `y` yank focused message · `Y` yank whole view · `z` copy mode |
 | Compose | `Tab` next field · `Ctrl+S` send · `Esc` cancel |
 | React   | `1`–`7` pick emoji · `Esc` cancel |

@@ -28,8 +28,7 @@ pub enum AppMessage {
     Messages {
         items: Vec<MailMessage>,
         next: Option<String>,
-        /// Append to the existing list (load-more) vs. replace it (new folder).
-        append: bool,
+        mode: ListUpdate,
     },
     MessageBody(MailMessage),
     Calendar(Vec<CalEvent>),
@@ -38,8 +37,7 @@ pub enum AppMessage {
         chat_id: String,
         messages: Vec<ChatMessage>,
         next: Option<String>,
-        /// Append older messages (load-more) vs. replace the conversation.
-        append: bool,
+        mode: ListUpdate,
     },
     Teams(Vec<Team>),
     Channels { team_id: String, channels: Vec<m365_core::models::Channel> },
@@ -48,7 +46,7 @@ pub enum AppMessage {
         channel_id: String,
         messages: Vec<ChatMessage>,
         next: Option<String>,
-        append: bool,
+        mode: ListUpdate,
     },
     /// A send/action completed; optional status text and refresh hint.
     Done(String),
@@ -114,6 +112,18 @@ pub enum Overlay {
 /// How many items to fetch per page — mail messages and Teams messages alike.
 /// Scrolling to the end of a list pulls the next page of this size.
 pub const PAGE_SIZE: u32 = 50;
+
+/// How an incoming page of items updates the list already on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListUpdate {
+    /// Fresh context (folder switch, conversation opened, search): replace all.
+    Replace,
+    /// Older items fetched by scrolling: append after what's loaded.
+    Append,
+    /// Periodic refresh: fold the newest page in without dropping the older
+    /// pages the user has already scrolled back through.
+    Merge,
+}
 
 /// Emoji reactions offered in the picker, keyed 1-7.
 pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
@@ -351,15 +361,11 @@ impl App {
         self.spawn(async move { Ok(AppMessage::Folders(mail::list_folders(&s.graph).await?)) });
     }
 
-    fn load_messages(&self, folder_id: String) {
+    fn load_messages(&self, folder_id: String, mode: ListUpdate) {
         let s = self.session.clone();
         self.spawn(async move {
             let (items, next) = mail::list_messages(&s.graph, &folder_id, PAGE_SIZE).await?;
-            Ok(AppMessage::Messages {
-                items,
-                next,
-                append: false,
-            })
+            Ok(AppMessage::Messages { items, next, mode })
         });
     }
 
@@ -378,7 +384,7 @@ impl App {
             Ok(AppMessage::Messages {
                 items,
                 next,
-                append: true,
+                mode: ListUpdate::Append,
             })
         });
     }
@@ -407,7 +413,7 @@ impl App {
         self.spawn(async move { Ok(AppMessage::Chats(chats::list_chats(&s.graph, 40).await?)) });
     }
 
-    fn load_chat_messages(&self, chat_id: String) {
+    fn load_chat_messages(&self, chat_id: String, mode: ListUpdate) {
         let s = self.session.clone();
         self.spawn(async move {
             let (messages, next) = chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await?;
@@ -415,7 +421,7 @@ impl App {
                 chat_id,
                 messages,
                 next,
-                append: false,
+                mode,
             })
         });
     }
@@ -439,7 +445,7 @@ impl App {
                     chat_id,
                     messages,
                     next,
-                    append: true,
+                    mode: ListUpdate::Append,
                 })
             });
         } else if let Some((team_id, channel_id)) = self.teams.open_channel.clone() {
@@ -450,7 +456,7 @@ impl App {
                     channel_id,
                     messages,
                     next,
-                    append: true,
+                    mode: ListUpdate::Append,
                 })
             });
         } else {
@@ -471,7 +477,7 @@ impl App {
         });
     }
 
-    fn load_channel_messages(&self, team_id: String, channel_id: String) {
+    fn load_channel_messages(&self, team_id: String, channel_id: String, mode: ListUpdate) {
         let s = self.session.clone();
         self.spawn(async move {
             let (messages, next) =
@@ -481,7 +487,7 @@ impl App {
                 channel_id,
                 messages,
                 next,
-                append: false,
+                mode,
             })
         });
     }
@@ -574,7 +580,7 @@ impl App {
                         self.outlook.folder_sel = i;
                     }
                     if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
-                        self.load_messages(f.id.clone());
+                        self.load_messages(f.id.clone(), ListUpdate::Replace);
                     }
                 } else {
                     // Refresh (poll): keep the user's selection, just clamp it.
@@ -584,29 +590,42 @@ impl App {
                         .min(self.outlook.folders.len().saturating_sub(1));
                 }
             }
-            AppMessage::Messages {
-                items,
-                next,
-                append,
-            } => {
-                if append {
-                    self.outlook.messages.extend(items);
-                    self.outlook.loading_more = false;
-                    self.status = if next.is_some() {
-                        format!("{} loaded (more available)", self.outlook.messages.len())
-                    } else {
-                        format!("{} loaded (all)", self.outlook.messages.len())
-                    };
-                } else {
-                    self.outlook.messages = items;
-                    // Preserve the user's selection across poll refreshes; clamp it.
-                    self.outlook.msg_sel = self
-                        .outlook
-                        .msg_sel
-                        .min(self.outlook.messages.len().saturating_sub(1));
-                    self.outlook.loading_more = false;
+            AppMessage::Messages { items, next, mode } => {
+                self.outlook.loading_more = false;
+                let selected_id = self
+                    .outlook
+                    .messages
+                    .get(self.outlook.msg_sel)
+                    .map(|m| m.id.clone());
+
+                match mode {
+                    ListUpdate::Replace => {
+                        self.outlook.messages = items;
+                        self.outlook.messages_next = next;
+                    }
+                    ListUpdate::Append => {
+                        self.outlook.messages.extend(items);
+                        self.outlook.messages_next = next;
+                        self.status = if self.outlook.messages_next.is_some() {
+                            format!("{} loaded (more available)", self.outlook.messages.len())
+                        } else {
+                            format!("{} loaded (all)", self.outlook.messages.len())
+                        };
+                    }
+                    ListUpdate::Merge => {
+                        // Refresh the newest window without discarding the older
+                        // pages already loaded; `messages_next` is left alone as
+                        // it already points past everything we hold.
+                        let existing = std::mem::take(&mut self.outlook.messages);
+                        self.outlook.messages =
+                            merge_newest_first(items, existing, |m| m.id.clone());
+                    }
                 }
-                self.outlook.messages_next = next;
+
+                self.outlook.msg_sel = selected_id
+                    .and_then(|id| self.outlook.messages.iter().position(|m| m.id == id))
+                    .unwrap_or(self.outlook.msg_sel)
+                    .min(self.outlook.messages.len().saturating_sub(1));
             }
             AppMessage::MessageBody(m) => {
                 let (ct, raw) = match &m.body {
@@ -628,10 +647,10 @@ impl App {
                 chat_id,
                 messages,
                 next,
-                append,
+                mode,
             } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
-                    self.set_teams_messages(messages, next, append);
+                    self.set_teams_messages(messages, next, mode);
                 }
             }
             AppMessage::Teams(t) => self.teams.teams = t,
@@ -646,10 +665,10 @@ impl App {
                 channel_id,
                 messages,
                 next,
-                append,
+                mode,
             } => {
                 if self.teams.open_channel.as_ref() == Some(&(team_id, channel_id)) {
-                    self.set_teams_messages(messages, next, append);
+                    self.set_teams_messages(messages, next, mode);
                 }
             }
             AppMessage::Done(s) => {
@@ -661,7 +680,7 @@ impl App {
                 self.teams.mode = TeamsMode::Chats;
                 self.teams.open_chat_id = Some(id.clone());
                 self.teams.focus = TeamsFocus::Messages;
-                self.load_chat_messages(id);
+                self.load_chat_messages(id, ListUpdate::Replace);
                 self.load_chats();
             }
             AppMessage::OpenChat(None) => {
@@ -694,15 +713,15 @@ impl App {
         // Mail: refresh folder unread counts + the open folder's messages.
         self.load_folders();
         if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
-            self.load_messages(f.id.clone());
+            self.load_messages(f.id.clone(), ListUpdate::Merge);
         }
         // Teams: refresh chat list + whichever conversation is open.
         self.load_chats();
         if let Some(id) = self.teams.open_chat_id.clone() {
-            self.load_chat_messages(id);
+            self.load_chat_messages(id, ListUpdate::Merge);
         }
         if let Some((t, c)) = self.teams.open_channel.clone() {
-            self.load_channel_messages(t, c);
+            self.load_channel_messages(t, c, ListUpdate::Merge);
         }
     }
 
@@ -711,19 +730,19 @@ impl App {
             ChangeKind::Mail => {
                 self.status = "📬 new mail".into();
                 if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
-                    self.load_messages(f.id.clone());
+                    self.load_messages(f.id.clone(), ListUpdate::Merge);
                 }
             }
             ChangeKind::Chat => {
                 self.status = "💬 chat update".into();
                 self.load_chats();
                 if let Some(id) = self.teams.open_chat_id.clone() {
-                    self.load_chat_messages(id);
+                    self.load_chat_messages(id, ListUpdate::Merge);
                 }
             }
             ChangeKind::Channel => {
                 if let Some((t, c)) = self.teams.open_channel.clone() {
-                    self.load_channel_messages(t, c);
+                    self.load_channel_messages(t, c, ListUpdate::Merge);
                 }
             }
             ChangeKind::Other => {}
@@ -736,33 +755,59 @@ impl App {
         &mut self,
         messages: Vec<ChatMessage>,
         next: Option<String>,
-        append: bool,
+        mode: ListUpdate,
     ) {
-        let rendered = messages.iter().map(|m| {
-            let ct = m.body.as_ref().and_then(|b| b.content_type.as_deref());
-            content::render_body(ct, &m.text())
-        });
-
-        if append {
-            // Older messages arrive after the ones already loaded, so the
-            // selection index stays valid.
-            self.teams.messages_rendered.extend(rendered);
-            self.teams.messages.extend(messages);
-            self.teams.loading_more = false;
-            self.status = if next.is_some() {
-                format!("{} messages loaded (more available)", self.teams.messages.len())
-            } else {
-                format!("{} messages loaded (start of conversation)", self.teams.messages.len())
-            };
-        } else {
-            self.teams.messages_rendered = rendered.collect();
-            self.teams.messages = messages;
-            self.teams.loading_more = false;
-        }
-        self.teams.messages_next = next;
-        self.teams.msg_sel = self
+        self.teams.loading_more = false;
+        // Remember what was selected so a refresh doesn't move the cursor to a
+        // different message when new ones arrive at the top.
+        let selected_id = self
             .teams
-            .msg_sel
+            .messages
+            .get(self.teams.msg_sel)
+            .map(|m| m.id.clone());
+
+        match mode {
+            ListUpdate::Replace => {
+                self.teams.messages = messages;
+                self.teams.messages_next = next;
+            }
+            ListUpdate::Append => {
+                self.teams.messages.extend(messages);
+                self.teams.messages_next = next;
+                self.status = if self.teams.messages_next.is_some() {
+                    format!("{} messages loaded (more available)", self.teams.messages.len())
+                } else {
+                    format!(
+                        "{} messages loaded (start of conversation)",
+                        self.teams.messages.len()
+                    )
+                };
+            }
+            ListUpdate::Merge => {
+                // Keep the older pages already scrolled into view; the fetched
+                // page only supersedes the newest window. `messages_next` is
+                // deliberately left alone — it points past everything loaded.
+                let existing = std::mem::take(&mut self.teams.messages);
+                self.teams.messages = merge_newest_first(messages, existing, |m| m.id.clone());
+            }
+        }
+
+        // Re-render bodies for whatever the list now holds (HTML parse is cached
+        // per message, so this only costs on changed content).
+        self.teams.messages_rendered = self
+            .teams
+            .messages
+            .iter()
+            .map(|m| {
+                let ct = m.body.as_ref().and_then(|b| b.content_type.as_deref());
+                content::render_body(ct, &m.text())
+            })
+            .collect();
+
+        // Restore the selection by identity, else clamp.
+        self.teams.msg_sel = selected_id
+            .and_then(|id| self.teams.messages.iter().position(|m| m.id == id))
+            .unwrap_or(self.teams.msg_sel)
             .min(self.teams.messages.len().saturating_sub(1));
     }
 
@@ -770,19 +815,19 @@ impl App {
         match self.screen {
             Screen::Outlook => {
                 if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
-                    self.load_messages(f.id.clone());
+                    self.load_messages(f.id.clone(), ListUpdate::Merge);
                 }
             }
             Screen::Teams => match self.teams.mode {
                 TeamsMode::Chats => {
                     self.load_chats();
                     if let Some(id) = self.teams.open_chat_id.clone() {
-                        self.load_chat_messages(id);
+                        self.load_chat_messages(id, ListUpdate::Merge);
                     }
                 }
                 TeamsMode::Channels => {
                     if let Some((t, c)) = self.teams.open_channel.clone() {
-                        self.load_channel_messages(t, c);
+                        self.load_channel_messages(t, c, ListUpdate::Merge);
                     }
                 }
             },
@@ -985,7 +1030,7 @@ impl App {
             OutlookFocus::Folders => {
                 if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
                     self.outlook.msg_sel = 0;
-                    self.load_messages(f.id.clone());
+                    self.load_messages(f.id.clone(), ListUpdate::Replace);
                     self.outlook_focus = OutlookFocus::Messages;
                 }
             }
@@ -1135,7 +1180,7 @@ impl App {
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
-                    self.load_chat_messages(id);
+                    self.load_chat_messages(id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
             }
@@ -1157,7 +1202,7 @@ impl App {
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
-                    self.load_channel_messages(team_id, ch_id);
+                    self.load_channel_messages(team_id, ch_id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
             }
@@ -1381,7 +1426,7 @@ impl App {
             Ok(AppMessage::Messages {
                 items: results,
                 next: None,
-                append: false,
+                mode: ListUpdate::Replace,
             })
         });
     }
@@ -1414,6 +1459,20 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Fold a freshly-fetched newest page into an existing newest-first list:
+/// the fresh page wins, older already-loaded entries are kept, duplicates go.
+fn merge_newest_first<T, F, K>(fresh: Vec<T>, existing: Vec<T>, key: F) -> Vec<T>
+where
+    F: Fn(&T) -> K,
+    K: std::hash::Hash + Eq,
+{
+    let seen: std::collections::HashSet<K> = fresh.iter().map(&key).collect();
+    fresh
+        .into_iter()
+        .chain(existing.into_iter().filter(|e| !seen.contains(&key(e))))
+        .collect()
 }
 
 /// Flatten rendered lines to plain text for the clipboard.
@@ -1494,4 +1553,64 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
         })
         .copied()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_newest_first, next_field, parse_recipients, step};
+
+    #[test]
+    fn merge_keeps_older_pages_and_dedups() {
+        // Newest-first: the user had scrolled back to "a"; a refresh returns the
+        // newest three, one of which ("e") is new.
+        let existing = vec!["d", "c", "b", "a"];
+        let fresh = vec!["e", "d", "c"];
+        let merged = merge_newest_first(fresh, existing, |s: &&str| s.to_string());
+        assert_eq!(merged, vec!["e", "d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn merge_handles_empty_sides() {
+        let none: Vec<&str> = vec![];
+        assert_eq!(
+            merge_newest_first(vec!["a"], none.clone(), |s: &&str| s.to_string()),
+            vec!["a"]
+        );
+        assert_eq!(
+            merge_newest_first(none, vec!["a", "b"], |s: &&str| s.to_string()),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn merge_is_idempotent_when_nothing_changed() {
+        let existing = vec!["c", "b", "a"];
+        let merged = merge_newest_first(vec!["c", "b", "a"], existing, |s: &&str| s.to_string());
+        assert_eq!(merged, vec!["c", "b", "a"], "no duplicates on an unchanged refresh");
+    }
+
+    #[test]
+    fn selection_step_clamps() {
+        assert_eq!(step(0, -1, 5), 0);
+        assert_eq!(step(4, 1, 5), 4);
+        assert_eq!(step(2, 1, 5), 3);
+        assert_eq!(step(0, 1, 0), 0, "empty list stays at 0");
+    }
+
+    #[test]
+    fn compose_field_cycles_within_allowed_fields() {
+        assert_eq!(next_field(&[0, 1, 2], 0), 1);
+        assert_eq!(next_field(&[0, 1, 2], 2), 0);
+        assert_eq!(next_field(&[2], 2), 2, "reply has only a body field");
+        assert_eq!(next_field(&[0, 2], 0), 2, "forward skips subject");
+    }
+
+    #[test]
+    fn recipients_split_on_common_separators() {
+        assert_eq!(
+            parse_recipients("a@x.pt, b@x.pt; c@x.pt d@x.pt"),
+            vec!["a@x.pt", "b@x.pt", "c@x.pt", "d@x.pt"]
+        );
+        assert!(parse_recipients("  ,; ").is_empty());
+    }
 }
