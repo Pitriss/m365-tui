@@ -16,10 +16,23 @@ pub async fn list_chats(graph: &GraphClient, top: u32) -> Result<Vec<Chat>> {
     graph.get_page(&path).await
 }
 
-/// List messages in a chat, newest first.
-pub async fn list_messages(graph: &GraphClient, chat_id: &str, top: u32) -> Result<Vec<ChatMessage>> {
+/// List the first page of messages in a chat, newest first. Also returns the
+/// `@odata.nextLink` for fetching older messages, if there are any.
+pub async fn list_messages(
+    graph: &GraphClient,
+    chat_id: &str,
+    top: u32,
+) -> Result<(Vec<ChatMessage>, Option<String>)> {
     let path = format!("me/chats/{chat_id}/messages?$top={top}");
-    graph.get_page(&path).await
+    graph.get_page_with_next(&path).await
+}
+
+/// Fetch the next (older) page from an `@odata.nextLink`.
+pub async fn list_messages_more(
+    graph: &GraphClient,
+    next_link: &str,
+) -> Result<(Vec<ChatMessage>, Option<String>)> {
+    graph.get_page_with_next(next_link).await
 }
 
 /// Incremental sync of a chat's messages.

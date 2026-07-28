@@ -19,14 +19,23 @@ pub async fn list_channels(graph: &GraphClient, team_id: &str) -> Result<Vec<Cha
 }
 
 /// Top-level messages in a channel (replies are fetched separately by Graph).
+/// Also returns the `@odata.nextLink` for fetching older messages.
 pub async fn list_messages(
     graph: &GraphClient,
     team_id: &str,
     channel_id: &str,
     top: u32,
-) -> Result<Vec<ChatMessage>> {
+) -> Result<(Vec<ChatMessage>, Option<String>)> {
     let path = format!("teams/{team_id}/channels/{channel_id}/messages?$top={top}");
-    graph.get_page(&path).await
+    graph.get_page_with_next(&path).await
+}
+
+/// Fetch the next (older) page from an `@odata.nextLink`.
+pub async fn list_messages_more(
+    graph: &GraphClient,
+    next_link: &str,
+) -> Result<(Vec<ChatMessage>, Option<String>)> {
+    graph.get_page_with_next(next_link).await
 }
 
 /// React to a channel message with an emoji (unicode, e.g. "👍").

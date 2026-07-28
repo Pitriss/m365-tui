@@ -34,13 +34,21 @@ pub enum AppMessage {
     MessageBody(MailMessage),
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
-    ChatMessages { chat_id: String, messages: Vec<ChatMessage> },
+    ChatMessages {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        next: Option<String>,
+        /// Append older messages (load-more) vs. replace the conversation.
+        append: bool,
+    },
     Teams(Vec<Team>),
     Channels { team_id: String, channels: Vec<m365_core::models::Channel> },
     ChannelMessages {
         team_id: String,
         channel_id: String,
         messages: Vec<ChatMessage>,
+        next: Option<String>,
+        append: bool,
     },
     /// A send/action completed; optional status text and refresh hint.
     Done(String),
@@ -102,6 +110,10 @@ pub enum Overlay {
     /// Presence (status) picker for the signed-in user.
     Presence,
 }
+
+/// How many items to fetch per page — mail messages and Teams messages alike.
+/// Scrolling to the end of a list pulls the next page of this size.
+pub const PAGE_SIZE: u32 = 50;
 
 /// Emoji reactions offered in the picker, keyed 1-7.
 pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
@@ -182,6 +194,10 @@ pub struct TeamsState {
     pub messages_rendered: Vec<Text<'static>>,
     /// Selected message index in the conversation pane (drives scroll + react).
     pub msg_sel: usize,
+    /// `@odata.nextLink` for older messages in the open conversation.
+    pub messages_next: Option<String>,
+    /// Guards against firing multiple "load older" requests at once.
+    pub loading_more: bool,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: String,
@@ -201,6 +217,8 @@ impl Default for TeamsState {
             messages: Vec::new(),
             messages_rendered: Vec::new(),
             msg_sel: 0,
+            messages_next: None,
+            loading_more: false,
             open_chat_id: None,
             open_channel: None,
             composer: String::new(),
@@ -336,7 +354,7 @@ impl App {
     fn load_messages(&self, folder_id: String) {
         let s = self.session.clone();
         self.spawn(async move {
-            let (items, next) = mail::list_messages(&s.graph, &folder_id, 50).await?;
+            let (items, next) = mail::list_messages(&s.graph, &folder_id, PAGE_SIZE).await?;
             Ok(AppMessage::Messages {
                 items,
                 next,
@@ -392,9 +410,52 @@ impl App {
     fn load_chat_messages(&self, chat_id: String) {
         let s = self.session.clone();
         self.spawn(async move {
-            let messages = chats::list_messages(&s.graph, &chat_id, 40).await?;
-            Ok(AppMessage::ChatMessages { chat_id, messages })
+            let (messages, next) = chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await?;
+            Ok(AppMessage::ChatMessages {
+                chat_id,
+                messages,
+                next,
+                append: false,
+            })
         });
+    }
+
+    /// Fetch the next page of older messages for the open conversation.
+    fn load_more_teams_messages(&mut self) {
+        if self.teams.loading_more {
+            return;
+        }
+        let Some(next_link) = self.teams.messages_next.clone() else {
+            return; // reached the start of the conversation
+        };
+        self.teams.loading_more = true;
+        self.status = "loading older messages…".into();
+        let s = self.session.clone();
+
+        if let Some(chat_id) = self.teams.open_chat_id.clone() {
+            self.spawn(async move {
+                let (messages, next) = chats::list_messages_more(&s.graph, &next_link).await?;
+                Ok(AppMessage::ChatMessages {
+                    chat_id,
+                    messages,
+                    next,
+                    append: true,
+                })
+            });
+        } else if let Some((team_id, channel_id)) = self.teams.open_channel.clone() {
+            self.spawn(async move {
+                let (messages, next) = channels::list_messages_more(&s.graph, &next_link).await?;
+                Ok(AppMessage::ChannelMessages {
+                    team_id,
+                    channel_id,
+                    messages,
+                    next,
+                    append: true,
+                })
+            });
+        } else {
+            self.teams.loading_more = false;
+        }
     }
 
     fn load_teams(&self) {
@@ -413,11 +474,14 @@ impl App {
     fn load_channel_messages(&self, team_id: String, channel_id: String) {
         let s = self.session.clone();
         self.spawn(async move {
-            let messages = channels::list_messages(&s.graph, &team_id, &channel_id, 40).await?;
+            let (messages, next) =
+                channels::list_messages(&s.graph, &team_id, &channel_id, PAGE_SIZE).await?;
             Ok(AppMessage::ChannelMessages {
                 team_id,
                 channel_id,
                 messages,
+                next,
+                append: false,
             })
         });
     }
@@ -560,9 +624,14 @@ impl App {
                 self.teams.chats = c;
                 self.teams.chat_sel = self.teams.chat_sel.min(self.teams.chats.len().saturating_sub(1));
             }
-            AppMessage::ChatMessages { chat_id, messages } => {
+            AppMessage::ChatMessages {
+                chat_id,
+                messages,
+                next,
+                append,
+            } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
-                    self.set_teams_messages(messages);
+                    self.set_teams_messages(messages, next, append);
                 }
             }
             AppMessage::Teams(t) => self.teams.teams = t,
@@ -576,9 +645,11 @@ impl App {
                 team_id,
                 channel_id,
                 messages,
+                next,
+                append,
             } => {
                 if self.teams.open_channel.as_ref() == Some(&(team_id, channel_id)) {
-                    self.set_teams_messages(messages);
+                    self.set_teams_messages(messages, next, append);
                 }
             }
             AppMessage::Done(s) => {
@@ -661,15 +732,34 @@ impl App {
 
     /// Set the Teams conversation messages and pre-render their Markdown once
     /// (HTML→md is the expensive part; keep it off the render path).
-    fn set_teams_messages(&mut self, messages: Vec<ChatMessage>) {
-        self.teams.messages_rendered = messages
-            .iter()
-            .map(|m| {
-                let ct = m.body.as_ref().and_then(|b| b.content_type.as_deref());
-                content::render_body(ct, &m.text())
-            })
-            .collect();
-        self.teams.messages = messages;
+    fn set_teams_messages(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        next: Option<String>,
+        append: bool,
+    ) {
+        let rendered = messages.iter().map(|m| {
+            let ct = m.body.as_ref().and_then(|b| b.content_type.as_deref());
+            content::render_body(ct, &m.text())
+        });
+
+        if append {
+            // Older messages arrive after the ones already loaded, so the
+            // selection index stays valid.
+            self.teams.messages_rendered.extend(rendered);
+            self.teams.messages.extend(messages);
+            self.teams.loading_more = false;
+            self.status = if next.is_some() {
+                format!("{} messages loaded (more available)", self.teams.messages.len())
+            } else {
+                format!("{} messages loaded (start of conversation)", self.teams.messages.len())
+            };
+        } else {
+            self.teams.messages_rendered = rendered.collect();
+            self.teams.messages = messages;
+            self.teams.loading_more = false;
+        }
+        self.teams.messages_next = next;
         self.teams.msg_sel = self
             .teams
             .msg_sel
@@ -997,11 +1087,21 @@ impl App {
             let mut i = self.teams.msg_sel as i32;
             loop {
                 i += delta.signum();
-                if i < 0 || i >= n {
-                    return; // at an edge; keep current selection
+                if i < 0 {
+                    return; // at the newest message
+                }
+                if i >= n {
+                    // Past the oldest loaded message — pull the next page.
+                    self.load_more_teams_messages();
+                    return;
                 }
                 if self.teams.messages[i as usize].deleted_date_time.is_none() {
                     self.teams.msg_sel = i as usize;
+                    // Prefetch when landing on the last one, so the next press
+                    // doesn't stall at the bottom.
+                    if delta > 0 && self.teams.msg_sel + 1 >= self.teams.messages.len() {
+                        self.load_more_teams_messages();
+                    }
                     return;
                 }
             }
@@ -1033,6 +1133,8 @@ impl App {
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
                     self.teams.msg_sel = 0;
+                    self.teams.messages_next = None;
+                    self.teams.loading_more = false;
                     self.load_chat_messages(id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -1053,6 +1155,8 @@ impl App {
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
                     self.teams.msg_sel = 0;
+                    self.teams.messages_next = None;
+                    self.teams.loading_more = false;
                     self.load_channel_messages(team_id, ch_id);
                     self.teams.focus = TeamsFocus::Messages;
                 }
