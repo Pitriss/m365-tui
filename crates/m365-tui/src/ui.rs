@@ -227,9 +227,6 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
     // Emit a "Today"/"Yesterday"/date separator whenever the day changes.
     let mut last_day: Option<chrono::NaiveDate> = None;
     for (i, m) in app.teams.messages.iter().enumerate() {
-        // Record the start before any separator so scrolling to the first
-        // message of a day keeps its date header in view.
-        starts.push(lines.len());
         let when = local_time(m.created_date_time.as_deref());
         if let Some(when) = when {
             let day = when.date_naive();
@@ -241,6 +238,10 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                 last_day = Some(day);
             }
         }
+        // Record the start *after* any separator, so scrolling to a message
+        // puts the message itself at the top — the pinned header carries the
+        // date, and we avoid showing the same date twice.
+        starts.push(lines.len());
         let selected = selectable && i == app.teams.msg_sel;
         let marker = if !selectable {
             ""
@@ -341,10 +342,11 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         &mut lstate,
     );
 
-    // Right: messages + composer
+    // Right: messages + composer. Min(5) leaves room for the border, the pinned
+    // date header, and at least a couple of message rows on small terminals.
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
@@ -367,12 +369,24 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "Conversation"
     };
+
+    // The pane is split inside its border: a pinned date header on the first
+    // row, then the scrolling message flow. The header tracks the day of the
+    // topmost visible message, so it updates as you scroll.
+    let block = panel_block(title, focused);
+    let inner = block.inner(right[0]);
+    f.render_widget(block, right[0]);
+    let pane = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    if let Some(label) = sticky_day_label(app, &msg_starts, scroll) {
+        f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
+    }
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
-            .block(panel_block(title, focused)),
-        right[0],
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        pane[1],
     );
 
     let composer_text = if app.teams.composer.is_empty() {
@@ -606,6 +620,23 @@ fn day_label(day: chrono::NaiveDate) -> String {
     }
 }
 
+/// Day label for the message currently at the top of the visible area — the
+/// content of the pinned header. `starts` is ascending, so the topmost visible
+/// message is the last one starting at or above the scroll offset.
+fn sticky_day_label(app: &App, starts: &[usize], scroll: u16) -> Option<String> {
+    let idx = topmost_message_index(starts, scroll);
+    let when = local_time(app.teams.messages.get(idx)?.created_date_time.as_deref())?;
+    Some(day_label(when.date_naive()))
+}
+
+/// Index of the message occupying the top of the visible area.
+fn topmost_message_index(starts: &[usize], scroll: u16) -> usize {
+    starts
+        .iter()
+        .rposition(|&s| s <= scroll as usize)
+        .unwrap_or(0)
+}
+
 fn day_separator(label: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("── ", Style::default().fg(DIM)),
@@ -710,6 +741,22 @@ mod tests {
         assert!(label.contains("Mar"), "unexpected label: {label}");
         assert!(label.contains("2024"), "past years show the year: {label}");
         assert!(!label.contains('-'), "no literal padding modifier: {label}");
+    }
+
+    #[test]
+    fn sticky_header_tracks_topmost_message() {
+        use super::topmost_message_index;
+        // Three messages beginning at lines 0, 5 and 12.
+        let starts = [0usize, 5, 12];
+        assert_eq!(topmost_message_index(&starts, 0), 0);
+        assert_eq!(topmost_message_index(&starts, 4), 0); // still inside msg 0
+        assert_eq!(topmost_message_index(&starts, 5), 1); // exactly at msg 1
+        assert_eq!(topmost_message_index(&starts, 11), 1);
+        assert_eq!(topmost_message_index(&starts, 12), 2);
+        assert_eq!(topmost_message_index(&starts, 99), 2); // clamped past the end
+        // A separator above the first message must not select a negative index.
+        assert_eq!(topmost_message_index(&[3, 9], 0), 0);
+        assert_eq!(topmost_message_index(&[], 7), 0);
     }
 
     #[test]
