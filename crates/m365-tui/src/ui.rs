@@ -224,8 +224,23 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
 pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
+    // Emit a "Today"/"Yesterday"/date separator whenever the day changes.
+    let mut last_day: Option<chrono::NaiveDate> = None;
     for (i, m) in app.teams.messages.iter().enumerate() {
+        // Record the start before any separator so scrolling to the first
+        // message of a day keeps its date header in view.
         starts.push(lines.len());
+        let when = local_time(m.created_date_time.as_deref());
+        if let Some(when) = when {
+            let day = when.date_naive();
+            if last_day != Some(day) {
+                if last_day.is_some() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(day_separator(&day_label(day)));
+                last_day = Some(day);
+            }
+        }
         let selected = selectable && i == app.teams.msg_sel;
         let marker = if !selectable {
             ""
@@ -244,11 +259,10 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
             continue;
         }
 
-        let ts = m
-            .created_date_time
-            .as_deref()
-            .map(|t| t.split('T').nth(1).unwrap_or(t).trim_end_matches('Z'))
-            .unwrap_or("");
+        // Local wall-clock time (Graph returns UTC).
+        let ts = when
+            .map(|w| w.format("%H:%M").to_string())
+            .unwrap_or_default();
         lines.push(Line::from(vec![
             Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
             Span::styled(
@@ -257,7 +271,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                     .fg(if selected { Color::Cyan } else { Color::LightGreen })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(ts.to_string(), Style::default().fg(DIM)),
+            Span::styled(ts, Style::default().fg(DIM)),
         ]));
         if let Some(body) = app.teams.messages_rendered.get(i) {
             for line in &body.lines {
@@ -570,6 +584,42 @@ fn render_compose(f: &mut Frame, c: &Compose) {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// Parse a Graph UTC timestamp into the local timezone.
+fn local_time(ts: Option<&str>) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::parse_from_rfc3339(ts?)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Local))
+}
+
+/// `Today` / `Yesterday` / `Mon 21 Jul` (with the year for other years).
+fn day_label(day: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let today = chrono::Local::now().date_naive();
+    if day == today {
+        "Today".to_string()
+    } else if Some(day) == today.pred_opt() {
+        "Yesterday".to_string()
+    } else if day.year() == today.year() {
+        day.format("%a %-d %b").to_string()
+    } else {
+        day.format("%a %-d %b %Y").to_string()
+    }
+}
+
+fn day_separator(label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("── ", Style::default().fg(DIM)),
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ".to_string() + &"─".repeat(40),
+            Style::default().fg(DIM),
+        ),
+    ])
+}
+
 /// Tab-bar presence dot symbol + availability label.
 fn presence_indicator(app: &App) -> (&'static str, String) {
     let avail = app
@@ -642,6 +692,32 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{day_label, local_time};
+
+    #[test]
+    fn labels_relative_days() {
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(day_label(today), "Today");
+        assert_eq!(day_label(today.pred_opt().unwrap()), "Yesterday");
+        // An older date renders as a weekday/day/month, not "Today".
+        let old = chrono::NaiveDate::from_ymd_opt(2024, 3, 5).unwrap();
+        let label = day_label(old);
+        assert!(label.contains("Mar"), "unexpected label: {label}");
+        assert!(label.contains("2024"), "past years show the year: {label}");
+        assert!(!label.contains('-'), "no literal padding modifier: {label}");
+    }
+
+    #[test]
+    fn parses_graph_timestamps_to_local() {
+        assert!(local_time(Some("2026-07-27T14:30:00Z")).is_some());
+        assert!(local_time(Some("2026-07-27T14:30:00.123Z")).is_some());
+        assert!(local_time(Some("not a date")).is_none());
+        assert!(local_time(None).is_none());
     }
 }
 
