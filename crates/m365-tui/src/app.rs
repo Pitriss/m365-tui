@@ -16,6 +16,7 @@ use ratatui::text::Text;
 use tokio::sync::mpsc;
 
 use crate::content;
+use crate::editor::TextInput;
 use crate::navigation;
 
 /// Messages sent from background tasks to the UI loop.
@@ -168,11 +169,31 @@ impl ComposeKind {
 
 pub struct Compose {
     pub kind: ComposeKind,
-    pub to: String,
-    pub subject: String,
-    pub body: String,
+    pub to: TextInput,
+    pub subject: TextInput,
+    pub body: TextInput,
     /// 0 = To, 1 = Subject, 2 = Body (To/Subject hidden for replies).
     pub field: usize,
+}
+
+impl Compose {
+    pub fn new(kind: ComposeKind, field: usize) -> Self {
+        Self {
+            kind,
+            to: TextInput::new(),
+            subject: TextInput::new(),
+            body: TextInput::new(),
+            field,
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut TextInput {
+        match self.field {
+            0 => &mut self.to,
+            1 => &mut self.subject,
+            _ => &mut self.body,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -210,7 +231,7 @@ pub struct TeamsState {
     pub loading_more: bool,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
-    pub composer: String,
+    pub composer: TextInput,
     pub focus: TeamsFocus,
 }
 
@@ -231,7 +252,7 @@ impl Default for TeamsState {
             loading_more: false,
             open_chat_id: None,
             open_channel: None,
-            composer: String::new(),
+            composer: TextInput::new(),
             focus: TeamsFocus::List,
         }
     }
@@ -251,6 +272,9 @@ pub struct App {
     pub my_presence: Option<Presence>,
     /// Wall-clock of the last poll refresh (shown in the tab bar).
     pub last_sync: Option<String>,
+    /// Width the focused text area was last laid out at, so Up/Down move by the
+    /// rows actually on screen. Set by the renderer, read by the key handler.
+    pub text_width_hint: std::cell::Cell<usize>,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -283,6 +307,7 @@ impl App {
             me: None,
             my_presence: None,
             last_sync: None,
+            text_width_hint: std::cell::Cell::new(60),
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
@@ -692,12 +717,23 @@ impl App {
             } => {
                 let effective = presence.availability.clone().unwrap_or_default();
                 self.status = match requested {
-                    // Graph accepted the preferred status but the effective one
-                    // only changes while a Teams client session is active.
-                    Some(req) if !effective.eq_ignore_ascii_case(&req) => format!(
-                        "preferred status '{req}' saved, but Teams reports '{effective}' — it applies once you're signed in to a Teams client"
+                    Some(req) if effective.eq_ignore_ascii_case(&req) => {
+                        format!("presence set to {req}")
+                    }
+                    // e.g. requested Available, Teams reports AvailableIdle.
+                    Some(req) if effective.to_lowercase().starts_with(&req.to_lowercase()) => {
+                        format!("presence set to {req} (Teams reports {effective})")
+                    }
+                    // No client session at all: nothing can make you look online.
+                    Some(req) if effective.eq_ignore_ascii_case("Offline") => format!(
+                        "preferred status '{req}' saved — you stay Offline until a Teams client is signed in"
                     ),
-                    Some(req) => format!("presence set to {req}"),
+                    // A session exists but Teams is overriding, typically its
+                    // idle detection. Busy/DoNotDisturb survive that, Available
+                    // does not.
+                    Some(req) => format!(
+                        "preferred status '{req}' saved, but Teams shows '{effective}' — its idle detection overrides Available; Busy/DND stick"
+                    ),
                     None => format!("presence: {effective}"),
                 };
                 self.my_presence = Some(presence);
@@ -982,13 +1018,7 @@ impl App {
             }
             KeyCode::Char('g') => self.load_calendar_and_show(),
             KeyCode::Char('c') => {
-                self.overlay = Some(Overlay::Compose(Compose {
-                    kind: ComposeKind::NewMail,
-                    to: String::new(),
-                    subject: String::new(),
-                    body: String::new(),
-                    field: 0,
-                }));
+                self.overlay = Some(Overlay::Compose(empty_compose()));
             }
             KeyCode::Char('/') => {
                 self.overlay = Some(Overlay::Search { query: String::new() });
@@ -1059,26 +1089,44 @@ impl App {
             ReplyMode::ReplyAll => (ComposeKind::ReplyAllMail { id }, 2),
             ReplyMode::Forward => (ComposeKind::ForwardMail { id }, 0),
         };
-        self.overlay = Some(Overlay::Compose(Compose {
-            kind,
-            to: String::new(),
-            subject: String::new(),
-            body: String::new(),
-            field,
-        }));
+        self.overlay = Some(Overlay::Compose(Compose::new(kind, field)));
     }
 
     fn on_key_teams(&mut self, key: KeyEvent) {
         // Composer captures typing when focused.
         if self.teams.focus == TeamsFocus::Composer {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let input = &mut self.teams.composer;
             match key.code {
                 KeyCode::Esc => self.teams.focus = TeamsFocus::Messages,
                 KeyCode::Tab => self.teams.focus = TeamsFocus::List,
-                KeyCode::Enter => self.teams_send(),
-                KeyCode::Backspace => {
-                    self.teams.composer.pop();
+                // Enter sends; Shift/Alt+Enter inserts a newline instead.
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    input.insert('\n')
                 }
-                KeyCode::Char(c) => self.teams.composer.push(c),
+                KeyCode::Enter => self.teams_send(),
+                KeyCode::Up => input.move_row(-1, self.text_width_hint.get()),
+                KeyCode::Down => input.move_row(1, self.text_width_hint.get()),
+                KeyCode::Backspace => input.backspace(),
+                KeyCode::Delete => input.delete(),
+                KeyCode::Char('w') if ctrl => input.delete_word_before(),
+                KeyCode::Char('u') if ctrl => input.delete_to_line_start(),
+                KeyCode::Char('k') if ctrl => input.delete_to_line_end(),
+                KeyCode::Left if ctrl => input.word_left(),
+                KeyCode::Right if ctrl => input.word_right(),
+                KeyCode::Left => input.left(),
+                KeyCode::Right => input.right(),
+                KeyCode::Home if ctrl => input.start_of_text(),
+                KeyCode::End if ctrl => input.end_of_text(),
+                KeyCode::Char('a') if ctrl => input.home(),
+                KeyCode::Char('e') if ctrl => input.end(),
+                KeyCode::Home => input.home(),
+                KeyCode::End => input.end(),
+                KeyCode::Char(c) if !ctrl => input.insert(c),
                 _ => {}
             }
             return;
@@ -1210,7 +1258,7 @@ impl App {
     }
 
     fn teams_send(&mut self) {
-        let text = self.teams.composer.trim().to_string();
+        let text = self.teams.composer.text().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -1348,42 +1396,87 @@ impl App {
     }
 
     fn on_key_compose(&mut self, key: KeyEvent, c: &mut Compose) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_body = c.field == 2;
+        // Width the body is laid out at, so Up/Down follow what's on screen.
+        let width = self.text_width_hint.get();
+
         match key.code {
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // -- actions --
+            KeyCode::Char('s') if ctrl => {
                 self.submit_compose(c);
                 return;
             }
             KeyCode::Tab => c.field = next_field(c.kind.fields(), c.field),
-            KeyCode::Backspace => {
-                field_mut(c).pop();
-            }
+            KeyCode::BackTab => c.field = prev_field(c.kind.fields(), c.field),
             KeyCode::Enter => {
-                if c.field == 2 {
-                    field_mut(c).push('\n');
+                if is_body {
+                    c.active_mut().insert('\n');
                 } else {
                     c.field = next_field(c.kind.fields(), c.field);
                 }
             }
-            KeyCode::Char(ch) => field_mut(c).push(ch),
+
+            // -- deletion --
+            KeyCode::Backspace => c.active_mut().backspace(),
+            KeyCode::Delete => c.active_mut().delete(),
+            KeyCode::Char('w') if ctrl => c.active_mut().delete_word_before(),
+            KeyCode::Char('u') if ctrl => c.active_mut().delete_to_line_start(),
+            KeyCode::Char('k') if ctrl => c.active_mut().delete_to_line_end(),
+
+            // -- movement --
+            KeyCode::Left if ctrl => c.active_mut().word_left(),
+            KeyCode::Right if ctrl => c.active_mut().word_right(),
+            KeyCode::Left => c.active_mut().left(),
+            KeyCode::Right => c.active_mut().right(),
+            KeyCode::Up if is_body => c.active_mut().move_row(-1, width),
+            KeyCode::Down if is_body => c.active_mut().move_row(1, width),
+            KeyCode::Up => c.field = prev_field(c.kind.fields(), c.field),
+            KeyCode::Down => c.field = next_field(c.kind.fields(), c.field),
+            KeyCode::Home if ctrl => c.active_mut().start_of_text(),
+            KeyCode::End if ctrl => c.active_mut().end_of_text(),
+            KeyCode::Char('a') if ctrl => c.active_mut().home(),
+            KeyCode::Char('e') if ctrl => c.active_mut().end(),
+            KeyCode::Home => c.active_mut().home(),
+            KeyCode::End => c.active_mut().end(),
+            KeyCode::PageUp => c.active_mut().move_row(-10, width),
+            KeyCode::PageDown => c.active_mut().move_row(10, width),
+
+            // -- typing (ignore other Ctrl chords so they can't insert junk) --
+            KeyCode::Char(ch) if !ctrl => c.active_mut().insert(ch),
             _ => {}
         }
         // Put the (mutated) compose overlay back.
-        self.overlay = Some(Overlay::Compose(std::mem::replace(
-            c,
-            Compose {
-                kind: ComposeKind::NewMail,
-                to: String::new(),
-                subject: String::new(),
-                body: String::new(),
-                field: 0,
-            },
-        )));
+        self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
+    }
+
+    /// Bracketed-paste text from the terminal.
+    pub fn on_paste(&mut self, text: String) {
+        match self.overlay.take() {
+            Some(Overlay::Compose(mut c)) => {
+                c.active_mut().insert_str(&text);
+                self.overlay = Some(Overlay::Compose(c));
+            }
+            Some(Overlay::Search { mut query }) => {
+                query.push_str(text.trim());
+                self.overlay = Some(Overlay::Search { query });
+            }
+            other => {
+                self.overlay = other;
+                if self.overlay.is_none()
+                    && self.screen == Screen::Teams
+                    && self.teams.focus == TeamsFocus::Composer
+                {
+                    self.teams.composer.insert_str(&text);
+                }
+            }
+        }
     }
 
     fn submit_compose(&mut self, c: &mut Compose) {
         match &c.kind {
             ComposeKind::NewMail => {
-                let to: Vec<String> = parse_recipients(&c.to);
+                let to: Vec<String> = parse_recipients(&c.to.text());
                 if to.is_empty() {
                     self.status = "add at least one recipient".into();
                     self.overlay = Some(Overlay::Compose(std::mem::replace(
@@ -1392,22 +1485,22 @@ impl App {
                     )));
                     return;
                 }
-                self.send_mail(to, c.subject.clone(), c.body.clone());
+                self.send_mail(to, c.subject.text(), c.body.text());
             }
             ComposeKind::ReplyMail { id } => {
-                self.reply_mail(id.clone(), c.body.clone());
+                self.reply_mail(id.clone(), c.body.text());
             }
             ComposeKind::ReplyAllMail { id } => {
-                self.reply_all_mail(id.clone(), c.body.clone());
+                self.reply_all_mail(id.clone(), c.body.text());
             }
             ComposeKind::ForwardMail { id } => {
-                let to: Vec<String> = parse_recipients(&c.to);
+                let to: Vec<String> = parse_recipients(&c.to.text());
                 if to.is_empty() {
                     self.status = "add at least one recipient to forward to".into();
                     self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
                     return;
                 }
-                self.forward_mail(id.clone(), to, c.body.clone());
+                self.forward_mail(id.clone(), to, c.body.text());
             }
         }
         self.overlay = None;
@@ -1510,22 +1603,14 @@ fn next_field(fields: &[usize], current: usize) -> usize {
     fields[(pos + 1) % fields.len()]
 }
 
-fn empty_compose() -> Compose {
-    Compose {
-        kind: ComposeKind::NewMail,
-        to: String::new(),
-        subject: String::new(),
-        body: String::new(),
-        field: 0,
-    }
+/// The previous allowed field (wrapping).
+fn prev_field(fields: &[usize], current: usize) -> usize {
+    let pos = fields.iter().position(|&f| f == current).unwrap_or(0);
+    fields[(pos + fields.len() - 1) % fields.len()]
 }
 
-fn field_mut(c: &mut Compose) -> &mut String {
-    match c.field {
-        0 => &mut c.to,
-        1 => &mut c.subject,
-        _ => &mut c.body,
-    }
+fn empty_compose() -> Compose {
+    Compose::new(ComposeKind::NewMail, 0)
 }
 
 /// Move a selection index by `delta`, clamped to `[0, len)`.

@@ -8,6 +8,7 @@
 mod app;
 mod clipboard;
 mod content;
+mod editor;
 mod navigation;
 mod ui;
 
@@ -16,7 +17,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use app::{App, AppMessage};
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -116,14 +119,14 @@ async fn run_tui(session: Session) -> Result<()> {
     // Terminal setup.
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let res = event_loop(&mut terminal, &mut app, &mut app_rx, &mut change_rx).await;
 
     // Terminal teardown (best-effort even on error).
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
     res
@@ -143,6 +146,7 @@ async fn event_loop(
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => app.on_key(k),
+                    Some(Ok(Event::Paste(text))) => app.on_paste(text),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => break,

@@ -342,11 +342,14 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         &mut lstate,
     );
 
-    // Right: messages + composer. Min(5) leaves room for the border, the pinned
-    // date header, and at least a couple of message rows on small terminals.
+    // Right: messages + composer. The composer grows with its content (handy for
+    // multi-line pastes) up to a cap; Min(5) leaves room for the border, the
+    // pinned date header, and a couple of message rows on small terminals.
+    let composer_width = cols[1].width.saturating_sub(2).max(1) as usize;
+    let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([Constraint::Min(5), Constraint::Length(composer_rows + 2)])
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
@@ -389,16 +392,30 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         pane[1],
     );
 
-    let composer_text = if app.teams.composer.is_empty() {
-        Span::styled("press i to type · Enter to send", Style::default().fg(DIM))
+    let composing = app.teams.focus == TeamsFocus::Composer;
+    let title = if composing {
+        "Message (Enter send · Shift/Alt+Enter newline)"
     } else {
-        Span::raw(app.teams.composer.clone())
+        "Message"
     };
-    f.render_widget(
-        Paragraph::new(Line::from(composer_text))
-            .block(panel_block("Message", app.teams.focus == TeamsFocus::Composer)),
-        right[1],
-    );
+    let composer_block = panel_block(title, composing);
+    let composer_inner = composer_block.inner(right[1]);
+    f.render_widget(composer_block, right[1]);
+    app.text_width_hint
+        .set(composer_inner.width.max(1) as usize);
+    if app.teams.composer.is_empty() && !composing {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "press i to type · Enter to send",
+                Style::default().fg(DIM),
+            )),
+            composer_inner,
+        );
+    } else if let Some((x, y)) =
+        render_text_area(f, composer_inner, &app.teams.composer, composing)
+    {
+        f.set_cursor_position((x, y));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +442,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           j/k select message · e react · Esc / ← / h back to list\n\
           i type message · Enter send\n\
  \n\
- Compose: Tab next field · Ctrl+S send · Esc cancel\n\
+ Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
+          ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
+          Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
+          Enter newline in body · paste works (bracketed paste)\n\
  \n\
  Press Esc to close.";
             f.render_widget(
@@ -493,7 +513,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 &mut st,
             );
         }
-        Overlay::Compose(c) => render_compose(f, c),
+        Overlay::Compose(c) => render_compose(f, c, app),
         Overlay::React => {
             let area = centered(50, 24, f.area());
             f.render_widget(Clear, area);
@@ -531,7 +551,68 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
     }
 }
 
-fn render_compose(f: &mut Frame, c: &Compose) {
+
+/// Render a wrapped, vertically-scrolling text area. Returns the on-screen
+/// cursor position when focused. Shared by the compose body and the Teams
+/// composer so both wrap and scroll identically.
+fn render_text_area(
+    f: &mut Frame,
+    area: Rect,
+    input: &crate::editor::TextInput,
+    focused: bool,
+) -> Option<(u16, u16)> {
+    let width = area.width.max(1) as usize;
+    let height = area.height.max(1) as usize;
+    let wrapped = input.wrap(width);
+    let (crow, ccol) = input.cursor_position(width);
+    // Keep the cursor row on screen.
+    let scroll = crow.saturating_sub(height.saturating_sub(1));
+    let visible: Vec<Line> = wrapped
+        .iter()
+        .skip(scroll)
+        .take(height)
+        .map(|r| Line::raw(r.text.clone()))
+        .collect();
+    f.render_widget(Paragraph::new(visible), area);
+    focused.then(|| {
+        (
+            area.x + ccol.min(width.saturating_sub(1)) as u16,
+            area.y + (crow - scroll) as u16,
+        )
+    })
+}
+
+/// Render one single-line field, scrolling horizontally to keep the cursor in
+/// view. Returns the on-screen cursor column when this field is focused.
+fn render_line_field(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    input: &crate::editor::TextInput,
+    focused: bool,
+) -> Option<(u16, u16)> {
+    let style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let label_w = label.chars().count() as u16;
+    let avail = area.width.saturating_sub(label_w).max(1) as usize;
+    let text = input.text();
+    let chars: Vec<char> = text.chars().collect();
+    // Scroll so the cursor stays visible in a long recipient list.
+    let offset = input.cursor().saturating_sub(avail.saturating_sub(1));
+    let shown: String = chars.iter().skip(offset).take(avail).collect();
+
+    f.render_widget(Paragraph::new(format!("{label}{shown}")).style(style), area);
+
+    focused.then(|| {
+        let col = area.x + label_w + (input.cursor() - offset) as u16;
+        (col.min(area.x + area.width.saturating_sub(1)), area.y)
+    })
+}
+
+fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     let area = centered(70, 70, f.area());
     f.render_widget(Clear, area);
     let block = popup_block(c.kind.title());
@@ -558,40 +639,42 @@ fn render_compose(f: &mut Frame, c: &Compose) {
         .constraints(constraints)
         .split(inner);
 
-    let cur = |field: usize| {
-        if c.field == field {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        }
-    };
-
+    let mut cursor: Option<(u16, u16)> = None;
     let mut i = 0;
     if show_to {
-        f.render_widget(Paragraph::new(format!("To:      {}", c.to)).style(cur(0)), rows[i]);
+        cursor = render_line_field(f, rows[i], "To:      ", &c.to, c.field == 0).or(cursor);
         i += 1;
     }
     if show_subject {
-        f.render_widget(
-            Paragraph::new(format!("Subject: {}", c.subject)).style(cur(1)),
-            rows[i],
-        );
+        cursor = render_line_field(f, rows[i], "Subject: ", &c.subject, c.field == 1).or(cursor);
         i += 1;
     }
-    f.render_widget(Paragraph::new("Body:").style(cur(2)), rows[i]);
+
+    let body_style = if c.field == 2 {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    f.render_widget(Paragraph::new("Body:").style(body_style), rows[i]);
     i += 1;
-    f.render_widget(
-        Paragraph::new(c.body.clone()).style(cur(2)).wrap(Wrap { trim: false }),
-        rows[i],
-    );
+
+    let body_area = rows[i];
+    // Tell the key handler what width Up/Down should move by.
+    app.text_width_hint.set(body_area.width.max(1) as usize);
+    cursor = render_text_area(f, body_area, &c.body, c.field == 2).or(cursor);
     i += 1;
+
     f.render_widget(
         Paragraph::new(Span::styled(
-            "Tab next field · Ctrl+S send · Esc cancel",
+            "Tab field · ←→ move · Ctrl+←→ word · Ctrl+W/U/K delete · Ctrl+S send · Esc cancel",
             Style::default().fg(DIM),
         )),
         rows[i],
     );
+
+    if let Some((x, y)) = cursor {
+        f.set_cursor_position((x, y));
+    }
 }
 
 // ---------------------------------------------------------------------------

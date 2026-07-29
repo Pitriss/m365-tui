@@ -134,8 +134,17 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 | Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message (scroll to end loads older) · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
 | Copying | `y` yank focused message · `Y` yank whole view · `z` copy mode |
-| Compose | `Tab` next field · `Ctrl+S` send · `Esc` cancel |
+| Compose | `Tab`/`Shift+Tab` field · `←→↑↓` move · `Ctrl+←→` word · `Home`/`End` line · `Ctrl+Home`/`Ctrl+End` all · `Backspace`/`Delete` · `Ctrl+W` word · `Ctrl+U`/`Ctrl+K` to line start/end · `Ctrl+S` send · `Esc` cancel |
 | React   | `1`–`7` pick emoji · `Esc` cancel |
+
+### Writing mail
+
+The compose/reply window is a real text editor: a visible cursor, arrow-key
+movement, word jumps (`Ctrl+←/→`), per-line `Home`/`End`, `Ctrl+Home`/`Ctrl+End`
+for the whole field, `Delete` as well as `Backspace`, and the usual `Ctrl+W`
+(word), `Ctrl+U` (to line start) and `Ctrl+K` (to line end) deletions. The body
+soft-wraps and scrolls with the cursor, and terminal **paste** is supported via
+bracketed paste. The Teams composer uses the same editing keys.
 
 ### Changing your status
 
