@@ -10,6 +10,7 @@ mod clipboard;
 mod content;
 mod editor;
 mod navigation;
+mod opener;
 mod ui;
 
 use std::io::stdout;

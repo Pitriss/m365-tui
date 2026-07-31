@@ -108,6 +108,8 @@ pub enum Overlay {
     React,
     /// Presence (status) picker for the signed-in user.
     Presence,
+    /// Numbered links in the focused message, to open in a browser.
+    Links,
 }
 
 /// How many items to fetch per page — mail messages and Teams messages alike.
@@ -209,6 +211,8 @@ pub struct OutlookState {
     pub reading: Option<MailMessage>,
     /// Cached styled body of the open message (HTML parsed once, not per frame).
     pub reading_body: Option<Text<'static>>,
+    /// Links referenced by the open message, numbered `[1]`, `[2]`, ...
+    pub reading_links: Vec<String>,
     pub calendar: Vec<CalEvent>,
 }
 
@@ -223,6 +227,8 @@ pub struct TeamsState {
     pub messages: Vec<ChatMessage>,
     /// Cached styled body per message, index-aligned with `messages`.
     pub messages_rendered: Vec<Text<'static>>,
+    /// Links per message, index-aligned with `messages`.
+    pub messages_links: Vec<Vec<String>>,
     /// Selected message index in the conversation pane (drives scroll + react).
     pub msg_sel: usize,
     /// `@odata.nextLink` for older messages in the open conversation.
@@ -247,6 +253,7 @@ impl Default for TeamsState {
             channel_sel: 0,
             messages: Vec::new(),
             messages_rendered: Vec::new(),
+            messages_links: Vec::new(),
             msg_sel: 0,
             messages_next: None,
             loading_more: false,
@@ -660,7 +667,9 @@ impl App {
                     ),
                     None => (Some("text"), m.body_preview.clone().unwrap_or_default()),
                 };
-                self.outlook.reading_body = Some(content::render_body(ct, &raw));
+                let rendered = content::render_body(ct, &raw);
+                self.outlook.reading_links = rendered.links;
+                self.outlook.reading_body = Some(rendered.text);
                 self.outlook.reading = Some(m);
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
@@ -830,7 +839,7 @@ impl App {
 
         // Re-render bodies for whatever the list now holds (HTML parse is cached
         // per message, so this only costs on changed content).
-        self.teams.messages_rendered = self
+        let rendered: Vec<_> = self
             .teams
             .messages
             .iter()
@@ -839,6 +848,8 @@ impl App {
                 content::render_body(ct, &m.text())
             })
             .collect();
+        self.teams.messages_links = rendered.iter().map(|r| r.links.clone()).collect();
+        self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
 
         // Restore the selection by identity, else clamp.
         self.teams.msg_sel = selected_id
@@ -867,6 +878,29 @@ impl App {
                     }
                 }
             },
+        }
+    }
+
+    /// Links of whichever message is in focus.
+    pub fn focused_links(&self) -> &[String] {
+        match self.screen {
+            Screen::Outlook => &self.outlook.reading_links,
+            Screen::Teams => self
+                .teams
+                .messages_links
+                .get(self.teams.msg_sel)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+        }
+    }
+
+    fn open_link(&mut self, index: usize) {
+        let Some(url) = self.focused_links().get(index).cloned() else {
+            return;
+        };
+        match crate::opener::open_url(&url) {
+            Ok(()) => self.status = format!("opening {}", truncate_url(&url)),
+            Err(e) => self.status = format!("could not open link: {e:#}"),
         }
     }
 
@@ -996,6 +1030,14 @@ impl App {
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) if !typing => {
                 self.overlay = Some(Overlay::Presence);
+                return;
+            }
+            (KeyCode::Char('o'), KeyModifiers::NONE) if !typing => {
+                if self.focused_links().is_empty() {
+                    self.status = "no links in this message".into();
+                } else {
+                    self.overlay = Some(Overlay::Links);
+                }
                 return;
             }
             _ => {}
@@ -1225,6 +1267,7 @@ impl App {
                     self.teams.open_channel = None;
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
+                    self.teams.messages_links.clear();
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
@@ -1247,6 +1290,7 @@ impl App {
                     self.teams.open_chat_id = None;
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
+                    self.teams.messages_links.clear();
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
@@ -1322,6 +1366,18 @@ impl App {
                     self.overlay = Some(Overlay::React); // ignore other keys
                 }
             }
+            Some(Overlay::Links) => match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    self.open_link((c as u8 - b'1') as usize);
+                }
+                KeyCode::Char('y') => {
+                    // Copy a link instead of opening it.
+                    if let Some(url) = self.focused_links().first().cloned() {
+                        self.copy_to_clipboard(&url, "link");
+                    }
+                }
+                _ => self.overlay = Some(Overlay::Links),
+            },
             Some(Overlay::Presence) => match key.code {
                 KeyCode::Char(c @ '1'..='6') => {
                     let idx = (c as u8 - b'1') as usize;
@@ -1582,6 +1638,15 @@ fn lines_to_plain(lines: &[ratatui::text::Line<'_>]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Shorten a URL for the status line.
+fn truncate_url(url: &str) -> String {
+    if url.chars().count() <= 60 {
+        return url.to_string();
+    }
+    let head: String = url.chars().take(57).collect();
+    format!("{head}…")
 }
 
 fn now_hms() -> String {

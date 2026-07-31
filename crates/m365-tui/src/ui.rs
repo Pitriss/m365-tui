@@ -432,6 +432,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  \n\
  Global:  F2 switch app · Ctrl+P palette · p set presence · ? help · q quit\n\
  \n\
+ Links:   o list links in the message · 1-9 open in browser\n\
+ \n\
  Copying: y yank focused message · Y yank whole view\n\
           z copy mode (full-width, borderless — drag-select cleanly)\n\
  \n\
@@ -528,6 +530,38 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     .block(popup_block("Add reaction")),
                 area,
             );
+        }
+        Overlay::Links => {
+            let links = app.focused_links();
+            let area = centered(80, 60, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Links — press 1-9 to open · y copy first · Esc close");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let width = inner.width.saturating_sub(4).max(10) as usize;
+            let items: Vec<ListItem> = links
+                .iter()
+                .take(9)
+                .enumerate()
+                .map(|(i, url)| {
+                    // Wrap long URLs across lines so the whole target is visible.
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{} ", i + 1),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(host_of(url), Style::default().fg(Color::LightGreen)),
+                    ])];
+                    for chunk in chunks_of(url, width) {
+                        lines.push(Line::styled(
+                            format!("  {chunk}"),
+                            Style::default().fg(DIM),
+                        ));
+                    }
+                    ListItem::new(lines)
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
         }
         Overlay::Presence => {
             let area = centered(46, 55, f.area());
@@ -680,6 +714,24 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// The host part of a URL, for a readable link label.
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// Split a long string into fixed-width chunks so it can be shown in full.
+fn chunks_of(s: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(width.max(1))
+        .map(|c| c.iter().collect())
+        .collect()
+}
 
 /// Parse a Graph UTC timestamp into the local timezone.
 fn local_time(ts: Option<&str>) -> Option<chrono::DateTime<chrono::Local>> {

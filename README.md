@@ -133,6 +133,7 @@ and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
 | Global  | `F2` switch app · `Ctrl+P` command palette · `p` set presence · `?` help · `q`/`Ctrl+C` quit |
 | Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message (scroll to end loads older) · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
+| Links   | `o` list links in the message · `1`–`9` open in browser |
 | Copying | `y` yank focused message · `Y` yank whole view · `z` copy mode |
 | Compose | `Tab`/`Shift+Tab` field · `←→↑↓` move · `Ctrl+←→` word · `Home`/`End` line · `Ctrl+Home`/`Ctrl+End` all · `Backspace`/`Delete` · `Ctrl+W` word · `Ctrl+U`/`Ctrl+K` to line start/end · `Ctrl+S` send · `Esc` cancel |
 | React   | `1`–`7` pick emoji · `Esc` cancel |
@@ -167,6 +168,16 @@ Without it, the picker is read-only and says so.
 > **If sign-in starts asking for admin approval,** the requested scope set no
 > longer matches what was consented. Either get the new set approved, or pin the
 > old one via `M365_SCOPES` in `.env` and re-login.
+
+### Links
+
+Long URLs are kept out of the reading flow: a link renders as its anchor text
+followed by a small `[1]` marker. Press **`o`** to list the message's links and
+`1`–`9` to open one in your browser (`xdg-open`), or `y` to copy it.
+
+Microsoft Defender "Safelinks" (`*.safelinks.protection.outlook.com/?url=...`)
+are unwrapped back to their real target, so a link that arrives as ~800
+characters of tracking wrapper shows as the short URL it actually points to.
 
 ### Copying text
 

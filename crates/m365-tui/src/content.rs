@@ -18,20 +18,31 @@ const LINK: Color = Color::LightBlue;
 const CODE_FG: Color = Color::Rgb(220, 185, 130);
 const CODE_BG: Color = Color::Rgb(40, 40, 52);
 
+/// A rendered message body: styled text plus the links it referenced, in the
+/// order they were numbered (`[1]`, `[2]`, ...).
+#[derive(Debug, Clone, Default)]
+pub struct RenderedBody {
+    pub text: Text<'static>,
+    pub links: Vec<String>,
+}
+
 /// Render a Graph body to styled text. HTML is parsed and walked; plain text is
 /// split into lines verbatim.
-pub fn render_body(content_type: Option<&str>, raw: &str) -> Text<'static> {
+pub fn render_body(content_type: Option<&str>, raw: &str) -> RenderedBody {
     let is_html = content_type
         .map(|c| c.eq_ignore_ascii_case("html"))
         .unwrap_or_else(|| looks_like_html(raw));
     if is_html {
         render_html(raw)
     } else {
-        Text::from(
-            raw.lines()
-                .map(|l| Line::raw(l.to_string()))
-                .collect::<Vec<_>>(),
-        )
+        RenderedBody {
+            text: Text::from(
+                raw.lines()
+                    .map(|l| Line::raw(l.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            links: Vec::new(),
+        }
     }
 }
 
@@ -41,7 +52,7 @@ fn looks_like_html(s: &str) -> bool {
 }
 
 /// Parse HTML and walk the DOM into styled lines.
-pub fn render_html(html: &str) -> Text<'static> {
+pub fn render_html(html: &str) -> RenderedBody {
     let dom = parse_document(RcDom::default(), Default::default())
         .from_utf8()
         .read_from(&mut html.as_bytes())
@@ -49,7 +60,11 @@ pub fn render_html(html: &str) -> Text<'static> {
 
     let mut r = Renderer::default();
     r.walk(&dom.document, Style::default());
-    r.finish()
+    let links = r.links.clone();
+    RenderedBody {
+        text: r.finish(),
+        links,
+    }
 }
 
 #[derive(Default)]
@@ -61,6 +76,9 @@ struct Renderer {
     in_pre: bool,
     /// Depth of skip-containers (script/style/head) currently open.
     skip: usize,
+    /// Link targets in numbering order; the inline text shows `[n]` instead of
+    /// the URL, which keeps huge Safelinks out of the reading flow.
+    links: Vec<String>,
 }
 
 impl Renderer {
@@ -135,6 +153,15 @@ impl Renderer {
             text = text.trim_start().to_string();
         }
         self.spans.push(Span::styled(text, style));
+    }
+
+    /// Number a link, reusing the number if the same target appears again.
+    fn link_number(&mut self, url: &str) -> usize {
+        if let Some(i) = self.links.iter().position(|l| l == url) {
+            return i + 1;
+        }
+        self.links.push(url.to_string());
+        self.links.len()
     }
 
     fn walk(&mut self, node: &Handle, style: Style) {
@@ -257,9 +284,11 @@ impl Renderer {
                 let link_style = style.fg(LINK).add_modifier(Modifier::UNDERLINED);
                 self.walk_children(node, link_style);
                 if let Some(href) = attr(attrs, "href") {
+                    let href = unwrap_safelink(href.trim());
                     if !href.is_empty() && !href.starts_with('#') && !href.starts_with("mailto:") {
+                        let n = self.link_number(&href);
                         self.spans
-                            .push(Span::styled(format!(" ({href})"), Style::default().fg(DIM)));
+                            .push(Span::styled(format!("[{n}]"), Style::default().fg(LINK)));
                     }
                 }
             }
@@ -334,6 +363,53 @@ pub fn plain(text: &Text) -> String {
         .join("\n")
 }
 
+/// Microsoft Defender rewrites links through
+/// `*.safelinks.protection.outlook.com/?url=<encoded>&data=...`, which turns a
+/// short link into ~800 characters. Recover the original target.
+pub fn unwrap_safelink(url: &str) -> String {
+    if !url.contains("safelinks.protection.outlook.com") {
+        return url.to_string();
+    }
+    let Some((_, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    for pair in query.split('&') {
+        if let Some(encoded) = pair.strip_prefix("url=") {
+            let decoded = percent_decode(encoded);
+            if !decoded.is_empty() {
+                return decoded;
+            }
+        }
+    }
+    url.to_string()
+}
+
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Collapse runs of ASCII/Unicode whitespace to single spaces (HTML semantics).
 fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -372,26 +448,57 @@ mod tests {
     #[test]
     fn renders_html_without_tags() {
         let html = "<div><h2>Hi</h2><p>Some <b>bold</b> and <a href=\"https://x.io\">a link</a>.</p><ul><li>one</li><li>two</li></ul></div>";
-        let text = render_html(html);
-        let s = flat(&text);
+        let s = flat(&render_html(html).text);
         assert!(s.contains("Hi"));
         assert!(s.contains("bold"));
         assert!(s.contains("a link"));
-        assert!(s.contains("https://x.io"));
         assert!(s.contains("• one"));
         assert!(!s.contains('<'), "tags leaked: {s}");
     }
 
     #[test]
     fn plain_text_passthrough() {
-        let text = render_body(Some("text"), "line one\nline two * star");
-        assert_eq!(flat(&text), "line one\nline two * star");
+        let out = render_body(Some("text"), "line one\nline two * star");
+        assert_eq!(flat(&out.text), "line one\nline two * star");
+    }
+
+    #[test]
+    fn safelinks_are_unwrapped_to_the_real_target() {
+        let wrapped = "https://eur03.safelinks.protection.outlook.com/?url=https%3A%2F%2Ftickets.contoso.com%2Fscp%2Ftickets.php%3Fid%3D47398&data=05%7C02%7Cada.lovelace%40contoso.com%7C572b&reserved=0";
+        assert_eq!(
+            unwrap_safelink(wrapped),
+            "https://tickets.contoso.com/scp/tickets.php?id=47398"
+        );
+        // Ordinary links pass through untouched.
+        let plain = "https://github.com/contoso";
+        assert_eq!(unwrap_safelink(plain), plain);
+        // A malformed safelink must not panic or lose the original.
+        let broken = "https://eur03.safelinks.protection.outlook.com/no-query-here";
+        assert_eq!(unwrap_safelink(broken), broken);
+    }
+
+    #[test]
+    fn links_are_numbered_and_deduped_not_inlined() {
+        let html = r#"<p>Please <a href="https://example.com/login">login</a> to continue,
+                      or <a href="https://example.com/login">login here</a>,
+                      or visit <a href="https://other.example/x">other</a>.</p>"#;
+        let out = render_html(html);
+        let text = flat(&out.text);
+        // The anchor text stays, the URL does not appear in the flow.
+        assert!(text.contains("login"));
+        assert!(!text.contains("https://example.com/login"), "url leaked: {text}");
+        // Markers are numbered, and the repeated target reuses its number.
+        assert!(text.contains("[1]"), "{text}");
+        assert!(text.contains("[2]"), "{text}");
+        assert_eq!(out.links.len(), 2, "duplicate targets share a number");
+        assert_eq!(out.links[0], "https://example.com/login");
+        assert_eq!(out.links[1], "https://other.example/x");
     }
 
     #[test]
     fn script_and_style_are_dropped() {
-        let text = render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
-        let s = flat(&text);
+        let out = render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
+        let s = flat(&out.text);
         assert!(s.contains("visible"));
         assert!(!s.contains("alert"));
         assert!(!s.contains("color:red"));
