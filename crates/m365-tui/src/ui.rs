@@ -157,6 +157,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         .map(|m| {
             let unread = !m.is_read.unwrap_or(true);
             let marker = if unread { "●" } else { " " };
+            let clip = if m.has_attachments.unwrap_or(false) { "📎" } else { "" };
             let subject = m.subject.clone().unwrap_or_else(|| "(no subject)".into());
             let line = Line::from(vec![
                 Span::styled(format!("{marker} "), Style::default().fg(ACCENT)),
@@ -165,6 +166,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::LightGreen),
                 ),
                 Span::raw("  "),
+                Span::styled(clip.to_string(), Style::default().fg(DIM)),
                 Span::styled(
                     subject,
                     if unread {
@@ -212,6 +214,15 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
         kv("Date", &m.received_date_time.clone().unwrap_or_default()),
         Line::raw(""),
     ];
+    if !app.outlook.reading_attachments.is_empty() {
+        let names: Vec<String> = app
+            .outlook
+            .reading_attachments
+            .iter()
+            .map(|a| format!("{} ({})", a.display_name(), a.human_size()))
+            .collect();
+        lines.insert(3, kv("Attach", &format!("📎 {}  — press A to save", names.join(", "))));
+    }
     if let Some(body) = &app.outlook.reading_body {
         lines.extend(body.lines.iter().cloned());
     }
@@ -279,6 +290,17 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                 let mut spans = vec![Span::raw(indent)];
                 spans.extend(line.spans.iter().cloned());
                 lines.push(Line::from(spans));
+            }
+        }
+        for att in &m.attachments {
+            if let Some(name) = &att.name {
+                lines.push(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(
+                        format!("📎 {name}"),
+                        Style::default().fg(Color::LightBlue),
+                    ),
+                ]));
             }
         }
         if let Some(reactions) = m.reactions_summary() {
@@ -433,6 +455,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Global:  F2 switch app · Ctrl+P palette · p set presence · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
+ Attach:  A list attachments · 1-9 save to your Downloads folder\n\
+          when writing: Tab to Attach, type a path, Enter to attach\n\
  \n\
  Copying: y yank focused message · Y yank whole view\n\
           z copy mode (full-width, borderless — drag-select cleanly)\n\
@@ -529,6 +553,40 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     .wrap(Wrap { trim: false })
                     .block(popup_block("Add reaction")),
                 area,
+            );
+        }
+        Overlay::Attachments => {
+            let area = centered(70, 50, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Attachments — press 1-9 to save · Esc close");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let items: Vec<ListItem> = app
+                .outlook
+                .reading_attachments
+                .iter()
+                .take(9)
+                .enumerate()
+                .map(|(i, a)| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", i + 1),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(a.display_name()),
+                        Span::styled(
+                            format!("  {}  {}", a.human_size(), a.content_type.clone().unwrap_or_default()),
+                            Style::default().fg(DIM),
+                        ),
+                    ]))
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
+            let hint = format!("saves to {}", crate::files::download_dir().display());
+            let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+            f.render_widget(
+                Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
+                hint_area,
             );
         }
         Overlay::Links => {
@@ -657,7 +715,8 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     let show_to = fields.contains(&0);
     let show_subject = fields.contains(&1);
 
-    // header rows (To/Subject) + "Body:" label + body area + hint line
+    // header rows (To/Subject) + "Body:" label + body + attach + staged + hint
+    let staged = c.attachments.len() as u16;
     let mut constraints = Vec::new();
     if show_to {
         constraints.push(Constraint::Length(1));
@@ -667,6 +726,8 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     }
     constraints.push(Constraint::Length(1)); // Body: label
     constraints.push(Constraint::Min(0)); // body
+    constraints.push(Constraint::Length(1)); // Attach: input
+    constraints.push(Constraint::Length(staged.min(4))); // staged files
     constraints.push(Constraint::Length(1)); // hint
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -698,11 +759,45 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
     cursor = render_text_area(f, body_area, &c.body, c.field == 2).or(cursor);
     i += 1;
 
+    // Attach: type a path, Enter stages it.
+    cursor = render_line_field(f, rows[i], "Attach:  ", &c.attach, c.field == 3).or(cursor);
+    i += 1;
+
+    // Staged files (most recent last), capped to the rows we reserved.
+    let staged_area = rows[i];
+    if staged_area.height > 0 {
+        let shown = staged_area.height as usize;
+        let skip = c.attachments.len().saturating_sub(shown);
+        let lines: Vec<Line> = c
+            .attachments
+            .iter()
+            .skip(skip)
+            .map(|(path, size)| {
+                Line::from(vec![
+                    Span::styled("  📎 ", Style::default().fg(Color::LightBlue)),
+                    Span::raw(
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    ),
+                    Span::styled(
+                        format!("  {}", human_size(*size)),
+                        Style::default().fg(DIM),
+                    ),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), staged_area);
+    }
+    i += 1;
+
+    let hint = if c.field == 3 {
+        "Enter attach file · Ctrl+X remove last · Tab field · Ctrl+S send · Esc cancel"
+    } else {
+        "Tab field · ←→ move · Ctrl+←→ word · Ctrl+W/U/K delete · Ctrl+S send · Esc cancel"
+    };
     f.render_widget(
-        Paragraph::new(Span::styled(
-            "Tab field · ←→ move · Ctrl+←→ word · Ctrl+W/U/K delete · Ctrl+S send · Esc cancel",
-            Style::default().fg(DIM),
-        )),
+        Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
         rows[i],
     );
 
@@ -714,6 +809,16 @@ fn render_compose(f: &mut Frame, c: &Compose, app: &App) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 /// The host part of a URL, for a readable link label.
 fn host_of(url: &str) -> String {

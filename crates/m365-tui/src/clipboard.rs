@@ -53,54 +53,12 @@ fn via_helper(text: &str) -> Option<&'static str> {
 /// Terminal-native clipboard write. Safe to emit while in raw mode.
 fn via_osc52(text: &str) -> Result<()> {
     let mut out = std::io::stdout();
-    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))
+    write!(
+        out,
+        "\x1b]52;c;{}\x07",
+        m365_core::util::base64_encode(text.as_bytes())
+    )
         .context("writing OSC 52 sequence")?;
     out.flush().context("flushing OSC 52 sequence")?;
     Ok(())
-}
-
-/// Standard base64 with padding (OSC 52 payloads must be base64-encoded).
-fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
-        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::base64;
-
-    #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        // multi-byte UTF-8 round-trips through the byte encoder
-        assert_eq!(base64("é".as_bytes()), "w6k=");
-    }
 }

@@ -22,3 +22,4 @@ crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util.workspace = true
 html5ever = "0.38"
 markup5ever_rcdom = "0.38"
+directories.workspace = true

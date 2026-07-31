@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -110,6 +111,49 @@ impl GraphClient {
         let url = self.url(path);
         let bytes = self.send(reqwest::Method::GET, &url, None).await?;
         serde_json::from_slice(&bytes).context("deserializing Graph response")
+    }
+
+    /// GET returning the raw body — used for attachment `$value` downloads.
+    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let url = self.url(path);
+        self.send(reqwest::Method::GET, &url, None).await
+    }
+
+    /// PUT one chunk to an upload session URL. Those URLs carry their own
+    /// authorization, so the bearer token is deliberately not sent.
+    /// Returns true once the upload is complete.
+    ///
+    /// Takes [`Bytes`] rather than a slice: chunks are refcounted views into the
+    /// one buffer holding the file, so no chunk is ever copied. `Content-Length`
+    /// is left to reqwest, which derives it from the body — setting it here as
+    /// well would append a second, conflicting header.
+    pub async fn put_upload_chunk(
+        &self,
+        upload_url: &str,
+        start: u64,
+        total: u64,
+        chunk: Bytes,
+    ) -> Result<bool> {
+        let end = start + chunk.len() as u64 - 1;
+        let resp = self
+            .http
+            .put(upload_url)
+            .header(
+                reqwest::header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{total}"),
+            )
+            .body(chunk)
+            .send()
+            .await
+            .context("uploading attachment chunk")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("attachment upload failed ({status}): {text}");
+        }
+        // 201/200 = finished, 202 = more chunks expected.
+        Ok(status != reqwest::StatusCode::ACCEPTED)
     }
 
     pub async fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {

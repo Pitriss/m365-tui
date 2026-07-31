@@ -9,6 +9,7 @@ mod app;
 mod clipboard;
 mod content;
 mod editor;
+mod files;
 mod navigation;
 mod opener;
 mod ui;

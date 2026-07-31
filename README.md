@@ -1,258 +1,215 @@
 # m365-tui
 
-A unified **terminal client for Outlook and Microsoft Teams**, built on the
-Microsoft Graph API in Rust. One process, two screens (switch with `F2`), with
-cross-navigation between them and near-real-time updates via a
-Cloudflare-tunnelled webhook.
+A terminal client for **Outlook and Microsoft Teams**, in one app. Switch
+between the two with `F2`.
 
-- **Outlook** — folders, message list with scroll-to-load-more, an HTML-rendered
-  reading pane, compose / reply / reply-all / forward, full-text search, and a
-  7-day calendar view with RSVP.
-- **Teams** — chats and channels, a message pane with per-message selection and
-  a pinned Today/Yesterday/date header, an inline composer, **emoji reactions**,
-  and presence-aware labels.
-- **Paging** — mail and Teams messages load 50 at a time; scrolling to the end
-  of either list pulls the next page, and periodic refreshes merge in new items
-  without dropping the pages you've already scrolled back through.
-- **Rich rendering** — mail and Teams message bodies are HTML; they're rendered
-  directly to styled terminal text (headings, bold/italic, lists, code,
-  blockquotes, links) — no raw tags.
-- **Cross-navigation** — from an email, open a Teams chat with its sender
-  (command palette → *chat with selected email's sender*).
-- **Live updates** — a background poll refreshes the current view every 20s
-  (a `⟳ synced HH:MM:SS` indicator shows in the tab bar). For *instant* push,
-  Graph change notifications hit a webhook behind a Cloudflare tunnel, which
-  publishes to Redis; the TUI reacts with a targeted delta fetch
-  ("notify-then-delta").
+- **Outlook** — read mail with proper HTML rendering, compose / reply /
+  reply-all / forward, send and save attachments, search, and a 7-day calendar
+  with RSVP.
+- **Teams** — chats and channels, emoji reactions, shared files, and your
+  presence status.
+- **Live** — refreshes every 20 seconds out of the box; add a tunnel for
+  instant push notifications.
 
-## Architecture
+Built on the Microsoft Graph API in Rust. For how it works internally, see
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-```
-crates/
-  m365-core/   auth (device-code), Graph client, models, endpoints, subscriptions, event bus
-  m365-tui/    the ratatui app (binary: `m365`)
-  webhook/     axum change-notification receiver (binary: `m365-webhook`)
-docker-compose.yml   redis + webhook + cloudflared
-```
+---
 
-Real-time data flow:
+## Requirements
 
-```
-Graph --HTTPS--> cloudflared --> webhook --> Redis --> TUI --delta fetch--> Graph
-  ^                                                     |
-  └──────────── TUI creates/renews subscriptions ───────┘
-```
+- A **work or school Microsoft 365 account**. Personal accounts can't use the
+  Teams messaging APIs.
+- Rust (or Nix — see [Install](#3-install)).
+- Docker, **only** if you want instant push notifications.
 
-The webhook holds no Graph token and never calls Graph — it only validates,
-verifies `clientState`, and republishes a small "something changed" signal.
+## 1. Register an app in Entra
 
-## Prerequisites
+You need an app registration to get a client ID. Sign in at
+[entra.microsoft.com](https://entra.microsoft.com) → *Applications* →
+*App registrations* → **New registration**.
 
-- Rust toolchain. On NixOS the rustup toolchain may be broken, so use the flake
-  dev shell (nixpkgs `rustc` + `cargo`):
-  ```sh
-  nix develop                      # drop into a shell with the toolchain
-  nix develop -c cargo build       # or run a single command in it
-  ```
-- Docker + Docker Compose (only for real-time push).
-- A **work/school Microsoft 365 account** (Teams messaging APIs don't work with
-  personal accounts).
+1. **Name**: anything, e.g. `m365-tui`.
+2. **Supported account types**: *Accounts in this organizational directory only*.
+3. **Redirect URI**: leave blank.
+4. Click **Register**, then copy the **Application (client) ID** and
+   **Directory (tenant) ID** from the Overview page.
 
-## 1. Register an Entra application
+Then two settings on that app:
 
-In the [Entra admin center](https://entra.microsoft.com) → *App registrations* →
-*New registration*:
+5. **Authentication** → *Advanced settings* → **Allow public client flows** →
+   **Yes**. Sign-in fails without this.
+6. **API permissions** → *Add a permission* → *Microsoft Graph* →
+   **Delegated permissions**, and add:
 
-1. **Supported account types**: single tenant (your org) is fine.
-2. **Authentication** → *Advanced settings* → **Allow public client flows** →
-   **Yes**. (Device-code flow needs this; no redirect URI is required.)
-3. **API permissions** → *Microsoft Graph* → *Delegated*, add:
-   `User.Read`, `People.Read`, `Mail.ReadWrite`, `Mail.Send`,
-   `Calendars.ReadWrite`, `Chat.ReadWrite`, `ChannelMessage.Send`,
-   `ChannelMessage.Read.All`, `Presence.Read.All` (and `offline_access`,
-   `openid`, `profile`).
-   - Optionally `Presence.ReadWrite` to *change* your own status — see
-     [Changing your status](#changing-your-status).
-   - **`ChannelMessage.Read.All` requires admin consent.** If you're not an
-     admin, click *Grant admin consent* is unavailable — ask IT, or start
-     Outlook-only by trimming scopes (see `M365_SCOPES` in `.env`).
-4. Copy the **Application (client) ID** and (optionally) the **Directory
-   (tenant) ID**.
+   ```
+   User.Read  People.Read
+   Mail.ReadWrite  Mail.Send
+   Calendars.ReadWrite
+   Chat.ReadWrite  ChannelMessage.Send  ChannelMessage.Read.All
+   Presence.Read.All
+   offline_access  openid  profile
+   ```
 
-> **Most likely blocker:** your tenant may forbid third-party app registrations
-> or require admin approval. That's an org policy, not a code issue.
+7. Click **Grant admin consent**.
+
+> **If you're not an admin**, that button is greyed out. `ChannelMessage.Read.All`
+> and `Presence.Read.All` need an administrator — ask them to register the app
+> and grant consent, then use the client ID they give you. You sign in as
+> yourself; the app acts on your behalf.
+>
+> To start without an admin, use Outlook-only scopes by setting `M365_SCOPES` in
+> `.env` (see [.env.example](.env.example)).
 
 ## 2. Configure
 
 ```sh
 cp .env.example .env
-# edit .env: set at least M365_CLIENT_ID (and M365_TENANT_ID if not `organizations`)
 ```
 
-For **poll-only mode** (no push), leave `M365_TUNNEL_BASE_URL` empty — the app is
-fully functional, just not instant.
+Set at minimum:
 
-## 3. Build & run
+```dotenv
+M365_CLIENT_ID=<Application (client) ID>
+M365_TENANT_ID=<Directory (tenant) ID>
+```
+
+Leave `M365_TUNNEL_BASE_URL` empty for now — the app works fully without it,
+just polling instead of instant push.
+
+## 3. Install
+
+**With Nix:**
+
+```sh
+nix run github:rootHytx/m365-tui         # try it
+nix profile install github:rootHytx/m365-tui
+```
+
+Or as a flake input, referencing `m365-tui.packages.${system}.default`.
+
+**Prebuilt binary:** download the `x86_64-linux` tarball from the
+[latest release](https://github.com/rootHytx/m365-tui/releases/latest). It's
+statically linked, so it runs anywhere including NixOS.
+
+**From source:**
+
+```sh
+cargo build --release            # binary at target/release/m365
+```
+
+On NixOS, or if your Rust toolchain misbehaves, use the bundled dev shell:
 
 ```sh
 nix develop -c cargo build --release
-
-# Auth smoke test (device-code login, prints your identity):
-nix develop -c cargo run -p m365-tui -- whoami
-
-# Launch the TUI:
-nix develop -c cargo run -p m365-tui
 ```
 
-### Via the Nix flake
+## 4. Run
 
 ```sh
-nix run  github:rootHytx/m365-tui          # run without installing
-nix build github:rootHytx/m365-tui         # build ./result/bin/m365
+m365 whoami     # sign in and print your identity — a good first check
+m365            # launch
 ```
 
-Or add it to a system/home-manager flake as an input (`m365-tui.url =
-"github:rootHytx/m365-tui"`) and reference
-`m365-tui.packages.${system}.default`.
+The first run prints a URL and a code: open the URL, enter the code, sign in.
+The token is cached at `~/.config/m365-tui/token-cache.json` and refreshed
+automatically, so you only do this once.
 
-### Prebuilt binary
+---
 
-Grab the static `x86_64-linux` tarball from the
-[latest release](https://github.com/rootHytx/m365-tui/releases/latest) — it
-contains `m365` and `m365-webhook` and runs as-is (musl, no glibc dependency, so
-it works on NixOS too).
+## Keys
 
-On first launch you'll get a device-code prompt: open the URL, enter the code,
-and sign in. The token is cached at `~/.config/m365-tui/token-cache.json`
-(mode `0600`) and refreshed silently thereafter.
+Press `?` in the app for this list at any time.
 
-### Keys
+| Scope | Keys |
+|---|---|
+| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
+| **Outlook** | `Tab` change pane · `j`/`k` move · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
+| **Teams** | `Tab` change pane · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `i` write · `Enter` send · `Esc` back |
+| **Attachments** | `A` list · `1`–`9` save to Downloads |
+| **Links** | `o` list · `1`–`9` open in browser |
+| **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
+| **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+S` send · `Esc` cancel |
 
-| Scope   | Keys |
-|---------|------|
-| Global  | `F2` switch app · `Ctrl+P` command palette · `p` set presence · `?` help · `q`/`Ctrl+C` quit |
-| Outlook | `Tab` cycle panes · `j`/`k` move (scroll to bottom loads more) · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
-| Teams   | `Tab` cycle panes · `Enter` open · `t` chats↔channels · `j`/`k` select message (scroll to end loads older) · `e` react · `Esc`/`←`/`h` back to list · `i` type · `Enter` send |
-| Links   | `o` list links in the message · `1`–`9` open in browser |
-| Copying | `y` yank focused message · `Y` yank whole view · `z` copy mode |
-| Compose | `Tab`/`Shift+Tab` field · `←→↑↓` move · `Ctrl+←→` word · `Home`/`End` line · `Ctrl+Home`/`Ctrl+End` all · `Backspace`/`Delete` · `Ctrl+W` word · `Ctrl+U`/`Ctrl+K` to line start/end · `Ctrl+S` send · `Esc` cancel |
-| React   | `1`–`7` pick emoji · `Esc` cancel |
+Scrolling to the end of a message list or conversation loads the next 50 items.
 
-### Writing mail
+## Things worth knowing
 
-The compose/reply window is a real text editor: a visible cursor, arrow-key
-movement, word jumps (`Ctrl+←/→`), per-line `Home`/`End`, `Ctrl+Home`/`Ctrl+End`
-for the whole field, `Delete` as well as `Backspace`, and the usual `Ctrl+W`
-(word), `Ctrl+U` (to line start) and `Ctrl+K` (to line end) deletions. The body
-soft-wraps and scrolls with the cursor, and terminal **paste** is supported via
-bracketed paste. The Teams composer uses the same editing keys.
+**Sending attachments.** In the compose window, `Tab` to the `Attach:` field,
+type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X` removes the
+last one. Files over 3 MB upload in chunks automatically; Graph's own ceiling is
+150 MB per message.
 
-### Changing your status
+**Saving attachments.** Messages with attachments show 📎. Press `A`, then a
+number, to save to your Downloads folder. Files are never overwritten.
 
-`p` shows your presence and offers Available / Busy / DND / Be right back / Away
-/ Appear offline (Graph `setUserPreferredPresence`, same as Teams' sticky status).
+**Links.** Long URLs are kept out of the text — a link shows as its text plus
+`[1]`. Press `o` to list them and a number to open. Microsoft "Safelinks"
+tracking wrappers are unwrapped back to the real destination.
 
-Reading your status works out of the box. **Setting** it needs the extra
-`Presence.ReadWrite` scope, which is **opt-in** — adding a scope invalidates any
-existing consent grant, and in tenants that disallow user consent every sign-in
-then requires fresh admin approval. To enable it:
+**Copying text.** Press `y` to copy a message straight to the clipboard, or `z`
+for copy mode — a borderless full-width view where a normal mouse drag selects
+only the message text, with no side panes in the way.
 
-1. Add the `Presence.ReadWrite` delegated permission to the app registration and
-   grant admin consent.
-2. Set `M365_PRESENCE_WRITE=1` in `.env`.
-3. Re-authenticate: `rm ~/.config/m365-tui/token-cache.json` then
-   `m365 login`.
+**Your status.** `p` sets Available / Busy / DND / Away / Appear offline. This
+needs one extra permission (`Presence.ReadWrite`) plus `M365_PRESENCE_WRITE=1`
+in `.env`; without them the picker is read-only.
 
-Without it, the picker is read-only and says so.
+Note that Teams overrides `Available` with `Away` when its client is idle. If
+you want a status that sticks while you work in the terminal, use **Busy** or
+**Do not disturb**.
 
-> **If sign-in starts asking for admin approval,** the requested scope set no
-> longer matches what was consented. Either get the new set approved, or pin the
-> old one via `M365_SCOPES` in `.env` and re-login.
+## Instant push (optional)
 
-### Links
+Polling every 20 seconds is the default and needs nothing. For ~1-second
+updates, run the webhook behind a Cloudflare tunnel.
 
-Long URLs are kept out of the reading flow: a link renders as its anchor text
-followed by a small `[1]` marker. Press **`o`** to list the message's links and
-`1`–`9` to open one in your browser (`xdg-open`), or `y` to copy it.
-
-Microsoft Defender "Safelinks" (`*.safelinks.protection.outlook.com/?url=...`)
-are unwrapped back to their real target, so a link that arrives as ~800
-characters of tracking wrapper shows as the short URL it actually points to.
-
-### Copying text
-
-Terminal selection is linear across the whole screen, so dragging over the
-reading pane would otherwise also grab the list pane beside it. Two ways around
-that:
-
-- **`y` / `Y`** — copy straight to the system clipboard, no mouse involved. `y`
-  copies the focused item (open email body, or selected Teams message); `Y`
-  copies the whole view (email with headers, or the entire conversation). Uses
-  `wl-copy`/`xclip`/`xsel` when available, else the OSC 52 escape sequence (which
-  also works over SSH).
-- **`z` copy mode** — redraws the current message/conversation full-width with no
-  borders and no side panes, so a normal terminal drag-select captures exactly the
-  text. `j`/`k` scroll, `y` yanks everything, `z`/`Esc` exits.
-
-Logs go to `$TMPDIR/m365-tui.log` (set `RUST_LOG=debug` for detail).
-
-## 4. Real-time (tunnel + Docker)
-
-1. Create a **Cloudflare Tunnel** (Zero Trust dashboard → *Networks* →
-   *Tunnels*), add a public hostname routing to `http://webhook:8080`, and copy
-   the tunnel **token**.
-2. In `.env` set:
-   - `CLOUDFLARE_TUNNEL_TOKEN=` the token
-   - `M365_TUNNEL_BASE_URL=https://<your-tunnel-hostname>` (no trailing slash)
-   - `M365_CLIENT_STATE=` a shared secret (`openssl rand -hex 16`)
-3. Start the stack:
+1. Create a tunnel at [one.dash.cloudflare.com](https://one.dash.cloudflare.com)
+   → *Networks* → *Tunnels*, and copy its token.
+2. Add a route: **Published application** → a hostname on a domain in your
+   Cloudflare account → service `http://webhook:8080`.
+3. In `.env`:
+   ```dotenv
+   M365_TUNNEL_BASE_URL=https://<your-hostname>
+   CLOUDFLARE_TUNNEL_TOKEN=<the token>
+   M365_CLIENT_STATE=<openssl rand -hex 16>
+   ```
+4. Start it, **before** launching the app:
    ```sh
    docker compose up -d --build
-   docker compose logs -f cloudflared   # confirm the tunnel is up
+   curl https://<your-hostname>/healthz     # expect: ok
    ```
-4. Launch the TUI (on the host). Because `M365_TUNNEL_BASE_URL` is now set, it
-   creates Graph subscriptions pointing at the tunnel and renews them every
-   45 min (chat subscriptions expire in ~1h).
 
-For a throwaway URL without a Cloudflare account, use a quick tunnel — see the
-commented `command:` in `docker-compose.yml`, then read the printed
-`https://*.trycloudflare.com` host into `M365_TUNNEL_BASE_URL`.
+No domain? Use a throwaway tunnel instead — see the commented `command:` in
+[docker-compose.yml](docker-compose.yml) — and put the printed
+`https://*.trycloudflare.com` URL in `M365_TUNNEL_BASE_URL`.
 
-## 5. Verify end-to-end
+## Troubleshooting
 
-1. **Auth**: `cargo run -p m365-tui -- whoami` prints your name/email; relaunch
-   and confirm no second login (silent refresh from cache).
-2. **Outlook**: read an email, `c` to send yourself a test mail, `r` to reply,
-   `g` for the calendar — cross-check in Outlook web.
-3. **Teams**: open a chat, `i` then type, `Enter` to send — confirm in Teams.
-4. **Handshake**: `docker compose up`; the first TUI launch with a tunnel set
-   should create subscriptions without error (the webhook echoes Graph's
-   `validationToken`). Check `docker compose logs webhook`.
-5. **Live push**: from your phone, send yourself an email and a Teams chat →
-   both appear in the TUI within ~1–2s.
-6. **Resilience**: `docker compose stop cloudflared` → new messages still show
-   up via polling (slower); restart → push resumes after renewal.
+**Sign-in asks for admin approval.** The requested scopes no longer match what
+was consented. Either have an admin approve the new set, or pin the old one with
+`M365_SCOPES` in `.env` and sign in again.
 
-## Tests
+**Nothing arrives instantly.** Check `docker compose logs webhook`, and confirm
+`M365_TUNNEL_BASE_URL` exactly matches your tunnel hostname. Subscription errors
+are recorded in `$TMPDIR/m365-tui.log`.
+
+**Anything else.** Logs go to `$TMPDIR/m365-tui.log`; run with `RUST_LOG=debug`
+for detail.
+
+## Development
 
 ```sh
-nix develop -c cargo test --workspace
+cargo test --workspace
+cargo clippy --workspace
 ```
 
-## Releases
+Tagging a release (`v0.1.0`) builds static binaries and publishes them via
+GitHub Actions. Design notes and internals live in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-Pushing a tag matching `v*.*` triggers `.github/workflows/release.yml`, which
-builds a static `x86_64-unknown-linux-musl` binary of both `m365` and
-`m365-webhook`, packages them into a tarball (with a SHA-256 checksum), and
-publishes a GitHub Release with auto-generated notes.
+## Not supported
 
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-## Out of scope
-
-Joining Teams audio/video/screen-share calls (not a terminal capability) and
-bulk chat export (a separately-approved "protected" Graph API). You can list and
-schedule meetings, just not join their media.
+Joining Teams calls or meetings (audio/video isn't a terminal thing — you can
+still list and schedule them), and bulk chat export, which needs separately
+approved Graph permissions.

@@ -29,6 +29,7 @@ directories = "5"
 dotenvy = "0.15"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio"] }
 futures-util = "0.3"
+bytes = "1"
 
 # Keep debug builds snappy; the TUI is I/O-bound anyway.
 [profile.dev]

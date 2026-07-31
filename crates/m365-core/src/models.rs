@@ -283,6 +283,8 @@ pub struct ChatMessage {
     pub deleted_date_time: Option<String>,
     #[serde(default)]
     pub reactions: Vec<MessageReaction>,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -371,6 +373,60 @@ pub struct Presence {
     pub availability: Option<String>,
     #[serde(default)]
     pub activity: Option<String>,
+}
+
+/// A mail attachment. Listing deliberately omits `contentBytes` — those are
+/// fetched separately so a big file isn't pulled just to show its name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<i64>,
+    #[serde(default)]
+    pub is_inline: Option<bool>,
+    /// `#microsoft.graph.fileAttachment`, `itemAttachment`, `referenceAttachment`.
+    #[serde(default, rename = "@odata.type")]
+    pub odata_type: Option<String>,
+}
+
+impl Attachment {
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| "(unnamed)".into())
+    }
+
+    /// Only file attachments have bytes to download.
+    pub fn is_file(&self) -> bool {
+        self.odata_type
+            .as_deref()
+            .map(|t| t.ends_with("fileAttachment"))
+            .unwrap_or(true)
+    }
+
+    pub fn human_size(&self) -> String {
+        match self.size {
+            Some(b) if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+            Some(b) if b >= 1024 => format!("{:.0} KB", b as f64 / 1024.0),
+            Some(b) => format!("{b} B"),
+            None => String::new(),
+        }
+    }
+}
+
+/// A file shared in a Teams message (points at SharePoint/OneDrive).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageAttachment {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_url: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 /// Outbound draft used by the compose views for both mail and Teams messages.

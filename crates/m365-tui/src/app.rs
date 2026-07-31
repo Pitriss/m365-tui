@@ -6,10 +6,13 @@
 
 use std::future::Future;
 
+use anyhow::Context;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team,
+    User,
 };
 use m365_core::{calendar, chats, channels, mail, people, Session};
 use ratatui::text::Text;
@@ -60,6 +63,10 @@ pub enum AppMessage {
         presence: Presence,
         requested: Option<String>,
     },
+    /// Attachments of the open mail message.
+    Attachments { message_id: String, items: Vec<Attachment> },
+    /// A downloaded attachment, ready to write to disk.
+    Downloaded { name: String, bytes: Vec<u8> },
     /// Periodic tick: refresh the current view from the server.
     Poll,
 }
@@ -110,6 +117,8 @@ pub enum Overlay {
     Presence,
     /// Numbered links in the focused message, to open in a browser.
     Links,
+    /// Attachments of the open mail message, to save to disk.
+    Attachments,
 }
 
 /// How many items to fetch per page — mail messages and Teams messages alike.
@@ -150,12 +159,13 @@ pub enum ComposeKind {
 }
 
 impl ComposeKind {
-    /// Which compose fields are shown/editable: 0 = To, 1 = Subject, 2 = Body.
+    /// Which compose fields are shown/editable:
+    /// 0 = To, 1 = Subject, 2 = Body, 3 = Attach (a file path to stage).
     pub fn fields(&self) -> &'static [usize] {
         match self {
-            ComposeKind::NewMail => &[0, 1, 2],
-            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. } => &[2],
-            ComposeKind::ForwardMail { .. } => &[0, 2],
+            ComposeKind::NewMail => &[0, 1, 2, 3],
+            ComposeKind::ReplyMail { .. } | ComposeKind::ReplyAllMail { .. } => &[2, 3],
+            ComposeKind::ForwardMail { .. } => &[0, 2, 3],
         }
     }
 
@@ -174,7 +184,11 @@ pub struct Compose {
     pub to: TextInput,
     pub subject: TextInput,
     pub body: TextInput,
-    /// 0 = To, 1 = Subject, 2 = Body (To/Subject hidden for replies).
+    /// Path being typed in the Attach field.
+    pub attach: TextInput,
+    /// Files staged for sending, as (path, size).
+    pub attachments: Vec<(std::path::PathBuf, u64)>,
+    /// 0 = To, 1 = Subject, 2 = Body, 3 = Attach.
     pub field: usize,
 }
 
@@ -185,7 +199,30 @@ impl Compose {
             to: TextInput::new(),
             subject: TextInput::new(),
             body: TextInput::new(),
+            attach: TextInput::new(),
+            attachments: Vec::new(),
             field,
+        }
+    }
+
+    /// Stage the path currently typed in the Attach field.
+    /// Returns a message for the status line.
+    fn stage_attachment(&mut self) -> String {
+        let raw = self.attach.text();
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+        let path = expand_tilde(raw);
+        match std::fs::metadata(&path) {
+            Ok(md) if md.is_file() => {
+                let size = md.len();
+                self.attachments.push((path.clone(), size));
+                self.attach.clear();
+                format!("attached {} ({})", path.display(), human_size(size))
+            }
+            Ok(_) => format!("{} is not a file", path.display()),
+            Err(e) => format!("cannot attach {}: {e}", path.display()),
         }
     }
 
@@ -193,6 +230,7 @@ impl Compose {
         match self.field {
             0 => &mut self.to,
             1 => &mut self.subject,
+            3 => &mut self.attach,
             _ => &mut self.body,
         }
     }
@@ -213,6 +251,8 @@ pub struct OutlookState {
     pub reading_body: Option<Text<'static>>,
     /// Links referenced by the open message, numbered `[1]`, `[2]`, ...
     pub reading_links: Vec<String>,
+    /// Attachments of the open message (fetched when it has any).
+    pub reading_attachments: Vec<Attachment>,
     pub calendar: Vec<CalEvent>,
 }
 
@@ -421,6 +461,37 @@ impl App {
         });
     }
 
+    fn load_attachments(&self, message_id: String) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            let items = mail::list_attachments(&s.graph, &message_id).await?;
+            Ok(AppMessage::Attachments { message_id, items })
+        });
+    }
+
+    /// Download one attachment; the write to disk happens on the UI thread.
+    fn download_attachment(&mut self, index: usize) {
+        let (Some(msg), Some(att)) = (
+            self.outlook.reading.as_ref(),
+            self.outlook.reading_attachments.get(index),
+        ) else {
+            return;
+        };
+        if !att.is_file() {
+            self.status = "only file attachments can be saved".into();
+            return;
+        }
+        let message_id = msg.id.clone();
+        let attachment_id = att.id.clone();
+        let name = att.display_name();
+        self.status = format!("downloading {name}…");
+        let s = self.session.clone();
+        self.spawn(async move {
+            let bytes = mail::download_attachment(&s.graph, &message_id, &attachment_id).await?;
+            Ok(AppMessage::Downloaded { name, bytes })
+        });
+    }
+
     fn load_body(&self, id: String) {
         let s = self.session.clone();
         self.spawn(async move { Ok(AppMessage::MessageBody(mail::get_message(&s.graph, &id).await?)) });
@@ -540,38 +611,6 @@ impl App {
         });
     }
 
-    fn send_mail(&self, to: Vec<String>, subject: String, body: String) {
-        let s = self.session.clone();
-        self.spawn(async move {
-            mail::send_mail(&s.graph, &to, &subject, &body).await?;
-            Ok(AppMessage::Done("mail sent".into()))
-        });
-    }
-
-    fn reply_mail(&self, id: String, comment: String) {
-        let s = self.session.clone();
-        self.spawn(async move {
-            mail::reply(&s.graph, &id, &comment).await?;
-            Ok(AppMessage::Done("reply sent".into()))
-        });
-    }
-
-    fn reply_all_mail(&self, id: String, comment: String) {
-        let s = self.session.clone();
-        self.spawn(async move {
-            mail::reply_all(&s.graph, &id, &comment).await?;
-            Ok(AppMessage::Done("reply-all sent".into()))
-        });
-    }
-
-    fn forward_mail(&self, id: String, to: Vec<String>, comment: String) {
-        let s = self.session.clone();
-        self.spawn(async move {
-            mail::forward(&s.graph, &id, &to, &comment).await?;
-            Ok(AppMessage::Done("message forwarded".into()))
-        });
-    }
-
     fn open_chat_with_email(&self, email: String) {
         let s = self.session.clone();
         let me_id = self.me.as_ref().map(|m| m.id.clone());
@@ -670,6 +709,10 @@ impl App {
                 let rendered = content::render_body(ct, &raw);
                 self.outlook.reading_links = rendered.links;
                 self.outlook.reading_body = Some(rendered.text);
+                self.outlook.reading_attachments.clear();
+                if m.has_attachments.unwrap_or(false) {
+                    self.load_attachments(m.id.clone());
+                }
                 self.outlook.reading = Some(m);
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
@@ -746,6 +789,23 @@ impl App {
                     None => format!("presence: {effective}"),
                 };
                 self.my_presence = Some(presence);
+            }
+            AppMessage::Attachments { message_id, items } => {
+                // Ignore a late response for a message we've navigated away from.
+                if self.outlook.reading.as_ref().map(|m| m.id.as_str()) == Some(&message_id) {
+                    // Inline images (signatures, logos) aren't useful downloads.
+                    self.outlook.reading_attachments =
+                        items.into_iter().filter(|a| !a.is_inline.unwrap_or(false)).collect();
+                }
+            }
+            AppMessage::Downloaded { name, bytes } => {
+                let size = bytes.len();
+                match crate::files::save(&name, &bytes) {
+                    Ok(path) => {
+                        self.status = format!("saved {} ({size} bytes) to {}", name, path.display())
+                    }
+                    Err(e) => self.status = format!("could not save {name}: {e:#}"),
+                }
             }
             AppMessage::Poll => self.poll(),
         }
@@ -848,7 +908,24 @@ impl App {
                 content::render_body(ct, &m.text())
             })
             .collect();
-        self.teams.messages_links = rendered.iter().map(|r| r.links.clone()).collect();
+        // Shared files are openable too: fold their URLs into the link list.
+        self.teams.messages_links = self
+            .teams
+            .messages
+            .iter()
+            .zip(rendered.iter())
+            .map(|(m, r)| {
+                let mut links = r.links.clone();
+                for att in &m.attachments {
+                    if let Some(url) = att.content_url.as_ref().filter(|u| !u.is_empty()) {
+                        if !links.contains(url) {
+                            links.push(url.clone());
+                        }
+                    }
+                }
+                links
+            })
+            .collect();
         self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
 
         // Restore the selection by identity, else clamp.
@@ -1030,6 +1107,16 @@ impl App {
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) if !typing => {
                 self.overlay = Some(Overlay::Presence);
+                return;
+            }
+            (KeyCode::Char('A'), _) if !typing => {
+                if self.screen == Screen::Outlook {
+                    if self.outlook.reading_attachments.is_empty() {
+                        self.status = "no attachments on this message".into();
+                    } else {
+                        self.overlay = Some(Overlay::Attachments);
+                    }
+                }
                 return;
             }
             (KeyCode::Char('o'), KeyModifiers::NONE) if !typing => {
@@ -1366,6 +1453,12 @@ impl App {
                     self.overlay = Some(Overlay::React); // ignore other keys
                 }
             }
+            Some(Overlay::Attachments) => match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    self.download_attachment((c as u8 - b'1') as usize);
+                }
+                _ => self.overlay = Some(Overlay::Attachments),
+            },
             Some(Overlay::Links) => match key.code {
                 KeyCode::Char(c @ '1'..='9') => {
                     self.open_link((c as u8 - b'1') as usize);
@@ -1468,8 +1561,19 @@ impl App {
             KeyCode::Enter => {
                 if is_body {
                     c.active_mut().insert('\n');
+                } else if c.field == 3 {
+                    let msg = c.stage_attachment();
+                    if !msg.is_empty() {
+                        self.status = msg;
+                    }
                 } else {
                     c.field = next_field(c.kind.fields(), c.field);
+                }
+            }
+            // Drop the most recently staged attachment.
+            KeyCode::Char('x') if ctrl => {
+                if let Some((p, _)) = c.attachments.pop() {
+                    self.status = format!("removed {}", p.display());
                 }
             }
 
@@ -1530,36 +1634,69 @@ impl App {
     }
 
     fn submit_compose(&mut self, c: &mut Compose) {
-        match &c.kind {
+        use m365_core::mail::Outgoing;
+
+        // Recipients are required for a new mail and for a forward.
+        let kind = match &c.kind {
             ComposeKind::NewMail => {
-                let to: Vec<String> = parse_recipients(&c.to.text());
+                let to = parse_recipients(&c.to.text());
                 if to.is_empty() {
                     self.status = "add at least one recipient".into();
-                    self.overlay = Some(Overlay::Compose(std::mem::replace(
-                        c,
-                        empty_compose(),
-                    )));
+                    self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
                     return;
                 }
-                self.send_mail(to, c.subject.text(), c.body.text());
+                Outgoing::New {
+                    to,
+                    subject: c.subject.text(),
+                }
             }
-            ComposeKind::ReplyMail { id } => {
-                self.reply_mail(id.clone(), c.body.text());
-            }
-            ComposeKind::ReplyAllMail { id } => {
-                self.reply_all_mail(id.clone(), c.body.text());
-            }
+            ComposeKind::ReplyMail { id } => Outgoing::Reply { id: id.clone() },
+            ComposeKind::ReplyAllMail { id } => Outgoing::ReplyAll { id: id.clone() },
             ComposeKind::ForwardMail { id } => {
-                let to: Vec<String> = parse_recipients(&c.to.text());
+                let to = parse_recipients(&c.to.text());
                 if to.is_empty() {
                     self.status = "add at least one recipient to forward to".into();
                     self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
                     return;
                 }
-                self.forward_mail(id.clone(), to, c.body.text());
+                Outgoing::Forward {
+                    id: id.clone(),
+                    to,
+                }
             }
-        }
+        };
+
+        let paths = c.attachments.clone();
+        let body = c.body.text();
+        let label = match paths.len() {
+            0 => "sending…".to_string(),
+            1 => "sending with 1 attachment…".to_string(),
+            n => format!("sending with {n} attachments…"),
+        };
+        self.status = label;
         self.overlay = None;
+
+        let s = self.session.clone();
+        self.spawn(async move {
+            // Read the staged files here, off the UI thread.
+            let mut attachments = Vec::with_capacity(paths.len());
+            for (path, _) in &paths {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "attachment".to_string());
+                attachments.push(m365_core::mail::OutgoingAttachment { name, bytes });
+            }
+            let count = attachments.len();
+            mail::send_message(&s.graph, kind, &body, attachments).await?;
+            Ok(AppMessage::Done(match count {
+                0 => "sent".to_string(),
+                1 => "sent with 1 attachment".to_string(),
+                n => format!("sent with {n} attachments"),
+            }))
+        });
     }
 
     fn run_search(&mut self, query: String) {
@@ -1647,6 +1784,26 @@ fn truncate_url(url: &str) -> String {
     }
     let head: String = url.chars().take(57).collect();
     format!("{head}…")
+}
+
+/// Expand a leading `~` to the user's home directory.
+fn expand_tilde(p: &str) -> std::path::PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(p)
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn now_hms() -> String {

@@ -858,6 +858,7 @@ name = "m365-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "directories",
  "dotenvy",
@@ -879,6 +880,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "directories",
  "futures-util",
  "html5ever",
  "m365-core",

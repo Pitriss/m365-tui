@@ -16,6 +16,7 @@ pub mod mail;
 pub mod models;
 pub mod people;
 pub mod subscriptions;
+pub mod util;
 
 use std::sync::Arc;
 
