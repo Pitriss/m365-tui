@@ -205,15 +205,20 @@ single code path — the small-attachment route has to buffer anyway to base64 i
 change if very large files ever mattered; it would mean `m365-core` doing
 filesystem I/O, which it otherwise avoids.
 
-## The status bar
+## Chrome layout
 
-The bottom row is split three ways so nothing has to compete for the same space:
+State and guidance are kept apart, each with one home, so neither has to compete
+for space with the other:
 
 | Position | Content | Lifetime |
 |---|---|---|
-| Left | Push health, resident memory | Persistent |
-| Middle | Latest action or error | Cleared after ~10s |
-| Right | Keys valid for the current focus | Follows focus |
+| Top left | Which app is active | — |
+| Top right | Presence, push health, memory, last sync | Persistent |
+| Bottom left | Latest action or error | Cleared after ~10s |
+| Bottom right | Keys valid for the current focus | Follows focus |
+
+Panes carry no key hints of their own: anything the user can press appears
+bottom-right, where it tracks focus rather than going stale.
 
 Transient text expires on a 2-second local tick that also samples memory. The
 tick counts how long the message has been unchanged rather than timestamping

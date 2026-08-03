@@ -155,9 +155,10 @@ Press `?` in the app for this list at any time.
 
 Scrolling to the end of a message list or conversation loads the next 50 items.
 
-The bottom bar shows tunnel health and memory on the left, the most recent
-message in the middle (it clears itself after a few seconds), and the keys
-available right now on the right.
+The **top-right** shows live state — your presence, push health, memory use and
+the last sync time. The **bottom-right** shows the keys available right now,
+changing with whatever has focus. The bottom-left carries the most recent
+message, which clears itself after a few seconds.
 
 ## Things worth knowing
 
@@ -212,7 +213,8 @@ No domain? Use a throwaway tunnel instead — see the commented `command:` in
 
 ### Is it actually working?
 
-**The bottom-left corner tells you**, alongside the app's memory use:
+**The top-right corner tells you**, alongside your presence, memory use and last
+sync time:
 
 | | Meaning |
 |---|---|
