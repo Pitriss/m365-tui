@@ -241,11 +241,39 @@ Transient text expires on a 2-second local tick that also samples memory. The
 tick counts how long the message has been unchanged rather than timestamping
 each write, which avoids threading an expiry through the ~30 places that set it.
 
+## External dependencies
+
+The binary is self-contained — statically linked, TLS via rustls, so no OpenSSL
+and no shared libraries. Everything beyond that is optional and invoked as a
+subprocess, each with a fallback so a missing tool degrades rather than fails:
+
+| Module | Spawns | Fallback |
+|---|---|---|
+| `opener.rs` | `xdg-open`, `open` | Error reported in the status bar |
+| `clipboard.rs` | `wl-copy`, `xclip`, `xsel` | OSC 52 escape sequence |
+| `notify.rs` | `notify-send` | Terminal bell |
+
+Only the push path needs services, and those are containers rather than host
+installs: Redis, the webhook itself, and `cloudflared`.
+
+The Rust dependency set is deliberately small: `tokio` and `reqwest` (rustls)
+for I/O, `ratatui`/`crossterm` for the terminal, `html5ever` for message bodies,
+`redis` for the event bus, `axum` for the webhook, plus `serde`, `chrono`,
+`anyhow` and `tracing`. Base64, HTML escaping and the text editor are
+hand-rolled in `util.rs` and `editor.rs` rather than pulling in crates for a few
+dozen lines.
+
 ## Notifications
 
-Only messages actually addressed to the user raise one: direct chats always,
-group chats and channels only on an `@mention`. Anything looser would be
-unusable in a busy tenant.
+Only things actually addressed to the user raise one: new inbox mail, direct
+chats always, group chats and channels only on an `@mention`. Anything looser
+would be unusable in a busy tenant.
+
+Mail is watched by a small `peek_inbox` fetch — the newest 15 inbox messages,
+run on each poll and on every mail push. It is deliberately independent of the
+folder on screen, since the message list only holds whichever folder the user is
+looking at, and mail should be announced while reading elsewhere. Messages
+already marked read (on a phone, in Outlook) are skipped.
 
 Detection prefers a message's `mentions` array, which is exact. Chat *previews*
 — which is all the chat list carries for conversations that aren't open — omit
@@ -253,9 +281,9 @@ it, so there is a fallback that scans the rendered `<at>…</at>` spans for the
 user's name. Prose that merely contains the name is not a mention.
 
 Two guards stop it becoming noise: notified message ids are remembered so a
-20-second poll can't repeat itself, and the first chat-list sync only records a
-baseline — otherwise every conversation's history would announce itself at
-startup.
+20-second poll can't repeat itself, and the first sync of either mail or chats
+only records a baseline — otherwise the whole inbox and every conversation's
+history would announce themselves at startup.
 
 ## Handling untrusted input
 

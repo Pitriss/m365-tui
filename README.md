@@ -18,24 +18,56 @@ Built on the Microsoft Graph API in Rust. For how it works internally, see
 
 ## Requirements
 
-To run the released binary, all you need is:
+### To run it
 
-- A **work or school Microsoft 365 account** — personal accounts can't use the
-  Teams messaging APIs.
-- **Linux on x86_64.** The release binary is statically linked against musl, so
-  it has no library dependencies and runs on any distribution, NixOS included.
+| | |
+|---|---|
+| **A work or school Microsoft 365 account** | Personal accounts can't use the Teams messaging APIs |
+| **An Entra app registration** | See [step 1](#1-register-an-app-in-entra) — you need a client ID |
+| **Linux on x86_64** | The release binary is statically linked against musl: no libc, no shared libraries, runs on any distribution including NixOS |
 
-Everything below is optional:
+Nothing else. The binary has no runtime library dependencies.
 
-| For | You need | If missing |
-|---|---|---|
-| Opening links (`o`) | `xdg-open` | Links can still be copied |
-| Copying (`y`) | `wl-clipboard`, `xclip` or `xsel` | Falls back to the OSC 52 escape sequence, which most modern terminals support |
-| Notifications | `notify-send` (libnotify) | Falls back to the terminal bell |
-| Instant push | Docker + Docker Compose | Still refreshes every 20 seconds |
-| Building yourself | Rust, or Nix | Not needed — use the release binary |
+### Optional helpers
 
-No Rust toolchain is required unless you want to build from source.
+These are external commands the app calls when present. Each has a fallback, so
+nothing breaks if one is missing.
+
+| Feature | Command | Package | Without it |
+|---|---|---|---|
+| Open links (`o`) | `xdg-open` | `xdg-utils` | Links can still be copied |
+| Copy (`y`, `Y`) | `wl-copy` (Wayland), or `xclip` / `xsel` (X11) | `wl-clipboard`, `xclip`, `xsel` | Falls back to the OSC 52 escape, which most modern terminals accept |
+| Notifications | `notify-send` | `libnotify` (Debian/Ubuntu: `libnotify-bin`) | Falls back to the terminal bell |
+
+Check what you have:
+
+```sh
+for c in xdg-open wl-copy xclip xsel notify-send; do
+  command -v "$c" >/dev/null && echo "✓ $c" || echo "✗ $c"
+done
+```
+
+You only need **one** clipboard tool — `wl-copy` on Wayland, `xclip` or `xsel` on X11.
+
+### For instant push (optional)
+
+Only if you want ~1-second updates instead of the 20-second refresh:
+
+- **Docker** and **Docker Compose** — they run the webhook, Redis and the tunnel;
+  you don't install `cloudflared` or Redis yourself.
+- **A Cloudflare account with a domain on it**, for a named tunnel. Without a
+  domain you can use a throwaway `trycloudflare.com` tunnel instead.
+
+### To build from source
+
+Not needed if you use the release binary or the Nix flake.
+
+- **Rust**, recent stable (developed against 1.96). Cargo fetches the crate
+  dependencies itself; `Cargo.lock` is committed.
+- **or Nix**, which supplies the toolchain via `nix develop`.
+
+No system libraries are required: TLS is handled by rustls, so there's no
+OpenSSL dependency.
 
 ## 1. Register an app in Entra
 
@@ -179,10 +211,17 @@ tracking wrappers are unwrapped back to the real destination.
 for copy mode — a borderless full-width view where a normal mouse drag selects
 only the message text, with no side panes in the way.
 
-**Notifications.** Direct messages always notify; group chats and channels only
-when someone `@mentions` you — so a busy tenant stays quiet. Uses `notify-send`
-if it's installed, otherwise the terminal bell. Turn it off with `M365_NOTIFY=0`
-in `.env`.
+**Notifications.** You're told about things actually addressed to you:
+
+| | Notifies |
+|---|---|
+| New inbox mail | Always, unless already read elsewhere |
+| Direct messages | Always |
+| Group chats, meeting chats | Only when someone `@mentions` you |
+
+Mail is announced even while you're reading another folder. Uses `notify-send`
+if installed, otherwise the terminal bell. Turn it off with `M365_NOTIFY=0` in
+`.env`.
 
 **Conversations read like a chat.** Consecutive messages from the same person
 are grouped under one name, each with its own timestamp down the left, and a

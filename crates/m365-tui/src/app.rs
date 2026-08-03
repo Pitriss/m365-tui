@@ -63,6 +63,8 @@ pub enum AppMessage {
         presence: Presence,
         requested: Option<String>,
     },
+    /// Newest inbox messages, fetched purely to drive notifications.
+    InboxPeek(Vec<MailMessage>),
     /// Attachments of the open mail message.
     Attachments { message_id: String, items: Vec<Attachment> },
     /// A downloaded attachment, ready to write to disk.
@@ -398,6 +400,8 @@ pub struct App {
     /// open. `None` until the first chat list lands — the first sync must not
     /// fire a burst of notifications for history.
     chat_seen: Option<std::collections::HashMap<String, String>>,
+    /// Inbox message ids already seen, same baseline rule as `chat_seen`.
+    mail_seen: Option<std::collections::HashSet<String>>,
     /// The presence session this app is currently publishing, and when it was
     /// last asserted — sessions expire, so they need renewing.
     pub presence_session: Option<(&'static str, &'static str)>,
@@ -449,6 +453,7 @@ impl App {
             push: PushState::Off,
             notified: std::collections::HashSet::new(),
             chat_seen: None,
+            mail_seen: None,
             presence_session: None,
             presence_session_at: None,
             rss_kb: read_rss_kb(),
@@ -605,6 +610,20 @@ impl App {
                 next,
                 mode: ListUpdate::Append,
             })
+        });
+    }
+
+    /// Fetch the newest inbox messages solely to drive notifications. Runs
+    /// regardless of which folder is on screen, so mail is announced even while
+    /// reading elsewhere.
+    fn peek_inbox(&self) {
+        if !self.session.config.notifications {
+            return;
+        }
+        let s = self.session.clone();
+        self.spawn(async move {
+            let (items, _) = mail::list_messages(&s.graph, "inbox", 15).await?;
+            Ok(AppMessage::InboxPeek(items))
         });
     }
 
@@ -938,6 +957,7 @@ impl App {
                 };
                 self.my_presence = Some(presence);
             }
+            AppMessage::InboxPeek(items) => self.notify_for_mail(&items),
             AppMessage::Attachments { message_id, items } => {
                 // Ignore a late response for a message we've navigated away from.
                 if self.outlook.reading.as_ref().map(|m| m.id.as_str()) == Some(&message_id) {
@@ -988,6 +1008,7 @@ impl App {
     fn poll(&mut self) {
         self.last_sync = Some(now_hms());
         self.renew_presence_session();
+        self.peek_inbox();
         // Mail: refresh folder unread counts + the open folder's messages.
         self.load_folders();
         if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
@@ -1007,6 +1028,7 @@ impl App {
         match change.kind() {
             ChangeKind::Mail => {
                 self.status = "📬 new mail".into();
+                self.peek_inbox();
                 if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
                     self.load_messages(f.id.clone(), ListUpdate::Merge);
                 }
@@ -1257,6 +1279,47 @@ impl App {
         }
         for (title, body) in to_notify {
             crate::notify::send(&title, &body);
+        }
+    }
+
+    /// Announce new, still-unread inbox mail.
+    fn notify_for_mail(&mut self, items: &[MailMessage]) {
+        if !self.session.config.notifications {
+            return;
+        }
+        // First sync records a baseline; otherwise the whole inbox would
+        // announce itself on startup.
+        let Some(seen) = self.mail_seen.as_mut() else {
+            self.mail_seen = Some(items.iter().map(|m| m.id.clone()).collect());
+            return;
+        };
+
+        let mut to_notify: Vec<(String, String)> = Vec::new();
+        for m in items {
+            if !seen.insert(m.id.clone()) {
+                continue; // already known
+            }
+            // Read elsewhere (phone, Outlook) before we got here.
+            if m.is_read.unwrap_or(false) {
+                continue;
+            }
+            if !self.notified.insert(m.id.clone()) {
+                continue;
+            }
+            to_notify.push((
+                m.sender_name(),
+                m.subject.clone().unwrap_or_else(|| "(no subject)".into()),
+            ));
+        }
+
+        if seen.len() > 1000 {
+            seen.clear();
+        }
+        if self.notified.len() > 1000 {
+            self.notified.clear();
+        }
+        for (who, subject) in to_notify {
+            crate::notify::send(&format!("✉ {who}"), &subject);
         }
     }
 
