@@ -106,6 +106,13 @@ already displayed:
 user had scrolled back through. Selection is restored by message id rather than
 index, so arriving messages don't move the cursor.
 
+Teams conversations add the usual chat-client behaviour on top: messages are
+newest-first, so an arrival lands *above* the reader. If the selection is already
+on the newest message the view follows it; otherwise the position is held and the
+new messages are counted into `unseen`, surfaced in the pane title. Without this
+a new message would silently appear off-screen above wherever the user was
+reading.
+
 ## Rendering message bodies
 
 Mail and Teams bodies arrive as HTML. `content.rs` parses it with `html5ever`

@@ -498,16 +498,19 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .map(|&s| s as u16)
         .unwrap_or(0)
         .min(total.saturating_sub(1));
-    let title = if focused {
-        "Conversation (j/k select · e react · z copy-mode)"
+    // Flag messages that arrived while the user was reading further back.
+    let title = if app.teams.unseen > 0 {
+        format!("Conversation — ▲ {} new (g to jump)", app.teams.unseen)
+    } else if focused {
+        "Conversation (j/k select · e react · z copy-mode)".to_string()
     } else {
-        "Conversation"
+        "Conversation".to_string()
     };
 
     // The pane is split inside its border: a pinned date header on the first
     // row, then the scrolling message flow. The header tracks the day of the
     // topmost visible message, so it updates as you scroll.
-    let block = panel_block(title, focused);
+    let block = panel_block(&title, focused);
     let inner = block.inner(right[0]);
     f.render_widget(block, right[0]);
     let pane = Layout::default()
@@ -575,7 +578,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           r reply · a reply-all · f forward · / search · g calendar\n\
  \n\
  Teams:   Tab cycle panes · Enter open · t chats/channels\n\
-          j/k select message · e react · Esc / ← / h back to list\n\
+          j/k select message · g newest · e react · Esc / ← / h back to list\n\
           i type message · Enter send\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\

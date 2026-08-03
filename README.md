@@ -147,7 +147,7 @@ Press `?` in the app for this list at any time.
 | **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
 | **Outlook** | `Tab` change pane · `j`/`k` move · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `Esc` back to the list |
-| **Teams** | `Tab` change pane · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `i` write · `Enter` send · `Esc` back |
+| **Teams** | `Tab` change pane · `Enter` open · `t` chats↔channels · `j`/`k` select message · `g` newest · `e` react · `i` write · `Enter` send · `Esc` back |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -177,6 +177,12 @@ tracking wrappers are unwrapped back to the real destination.
 **Copying text.** Press `y` to copy a message straight to the clipboard, or `z`
 for copy mode — a borderless full-width view where a normal mouse drag selects
 only the message text, with no side panes in the way.
+
+**Open chats update themselves.** New messages appear in the conversation you're
+reading — within a second with push enabled, otherwise on the 20-second refresh.
+If you're on the newest message the view follows along; if you've scrolled back
+to read history it stays put and the title shows `▲ 2 new`. Press `g` to jump
+back to the newest.
 
 **Your status.** `p` sets Available / Busy / DND / Away / Appear offline. This
 needs one extra permission (`Presence.ReadWrite`) plus `M365_PRESENCE_WRITE=1`

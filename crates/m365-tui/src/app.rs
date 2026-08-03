@@ -298,6 +298,8 @@ pub struct TeamsState {
     pub messages_next: Option<String>,
     /// Guards against firing multiple "load older" requests at once.
     pub loading_more: bool,
+    /// Messages that arrived while the user was reading further back.
+    pub unseen: usize,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: TextInput,
@@ -320,6 +322,7 @@ impl Default for TeamsState {
             msg_sel: 0,
             messages_next: None,
             loading_more: false,
+            unseen: 0,
             open_chat_id: None,
             open_channel: None,
             composer: TextInput::new(),
@@ -927,6 +930,7 @@ impl App {
         mode: ListUpdate,
     ) {
         self.teams.loading_more = false;
+        let mut follow_newest = false;
         // Remember what was selected so a refresh doesn't move the cursor to a
         // different message when new ones arrive at the top.
         let selected_id = self
@@ -953,6 +957,17 @@ impl App {
                 };
             }
             ListUpdate::Merge => {
+                // Chat convention: if the user is sitting on the newest message,
+                // follow new arrivals; if they've scrolled back to read history,
+                // hold their place and just count what came in.
+                follow_newest = self.teams.msg_sel == 0;
+                let known: std::collections::HashSet<&str> =
+                    self.teams.messages.iter().map(|m| m.id.as_str()).collect();
+                let arrived = messages.iter().filter(|m| !known.contains(m.id.as_str())).count();
+                if !follow_newest {
+                    self.teams.unseen += arrived;
+                }
+
                 // Keep the older pages already scrolled into view; the fetched
                 // page only supersedes the newest window. `messages_next` is
                 // deliberately left alone — it points past everything loaded.
@@ -992,11 +1007,17 @@ impl App {
             .collect();
         self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
 
-        // Restore the selection by identity, else clamp.
-        self.teams.msg_sel = selected_id
-            .and_then(|id| self.teams.messages.iter().position(|m| m.id == id))
-            .unwrap_or(self.teams.msg_sel)
-            .min(self.teams.messages.len().saturating_sub(1));
+        // Restore the selection: stick to the newest when following, otherwise
+        // keep the same message the user was reading.
+        self.teams.msg_sel = if follow_newest {
+            self.teams.unseen = 0;
+            0
+        } else {
+            selected_id
+                .and_then(|id| self.teams.messages.iter().position(|m| m.id == id))
+                .unwrap_or(self.teams.msg_sel)
+                .min(self.teams.messages.len().saturating_sub(1))
+        };
     }
 
     fn refresh_current(&mut self) {
@@ -1378,6 +1399,11 @@ impl App {
             {
                 self.overlay = Some(Overlay::React);
             }
+            // Jump back to the newest message and resume following it.
+            KeyCode::Home | KeyCode::Char('g') if self.teams.focus == TeamsFocus::Messages => {
+                self.teams.msg_sel = 0;
+                self.teams.unseen = 0;
+            }
             KeyCode::Up | KeyCode::Char('k') => self.teams_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.teams_move(1),
             KeyCode::Enter => self.teams_enter(),
@@ -1406,6 +1432,9 @@ impl App {
                 }
                 if self.teams.messages[i as usize].deleted_date_time.is_none() {
                     self.teams.msg_sel = i as usize;
+                    if self.teams.msg_sel == 0 {
+                        self.teams.unseen = 0; // caught up
+                    }
                     // Prefetch when landing on the last one, so the next press
                     // doesn't stall at the bottom.
                     if delta > 0 && self.teams.msg_sel + 1 >= self.teams.messages.len() {
@@ -1445,6 +1474,7 @@ impl App {
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
+                    self.teams.unseen = 0;
                     self.load_chat_messages(id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -1468,6 +1498,7 @@ impl App {
                     self.teams.msg_sel = 0;
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
+                    self.teams.unseen = 0;
                     self.load_channel_messages(team_id, ch_id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
