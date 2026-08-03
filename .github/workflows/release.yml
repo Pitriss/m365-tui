@@ -40,13 +40,17 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          name="m365-tui-${GITHUB_REF_NAME}-x86_64-linux-musl"
-          mkdir -p "dist/$name"
-          cp "target/$TARGET/release/m365" "dist/$name/"
-          cp "target/$TARGET/release/m365-webhook" "dist/$name/"
-          cp README.md "dist/$name/"
-          tar -C dist -czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # The extracted directory carries the version, but the asset name is
+          # kept stable so /releases/latest/download/<asset> always resolves —
+          # that's what the README's install one-liner relies on.
+          dir="m365-tui-${GITHUB_REF_NAME}"
+          asset="m365-tui-x86_64-linux-musl.tar.gz"
+          mkdir -p "dist/$dir"
+          cp "target/$TARGET/release/m365" "dist/$dir/"
+          cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
+          cp README.md ARCHITECTURE.md "dist/$dir/"
+          tar -C dist -czf "$asset" "$dir"
+          sha256sum "$asset" > "$asset.sha256"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

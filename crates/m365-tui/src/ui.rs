@@ -9,7 +9,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    filter_commands, App, Compose, Overlay, OutlookFocus, Screen, TeamsFocus, TeamsMode,
+    filter_commands, App, Compose, Overlay, OutlookFocus, PushState, Screen, TeamsFocus, TeamsMode,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -101,14 +101,92 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// Bottom bar: persistent state on the left (tunnel health, memory), the
+/// current transient message in the middle, and context-sensitive key hints on
+/// the right.
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
+    let bg = Color::Rgb(30, 30, 40);
+
+    let push = match &app.push {
+        PushState::Off => ("push off", DIM),
+        PushState::Connecting => ("push …", Color::Yellow),
+        PushState::Live => ("push live", Color::Green),
+        PushState::Failed(_) => ("push FAILED", Color::Red),
+    };
+    let ram = match app.rss_kb {
+        Some(kb) if kb >= 1024 => format!("{:.0} MB", kb as f64 / 1024.0),
+        Some(kb) => format!("{kb} KB"),
+        None => "—".to_string(),
+    };
+    let left = Line::from(vec![
+        Span::styled(format!(" {} ", push.0), Style::default().fg(push.1).bg(bg)),
+        Span::styled("· ", Style::default().fg(DIM).bg(bg)),
+        Span::styled(format!("rss {ram} "), Style::default().fg(Color::Gray).bg(bg)),
+    ]);
+    let left_w = left_width(&left);
+
+    let hints = context_hints(app);
+    let right_w = hints.chars().count() as u16 + 2;
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_w),
+            Constraint::Min(0),
+            Constraint::Length(right_w.min(area.width.saturating_sub(left_w))),
+        ])
+        .split(area);
+
+    f.render_widget(Paragraph::new(left).style(Style::default().bg(bg)), cols[0]);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             app.status.clone(),
-            Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 40)),
+            Style::default().fg(Color::White).bg(bg),
         ))),
-        area,
+        cols[1],
     );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {hints} "),
+            Style::default().fg(DIM).bg(bg),
+        ))),
+        cols[2],
+    );
+}
+
+fn left_width(line: &Line) -> u16 {
+    line.spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>() as u16
+}
+
+/// Key hints for whatever currently has focus.
+fn context_hints(app: &App) -> &'static str {
+    if let Some(overlay) = &app.overlay {
+        return match overlay {
+            Overlay::Compose(_) => "Ctrl+S send · Esc cancel",
+            Overlay::Links => "1-9 open · y copy · Esc close",
+            Overlay::Attachments => "1-9 save · Esc close",
+            Overlay::React => "1-7 react · Esc close",
+            Overlay::Presence => "1-6 set · c clear · Esc close",
+            Overlay::Search { .. } => "Enter search · Esc cancel",
+            Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
+            Overlay::Calendar | Overlay::Help => "Esc close",
+        };
+    }
+    match app.screen {
+        Screen::Outlook => match app.outlook_focus {
+            OutlookFocus::Folders => "Enter open · Tab next pane",
+            OutlookFocus::Messages => "Enter read · c compose · r reply · / search · ? help",
+            OutlookFocus::Reading => "j/k scroll · o links · A attach · y copy · Esc back",
+        },
+        Screen::Teams => match app.teams.focus {
+            TeamsFocus::List => "Enter open · t chats/channels · ? help",
+            TeamsFocus::Messages => "j/k select · e react · i write · Esc back",
+            TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,16 +270,41 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         &mut mstate,
     );
 
-    // Reading pane
-    let reading = match email_lines(app) {
-        Some(lines) => Paragraph::new(lines).wrap(Wrap { trim: false }),
-        None => Paragraph::new("Select a message and press Enter to read.\n\nKeys: c compose · r reply · a reply-all · f forward · / search · g calendar · z copy-mode · y yank")
-            .style(Style::default().fg(DIM)),
+    // Reading pane — scrollable when focused, like the Teams conversation.
+    let focused = app.outlook_focus == OutlookFocus::Reading;
+    let title = if focused {
+        "Reading (j/k scroll · Esc back)"
+    } else {
+        "Reading"
     };
-    f.render_widget(
-        reading.block(panel_block("Reading", app.outlook_focus == OutlookFocus::Reading)),
-        cols[2],
-    );
+    let block = panel_block(title, focused);
+    let inner = block.inner(cols[2]);
+    f.render_widget(block, cols[2]);
+
+    match email_lines(app) {
+        Some(lines) => {
+            // Tell the key handler how far it can usefully scroll.
+            let wrapped = wrapped_height(&lines, inner.width as usize);
+            app.reading_max_scroll
+                .set(wrapped.saturating_sub(inner.height));
+            let scroll = app.outlook.reading_scroll.min(app.reading_max_scroll.get());
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                inner,
+            );
+        }
+        None => {
+            app.reading_max_scroll.set(0);
+            f.render_widget(
+                Paragraph::new("Select a message and press Enter to read.\n\nKeys: c compose · r reply · a reply-all · f forward · / search · g calendar · A attachments · o links · y yank")
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(DIM)),
+                inner,
+            );
+        }
+    }
 }
 
 /// Headers + rendered body of the open email, or `None` if nothing is open.
@@ -462,6 +565,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           z copy mode (full-width, borderless — drag-select cleanly)\n\
  \n\
  Outlook: Tab cycle panes · j/k move · Enter open · c compose\n\
+          in the reading pane: j/k scroll · Home/End · Esc back to list\n\
           r reply · a reply-all · f forward · / search · g calendar\n\
  \n\
  Teams:   Tab cycle panes · Enter open · t chats/channels\n\
@@ -818,6 +922,22 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Rows the given lines occupy once wrapped to `width`. Approximates ratatui's
+/// word wrap closely enough to bound scrolling.
+fn wrapped_height(lines: &[Line], width: usize) -> u16 {
+    if width == 0 {
+        return lines.len() as u16;
+    }
+    let total: usize = lines
+        .iter()
+        .map(|l| {
+            let chars: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+            chars.div_ceil(width).max(1)
+        })
+        .sum();
+    total.min(u16::MAX as usize) as u16
 }
 
 /// The host part of a URL, for a readable link label.

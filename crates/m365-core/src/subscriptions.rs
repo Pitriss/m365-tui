@@ -18,7 +18,15 @@ use crate::graph::GraphClient;
 
 /// Well-known resources we subscribe to.
 pub const RES_INBOX: &str = "me/mailFolders('inbox')/messages";
-pub const RES_ALL_CHATS: &str = "me/chats/getAllMessages";
+
+/// All chats the user takes part in.
+///
+/// Graph rejects the `/me/` shorthand here — it answers 403 "User may only
+/// create user-scoped chat message subscriptions for their own messages" — so
+/// the signed-in user's id has to be spelled out.
+pub fn res_all_chats(user_id: &str) -> String {
+    format!("users/{user_id}/chats/getAllMessages")
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -41,8 +41,11 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .expect("invalid WEBHOOK_BIND");
 
+    // Redis may not be accepting connections yet: `depends_on` waits for the
+    // container to start, not for the server to be ready. Exiting here would
+    // leave the webhook dead until someone noticed, so retry with backoff.
     let client = redis::Client::open(redis_url.as_str())?;
-    let redis = client.get_multiplexed_async_connection().await?;
+    let redis = connect_with_retry(&client).await?;
 
     if expected_state.is_none() {
         tracing::warn!("M365_CLIENT_STATE not set — clientState verification is DISABLED");
@@ -60,6 +63,24 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Connect to Redis, retrying while it comes up.
+async fn connect_with_retry(
+    client: &redis::Client,
+) -> anyhow::Result<redis::aio::MultiplexedConnection> {
+    let mut delay = std::time::Duration::from_millis(500);
+    for attempt in 1..=12 {
+        match client.get_multiplexed_async_connection().await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                tracing::warn!("Redis not ready (attempt {attempt}): {e}; retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(10));
+            }
+        }
+    }
+    anyhow::bail!("Redis did not become available")
 }
 
 #[derive(Deserialize)]

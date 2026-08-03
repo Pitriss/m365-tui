@@ -18,7 +18,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, AppMessage};
+use app::{App, AppMessage, PushState};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
@@ -35,6 +35,10 @@ use tokio::sync::mpsc;
 
 /// How often to poll the server to refresh the current view.
 const POLL_SECONDS: u64 = 20;
+
+/// Lightweight local tick: refreshes memory usage and ages out status text.
+/// Costs nothing on the network.
+const TICK_SECONDS: u64 = 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -90,7 +94,7 @@ async fn run_tui(session: Session) -> Result<()> {
 
     // Real-time push: only if a tunnel URL is configured.
     if session.config.notification_url().is_some() {
-        spawn_realtime(&session, change_tx);
+        spawn_realtime(&session, change_tx, tx.clone());
     } else {
         let _ = tx
             .send(AppMessage::Status(format!(
@@ -109,6 +113,20 @@ async fn run_tui(session: Session) -> Result<()> {
             loop {
                 ticker.tick().await;
                 if poll_tx.send(AppMessage::Poll).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    {
+        let tick_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(TICK_SECONDS));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if tick_tx.send(AppMessage::Tick).await.is_err() {
                     break;
                 }
             }
@@ -166,27 +184,38 @@ async fn event_loop(
 }
 
 /// Subscribe to the webhook's Redis channel and keep Graph subscriptions alive.
-fn spawn_realtime(session: &Session, change_tx: mpsc::Sender<ChangeEvent>) {
+fn spawn_realtime(
+    session: &Session,
+    change_tx: mpsc::Sender<ChangeEvent>,
+    app_tx: mpsc::Sender<AppMessage>,
+) {
     let redis_url = session.config.redis_url.clone();
     tokio::spawn(m365_core::events::run_subscriber_forever(redis_url, change_tx));
 
     let session = session.clone();
     tokio::spawn(async move {
-        if let Err(e) = manage_subscriptions(session).await {
+        if let Err(e) = manage_subscriptions(session, app_tx.clone()).await {
             tracing::warn!("subscription manager stopped: {e:#}");
+            let _ = app_tx
+                .send(AppMessage::Push(PushState::Failed(format!("{e:#}"))))
+                .await;
         }
     });
 }
 
 /// Create the inbox + all-chats subscriptions and renew them before they lapse.
 /// Chat subscriptions expire in ~1h, so we renew every 45 minutes.
-async fn manage_subscriptions(session: Session) -> Result<()> {
+async fn manage_subscriptions(
+    session: Session,
+    app_tx: mpsc::Sender<AppMessage>,
+) -> Result<()> {
+    let _ = app_tx.send(AppMessage::Push(PushState::Connecting)).await;
     let notify = session.config.notification_url().unwrap();
     let lifecycle = session.config.lifecycle_url();
     let state = &session.config.client_state;
 
     let mut ids: Vec<String> = Vec::new();
-    let create = |res: &'static str| {
+    let create = |res: String| {
         let notify = notify.clone();
         let lifecycle = lifecycle.clone();
         let graph = session.graph.clone();
@@ -194,7 +223,7 @@ async fn manage_subscriptions(session: Session) -> Result<()> {
         async move {
             subscriptions::create(
                 &graph,
-                res,
+                &res,
                 "created,updated",
                 &notify,
                 lifecycle.as_deref(),
@@ -205,15 +234,41 @@ async fn manage_subscriptions(session: Session) -> Result<()> {
         }
     };
 
-    for res in [subscriptions::RES_INBOX, subscriptions::RES_ALL_CHATS] {
-        match create(res).await {
+    // The chats resource needs the signed-in user's id spelled out.
+    let resources: Vec<String> = match m365_core::people::me(&session.graph).await {
+        Ok(user) => vec![
+            subscriptions::RES_INBOX.to_string(),
+            subscriptions::res_all_chats(&user.id),
+        ],
+        Err(e) => {
+            tracing::warn!("could not resolve the signed-in user: {e:#}");
+            vec![subscriptions::RES_INBOX.to_string()]
+        }
+    };
+
+    let mut last_error = None;
+    for res in resources {
+        match create(res.clone()).await {
             Ok(s) => {
                 tracing::info!("subscribed to {res}: {}", s.id);
                 ids.push(s.id);
             }
-            Err(e) => tracing::warn!("failed to subscribe to {res}: {e:#}"),
+            Err(e) => {
+                tracing::warn!("failed to subscribe to {res}: {e:#}");
+                last_error = Some(graph_error_summary(&format!("{e:#}")));
+            }
         }
     }
+
+    // Report health so a broken tunnel is visible rather than silently
+    // degrading to polling.
+    let _ = app_tx
+        .send(AppMessage::Push(if ids.is_empty() {
+            PushState::Failed(last_error.unwrap_or_else(|| "no subscriptions created".into()))
+        } else {
+            PushState::Live
+        }))
+        .await;
 
     loop {
         tokio::time::sleep(Duration::from_secs(45 * 60)).await;
@@ -223,6 +278,18 @@ async fn manage_subscriptions(session: Session) -> Result<()> {
             }
         }
     }
+}
+
+/// Pull the useful sentence out of a Graph error blob for the status line.
+fn graph_error_summary(err: &str) -> String {
+    // Graph nests the human-readable part in `"message":"..."`.
+    if let Some(start) = err.find("\"message\":\"") {
+        let rest = &err[start + 11..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    err.chars().take(120).collect()
 }
 
 /// Log to a file in the cache dir so we never corrupt the TUI on stdout/stderr.
@@ -240,4 +307,27 @@ fn init_tracing() {
                 .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap())
         })
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::graph_error_summary;
+
+    #[test]
+    fn extracts_the_readable_part_of_a_graph_error() {
+        // The exact shape seen when the tunnel hostname is wrong.
+        let raw = r#"Graph request failed (400 Bad Request): {"error":{"code":"InvalidRequest","message":"Failed to resolve domain m365.xstf.pt: No such host is known","innerError":{"date":"2026-07-27"}}}"#;
+        assert_eq!(
+            graph_error_summary(raw),
+            "Failed to resolve domain m365.xstf.pt: No such host is known"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_a_truncated_message() {
+        let raw = "connection refused";
+        assert_eq!(graph_error_summary(raw), "connection refused");
+        let long = "x".repeat(500);
+        assert_eq!(graph_error_summary(&long).chars().count(), 120);
+    }
 }

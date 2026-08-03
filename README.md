@@ -18,10 +18,23 @@ Built on the Microsoft Graph API in Rust. For how it works internally, see
 
 ## Requirements
 
-- A **work or school Microsoft 365 account**. Personal accounts can't use the
+To run the released binary, all you need is:
+
+- A **work or school Microsoft 365 account** — personal accounts can't use the
   Teams messaging APIs.
-- Rust (or Nix — see [Install](#3-install)).
-- Docker, **only** if you want instant push notifications.
+- **Linux on x86_64.** The release binary is statically linked against musl, so
+  it has no library dependencies and runs on any distribution, NixOS included.
+
+Everything below is optional:
+
+| For | You need | If missing |
+|---|---|---|
+| Opening links (`o`) | `xdg-open` | Links can still be copied |
+| Copying (`y`) | `wl-clipboard`, `xclip` or `xsel` | Falls back to the OSC 52 escape sequence, which most modern terminals support |
+| Instant push | Docker + Docker Compose | Still refreshes every 20 seconds |
+| Building yourself | Rust, or Nix | Not needed — use the release binary |
+
+No Rust toolchain is required unless you want to build from source.
 
 ## 1. Register an app in Entra
 
@@ -79,30 +92,38 @@ just polling instead of instant push.
 
 ## 3. Install
 
-**With Nix:**
+**Download the release binary** — nothing else required:
 
 ```sh
-nix run github:rootHytx/m365-tui         # try it
+curl -fsSL -o m365-tui.tar.gz \
+  https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-x86_64-linux-musl.tar.gz
+tar xzf m365-tui.tar.gz
+sudo install m365-tui-*/m365 /usr/local/bin/
+```
+
+Each release also publishes a `.sha256` next to the tarball if you want to
+verify it. `m365-webhook` is in the same archive; you only need it for
+[instant push](#instant-push-optional), and Docker builds it for you there.
+
+<details>
+<summary>Other ways to install</summary>
+
+**Nix** — run it without installing, or add it to a system/home-manager flake
+(`m365-tui.packages.${system}.default`):
+
+```sh
+nix run github:rootHytx/m365-tui
 nix profile install github:rootHytx/m365-tui
 ```
 
-Or as a flake input, referencing `m365-tui.packages.${system}.default`.
-
-**Prebuilt binary:** download the `x86_64-linux` tarball from the
-[latest release](https://github.com/rootHytx/m365-tui/releases/latest). It's
-statically linked, so it runs anywhere including NixOS.
-
-**From source:**
+**From source** — needs a Rust toolchain:
 
 ```sh
 cargo build --release            # binary at target/release/m365
+nix develop -c cargo build --release    # or via the bundled dev shell
 ```
 
-On NixOS, or if your Rust toolchain misbehaves, use the bundled dev shell:
-
-```sh
-nix develop -c cargo build --release
-```
+</details>
 
 ## 4. Run
 
@@ -125,6 +146,7 @@ Press `?` in the app for this list at any time.
 |---|---|
 | **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
 | **Outlook** | `Tab` change pane · `j`/`k` move · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
+| **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `Esc` back to the list |
 | **Teams** | `Tab` change pane · `Enter` open · `t` chats↔channels · `j`/`k` select message · `e` react · `i` write · `Enter` send · `Esc` back |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
@@ -132,6 +154,10 @@ Press `?` in the app for this list at any time.
 | **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+S` send · `Esc` cancel |
 
 Scrolling to the end of a message list or conversation loads the next 50 items.
+
+The bottom bar shows tunnel health and memory on the left, the most recent
+message in the middle (it clears itself after a few seconds), and the keys
+available right now on the right.
 
 ## Things worth knowing
 
@@ -184,29 +210,49 @@ No domain? Use a throwaway tunnel instead — see the commented `command:` in
 [docker-compose.yml](docker-compose.yml) — and put the printed
 `https://*.trycloudflare.com` URL in `M365_TUNNEL_BASE_URL`.
 
+### Is it actually working?
+
+**The bottom-left corner tells you**, alongside the app's memory use:
+
+| | Meaning |
+|---|---|
+| `push live` (green) | Subscriptions are live — changes arrive in seconds |
+| `push …` (yellow) | Still subscribing |
+| `push FAILED` (red) | Graph rejected it; the reason appears in the status bar, and it falls back to polling |
+| `push off` (grey) | No tunnel configured — normal poll-only mode |
+
+To confirm end-to-end, send yourself an email from your phone: it should appear
+within a second or two, well before the `⟳ synced` clock changes.
+
+If it says failed, the usual cause is `M365_TUNNEL_BASE_URL` not exactly matching
+your tunnel hostname — Graph reports `Failed to resolve domain ...`. Check
+`docker compose logs webhook` to see requests arriving.
+
 ## Troubleshooting
 
 **Sign-in asks for admin approval.** The requested scopes no longer match what
 was consented. Either have an admin approve the new set, or pin the old one with
 `M365_SCOPES` in `.env` and sign in again.
 
-**Nothing arrives instantly.** Check `docker compose logs webhook`, and confirm
-`M365_TUNNEL_BASE_URL` exactly matches your tunnel hostname. Subscription errors
-are recorded in `$TMPDIR/m365-tui.log`.
+**Nothing arrives instantly.** Look at the push indicator in the tab bar — see
+[Is it actually working?](#is-it-actually-working). Subscription errors are also
+recorded in `$TMPDIR/m365-tui.log`.
 
 **Anything else.** Logs go to `$TMPDIR/m365-tui.log`; run with `RUST_LOG=debug`
 for detail.
 
 ## Development
 
+Only needed if you're changing the code — running it doesn't require any of this.
+
 ```sh
 cargo test --workspace
 cargo clippy --workspace
 ```
 
-Tagging a release (`v0.1.0`) builds static binaries and publishes them via
-GitHub Actions. Design notes and internals live in
-[ARCHITECTURE.md](ARCHITECTURE.md).
+Pushing a `v*.*` tag builds the static `x86_64-linux-musl` binaries and publishes
+them as a GitHub release, which is what the install step downloads. Design notes
+and internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Not supported
 

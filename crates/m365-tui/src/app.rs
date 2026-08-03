@@ -67,6 +67,10 @@ pub enum AppMessage {
     Attachments { message_id: String, items: Vec<Attachment> },
     /// A downloaded attachment, ready to write to disk.
     Downloaded { name: String, bytes: Vec<u8> },
+    /// Push-notification health, for the status bar.
+    Push(PushState),
+    /// Lightweight timer: refresh memory usage and expire stale status text.
+    Tick,
     /// Periodic tick: refresh the current view from the server.
     Poll,
 }
@@ -120,6 +124,23 @@ pub enum Overlay {
     /// Attachments of the open mail message, to save to disk.
     Attachments,
 }
+
+/// Whether Graph push notifications are working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushState {
+    /// No tunnel configured — polling only.
+    Off,
+    /// Tunnel configured, subscriptions being created.
+    Connecting,
+    /// Subscriptions live; changes arrive in seconds.
+    Live,
+    /// Graph rejected the subscriptions — still polling, but not instant.
+    Failed(String),
+}
+
+/// Ticks (see `TICK_SECONDS` in main) a status message survives before being
+/// cleared. Long enough to read, short enough not to linger.
+const STATUS_TICKS_TO_LIVE: u32 = 5;
 
 /// How many items to fetch per page — mail messages and Teams messages alike.
 /// Scrolling to the end of a list pulls the next page of this size.
@@ -253,6 +274,8 @@ pub struct OutlookState {
     pub reading_links: Vec<String>,
     /// Attachments of the open message (fetched when it has any).
     pub reading_attachments: Vec<Attachment>,
+    /// Line scroll offset of the reading pane.
+    pub reading_scroll: u16,
     pub calendar: Vec<CalEvent>,
 }
 
@@ -319,9 +342,20 @@ pub struct App {
     pub my_presence: Option<Presence>,
     /// Wall-clock of the last poll refresh (shown in the tab bar).
     pub last_sync: Option<String>,
+    /// Whether instant push is working (shown in the status bar).
+    pub push: PushState,
+    /// Resident memory in KiB, refreshed on each tick.
+    pub rss_kb: Option<u64>,
+    /// Copy of `status` as of the last tick, plus how many ticks it has been
+    /// unchanged — transient messages are cleared so nothing gets stuck.
+    last_status: String,
+    status_ticks: u32,
     /// Width the focused text area was last laid out at, so Up/Down move by the
     /// rows actually on screen. Set by the renderer, read by the key handler.
     pub text_width_hint: std::cell::Cell<usize>,
+    /// Largest useful reading-pane scroll offset, set by the renderer once it
+    /// knows the wrapped height of the open message.
+    pub reading_max_scroll: std::cell::Cell<u16>,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -354,7 +388,12 @@ impl App {
             me: None,
             my_presence: None,
             last_sync: None,
+            push: PushState::Off,
+            rss_kb: read_rss_kb(),
+            last_status: String::new(),
+            status_ticks: 0,
             text_width_hint: std::cell::Cell::new(60),
+            reading_max_scroll: std::cell::Cell::new(0),
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
@@ -710,6 +749,7 @@ impl App {
                 self.outlook.reading_links = rendered.links;
                 self.outlook.reading_body = Some(rendered.text);
                 self.outlook.reading_attachments.clear();
+                self.outlook.reading_scroll = 0;
                 if m.has_attachments.unwrap_or(false) {
                     self.load_attachments(m.id.clone());
                 }
@@ -805,6 +845,30 @@ impl App {
                         self.status = format!("saved {} ({size} bytes) to {}", name, path.display())
                     }
                     Err(e) => self.status = format!("could not save {name}: {e:#}"),
+                }
+            }
+            AppMessage::Push(state) => {
+                // Surface a broken tunnel instead of silently falling back.
+                if let PushState::Failed(reason) = &state {
+                    self.status = format!("push unavailable, using 20s polling — {reason}");
+                }
+                self.push = state;
+            }
+            AppMessage::Tick => {
+                self.rss_kb = read_rss_kb();
+                // Clear a message once it has sat unchanged for a while, so the
+                // status bar never shows something from half an hour ago.
+                if self.status.is_empty() {
+                    self.status_ticks = 0;
+                } else if self.status == self.last_status {
+                    self.status_ticks += 1;
+                    if self.status_ticks >= STATUS_TICKS_TO_LIVE {
+                        self.status.clear();
+                        self.status_ticks = 0;
+                    }
+                } else {
+                    self.last_status = self.status.clone();
+                    self.status_ticks = 0;
                 }
             }
             AppMessage::Poll => self.poll(),
@@ -1157,6 +1221,20 @@ impl App {
             KeyCode::Char('f') => self.open_reply(ReplyMode::Forward),
             KeyCode::Up | KeyCode::Char('k') => self.outlook_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
+            KeyCode::PageUp => self.outlook_move(-10),
+            KeyCode::PageDown => self.outlook_move(10),
+            // Back out of the reading pane to the message list, as in Teams.
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')
+                if self.outlook_focus == OutlookFocus::Reading =>
+            {
+                self.outlook_focus = OutlookFocus::Messages;
+            }
+            KeyCode::Home if self.outlook_focus == OutlookFocus::Reading => {
+                self.outlook.reading_scroll = 0;
+            }
+            KeyCode::End if self.outlook_focus == OutlookFocus::Reading => {
+                self.outlook.reading_scroll = self.reading_max_scroll.get();
+            }
             KeyCode::Enter => self.outlook_enter(),
             _ => {}
         }
@@ -1173,7 +1251,16 @@ impl App {
                 self.outlook.folder_sel =
                     step(self.outlook.folder_sel, delta, self.outlook.folders.len());
             }
-            OutlookFocus::Messages | OutlookFocus::Reading => {
+            // In the reading pane, j/k scroll the message body.
+            OutlookFocus::Reading => {
+                let max = self.reading_max_scroll.get();
+                self.outlook.reading_scroll = if delta > 0 {
+                    self.outlook.reading_scroll.saturating_add(delta as u16).min(max)
+                } else {
+                    self.outlook.reading_scroll.saturating_sub(delta.unsigned_abs() as u16)
+                };
+            }
+            OutlookFocus::Messages => {
                 let len = self.outlook.messages.len();
                 self.outlook.msg_sel = step(self.outlook.msg_sel, delta, len);
                 // Scrolling down onto the last row pulls the next page.
@@ -1806,6 +1893,21 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Resident set size in KiB, from `/proc/self/status` (Linux).
+fn read_rss_kb() -> Option<u64> {
+    parse_vmrss(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+fn parse_vmrss(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 fn now_hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
@@ -1894,6 +1996,14 @@ mod tests {
         let existing = vec!["c", "b", "a"];
         let merged = merge_newest_first(vec!["c", "b", "a"], existing, |s: &&str| s.to_string());
         assert_eq!(merged, vec!["c", "b", "a"], "no duplicates on an unchanged refresh");
+    }
+
+    #[test]
+    fn reads_resident_memory_from_proc_status() {
+        use super::parse_vmrss;
+        let sample = "Name:\tm365\nVmPeak:\t  123456 kB\nVmRSS:\t   24680 kB\nThreads:\t9\n";
+        assert_eq!(parse_vmrss(sample), Some(24680));
+        assert_eq!(parse_vmrss("no such field"), None);
     }
 
     #[test]

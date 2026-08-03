@@ -130,6 +130,32 @@ Two independent mechanisms, so the app is never dependent on the tunnel:
 1. **Polling** — a 20-second timer refreshes the current view. Always on.
 2. **Push** — Graph change notifications, when a tunnel is configured.
 
+### Why a tunnel is needed at all
+
+Graph change notifications are a *webhook*: Microsoft's servers make an inbound
+HTTPS request to a URL you register. A desktop client has no public address, sits
+behind NAT, and has no certificate, so Graph cannot reach it. The tunnel supplies
+a public HTTPS hostname and forwards to the local webhook without opening a port.
+
+It buys latency only — roughly 1–2 seconds instead of up to 20. Every feature
+works identically without it.
+
+### Subscription resources
+
+Chat subscriptions must name the user explicitly —
+`users/{id}/chats/getAllMessages`. The `/me/` shorthand is rejected with a 403
+("User may only create user-scoped chat message subscriptions for their own
+messages"), because the subscription service resolves the resource later,
+outside the caller's context. Mail (`me/mailFolders('inbox')/messages`) does
+accept it.
+
+### Reporting health
+
+Because push failures are silent by nature — the app just keeps polling — the
+subscription manager reports a `PushState` (`Off`/`Connecting`/`Live`/`Failed`)
+to the UI, shown in the tab bar. A misconfigured hostname previously degraded to
+polling with nothing but a line in the log to show for it.
+
 The push path is **notify-then-delta**:
 
 ```
@@ -137,6 +163,10 @@ Graph --HTTPS--> cloudflared --> webhook --> Redis --> TUI --delta fetch--> Grap
   ^                                                     |
   └──────────── TUI creates/renews subscriptions ───────┘
 ```
+
+The webhook retries its Redis connection on startup: `depends_on` only waits for
+the container to start, not for the server to accept connections, and exiting on
+the first failure left the service dead until someone looked.
 
 The webhook holds no Graph token and never calls Graph. It only echoes the
 validation token during subscription setup, verifies `clientState`, and
@@ -175,6 +205,20 @@ single code path — the small-attachment route has to buffer anyway to base64 i
 change if very large files ever mattered; it would mean `m365-core` doing
 filesystem I/O, which it otherwise avoids.
 
+## The status bar
+
+The bottom row is split three ways so nothing has to compete for the same space:
+
+| Position | Content | Lifetime |
+|---|---|---|
+| Left | Push health, resident memory | Persistent |
+| Middle | Latest action or error | Cleared after ~10s |
+| Right | Keys valid for the current focus | Follows focus |
+
+Transient text expires on a 2-second local tick that also samples memory. The
+tick counts how long the message has been unchanged rather than timestamping
+each write, which avoids threading an expiry through the ~30 places that set it.
+
 ## Handling untrusted input
 
 Two places take data from anyone who can send you a message:
@@ -198,3 +242,15 @@ Two places take data from anyone who can send you a message:
   a preference; Teams combines it with client session activity, so an idle or
   absent Teams client still shows Away/Offline.
 - **No call media.** Joining Teams audio/video is not a terminal capability.
+
+## Releases
+
+Pushing a `v*.*` tag runs `.github/workflows/release.yml`: it builds both
+binaries for `x86_64-unknown-linux-musl` — statically linked, so the artifact
+has no libc dependency and runs on any distribution — and publishes them with a
+SHA-256 checksum.
+
+The asset filename is deliberately **not** versioned
+(`m365-tui-x86_64-linux-musl.tar.gz`), so that
+`/releases/latest/download/<asset>` always resolves and the README can offer a
+copy-paste install. The version lives in the directory inside the archive.
