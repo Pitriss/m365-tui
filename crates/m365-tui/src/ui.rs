@@ -802,10 +802,13 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             if let Some(a) = app.my_presence.as_ref().and_then(|p| p.availability.as_deref()) {
                 body.push_str(&format!("Current: {a}\n\n"));
             }
-            for (i, (label, _, _)) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
-                body.push_str(&format!("{}  {label}\n", i + 1));
+            for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
+                body.push_str(&format!("{}  {}\n", i + 1, opt.label));
             }
             body.push_str("\nc  Clear (revert to automatic)\nEsc cancel");
+            body.push_str(
+                "\n\nThis app publishes its own presence session, so the status\nshows even with no Teams client running. Quitting clears it.",
+            );
             if !app.session.config.can_write_presence() {
                 body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");
             }

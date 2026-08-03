@@ -34,6 +34,45 @@ pub async fn set_preferred_presence(
         .await
 }
 
+/// Register this app as a *presence session* for the user.
+///
+/// `setUserPreferredPresence` only records a preference; the status a colleague
+/// sees comes from an active session, which is normally the Teams client. An app
+/// may hold its own session, which is what makes a status visible with no Teams
+/// client running. Sessions expire (5 min – 4 h), so this must be re-asserted.
+///
+/// `session_id` must be the application (client) ID.
+pub async fn set_session_presence(
+    graph: &GraphClient,
+    session_id: &str,
+    availability: &str,
+    activity: &str,
+    expiration: &str,
+) -> Result<()> {
+    graph
+        .post_action(
+            "me/presence/setPresence",
+            &json!({
+                "sessionId": session_id,
+                "availability": availability,
+                "activity": activity,
+                "expirationDuration": expiration,
+            }),
+        )
+        .await
+}
+
+/// Drop this app's presence session, so the user stops appearing online because
+/// of us. Called when a status is cleared and on exit.
+pub async fn clear_session_presence(graph: &GraphClient, session_id: &str) -> Result<()> {
+    graph
+        .post_action(
+            "me/presence/clearPresence",
+            &json!({ "sessionId": session_id }),
+        )
+        .await
+}
+
 /// Clear the preferred presence, reverting to automatically-calculated status.
 pub async fn clear_preferred_presence(graph: &GraphClient) -> Result<()> {
     graph

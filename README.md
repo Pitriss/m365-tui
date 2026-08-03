@@ -188,13 +188,22 @@ If you're on the newest message the view follows along; if you've scrolled back
 to read history it stays put and the title shows `▲ 2 new`. Press `g` to jump
 back to the newest.
 
-**Your status.** `p` sets Available / Busy / DND / Away / Appear offline. This
-needs one extra permission (`Presence.ReadWrite`) plus `M365_PRESENCE_WRITE=1`
-in `.env`; without them the picker is read-only.
+**Your status.** `p` sets Available / Busy / DND / Be right back / Away / Appear
+offline, and it works **without Teams running** — the app publishes its own
+presence session, so colleagues see the status you pick. Quitting the app clears
+it, and the session is renewed automatically while the app is open.
 
-Note that Teams overrides `Available` with `Away` when its client is idle. If
-you want a status that sticks while you work in the terminal, use **Busy** or
-**Do not disturb**.
+Needs one extra permission (`Presence.ReadWrite`) plus `M365_PRESENCE_WRITE=1` in
+`.env`; without them the picker is read-only.
+
+Two quirks worth knowing:
+
+- A **signed-in Teams client outranks the app.** If Teams is running and goes
+  idle, it can pull `Available` down to `Away`. With no Teams client, what you
+  pick is what shows.
+- The session API's vocabulary is narrower than the picker's, so **Busy** shows
+  as "In a call" and **Do not disturb** as "Presenting". The colour and the
+  do-not-disturb behaviour are right; the sub-label is Microsoft's, not ours.
 
 ## Instant push (optional)
 

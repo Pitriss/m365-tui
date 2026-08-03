@@ -161,15 +161,60 @@ pub enum ListUpdate {
 /// Emoji reactions offered in the picker, keyed 1-7.
 pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
 
-/// Presence options: (label, availability, activity). Keyed 1-6.
-pub const PRESENCE_OPTIONS: &[(&str, &str, &str)] = &[
-    ("Available", "Available", "Available"),
-    ("Busy", "Busy", "Busy"),
-    ("Do not disturb", "DoNotDisturb", "DoNotDisturb"),
-    ("Be right back", "BeRightBack", "BeRightBack"),
-    ("Away", "Away", "Away"),
-    ("Appear offline", "Offline", "OffWork"),
+/// A status the user can pick.
+pub struct PresenceOption {
+    pub label: &'static str,
+    /// What `setUserPreferredPresence` records — the sticky preference a Teams
+    /// client will surface.
+    pub preferred: (&'static str, &'static str),
+    /// What this app publishes as its own presence *session*, which is what
+    /// makes the status visible with no Teams client running. `None` means no
+    /// session, i.e. appear offline. The session API accepts a narrower
+    /// vocabulary than the preference API, hence the remapping.
+    pub session: Option<(&'static str, &'static str)>,
+}
+
+/// Presence options, keyed 1-6.
+pub const PRESENCE_OPTIONS: &[PresenceOption] = &[
+    PresenceOption {
+        label: "Available",
+        preferred: ("Available", "Available"),
+        session: Some(("Available", "Available")),
+    },
+    PresenceOption {
+        label: "Busy",
+        // The session API only offers Busy/InACall or Busy/InAConferenceCall.
+        preferred: ("Busy", "Busy"),
+        session: Some(("Busy", "InACall")),
+    },
+    PresenceOption {
+        label: "Do not disturb",
+        preferred: ("DoNotDisturb", "DoNotDisturb"),
+        session: Some(("DoNotDisturb", "Presenting")),
+    },
+    PresenceOption {
+        label: "Be right back",
+        // No BeRightBack in the session vocabulary; Away is the closest.
+        preferred: ("BeRightBack", "BeRightBack"),
+        session: Some(("Away", "Away")),
+    },
+    PresenceOption {
+        label: "Away",
+        preferred: ("Away", "Away"),
+        session: Some(("Away", "Away")),
+    },
+    PresenceOption {
+        label: "Appear offline",
+        preferred: ("Offline", "OffWork"),
+        session: None,
+    },
 ];
+
+/// How long each presence session is asserted for, and how often it is renewed.
+/// Graph allows PT5M–PT4H; a one-hour lease with a 30-minute refresh keeps it
+/// alive while the app runs without leaving a long stale status if it dies.
+pub const PRESENCE_SESSION_LEASE: &str = "PT1H";
+pub const PRESENCE_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 #[allow(clippy::enum_variant_names)] // the "Mail" suffix distinguishes from Teams compose
 pub enum ComposeKind {
@@ -347,6 +392,10 @@ pub struct App {
     pub last_sync: Option<String>,
     /// Whether instant push is working (shown in the status bar).
     pub push: PushState,
+    /// The presence session this app is currently publishing, and when it was
+    /// last asserted — sessions expire, so they need renewing.
+    pub presence_session: Option<(&'static str, &'static str)>,
+    presence_session_at: Option<std::time::Instant>,
     /// Resident memory in KiB, refreshed on each tick.
     pub rss_kb: Option<u64>,
     /// Copy of `status` as of the last tick, plus how many ticks it has been
@@ -392,6 +441,8 @@ impl App {
             my_presence: None,
             last_sync: None,
             push: PushState::Off,
+            presence_session: None,
+            presence_session_at: None,
             rss_kb: read_rss_kb(),
             last_status: String::new(),
             status_ticks: 0,
@@ -446,23 +497,69 @@ impl App {
         });
     }
 
-    fn set_presence(&self, availability: String, activity: String) {
+    /// Apply a chosen status: record the sticky preference *and* publish this
+    /// app as a presence session, which is what actually makes the status
+    /// visible when no Teams client is running.
+    fn set_presence(&mut self, opt: &'static PresenceOption) {
+        self.presence_session = opt.session;
+        self.presence_session_at = Some(std::time::Instant::now());
+
         let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
+        let (pref_av, pref_act) = opt.preferred;
+        let session = opt.session;
+        let label = opt.label;
         self.spawn(async move {
-            people::set_preferred_presence(&s.graph, &availability, &activity).await?;
-            // Read back the *effective* presence, which Graph derives from the
-            // preferred value plus any active Teams session.
+            people::set_preferred_presence(&s.graph, pref_av, pref_act).await?;
+            match session {
+                Some((av, act)) => {
+                    people::set_session_presence(
+                        &s.graph,
+                        &client_id,
+                        av,
+                        act,
+                        PRESENCE_SESSION_LEASE,
+                    )
+                    .await?
+                }
+                // "Appear offline" means holding no session at all.
+                None => {
+                    let _ = people::clear_session_presence(&s.graph, &client_id).await;
+                }
+            }
             Ok(AppMessage::Presence {
                 presence: people::my_presence(&s.graph).await?,
-                requested: Some(availability),
+                requested: Some(label.to_string()),
             })
         });
     }
 
-    fn clear_presence(&self) {
+    /// Re-assert the presence session before it lapses.
+    fn renew_presence_session(&mut self) {
+        let (Some((av, act)), Some(at)) = (self.presence_session, self.presence_session_at) else {
+            return;
+        };
+        if at.elapsed() < PRESENCE_RENEW_AFTER {
+            return;
+        }
+        self.presence_session_at = Some(std::time::Instant::now());
         let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
+        self.spawn(async move {
+            people::set_session_presence(&s.graph, &client_id, av, act, PRESENCE_SESSION_LEASE)
+                .await?;
+            Ok(AppMessage::Status(String::new()))
+        });
+    }
+
+    fn clear_presence(&mut self) {
+        self.presence_session = None;
+        self.presence_session_at = None;
+        let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
         self.spawn(async move {
             people::clear_preferred_presence(&s.graph).await?;
+            let _ = people::clear_session_presence(&s.graph, &client_id).await;
             Ok(AppMessage::Presence {
                 presence: people::my_presence(&s.graph).await?,
                 requested: None,
@@ -819,15 +916,14 @@ impl App {
                     Some(req) if effective.to_lowercase().starts_with(&req.to_lowercase()) => {
                         format!("presence set to {req} (Teams reports {effective})")
                     }
-                    // No client session at all: nothing can make you look online.
-                    Some(req) if effective.eq_ignore_ascii_case("Offline") => format!(
-                        "preferred status '{req}' saved — you stay Offline until a Teams client is signed in"
-                    ),
-                    // A session exists but Teams is overriding, typically its
-                    // idle detection. Busy/DoNotDisturb survive that, Available
-                    // does not.
+                    // Chose "Appear offline": Offline is the expected outcome.
+                    Some(req) if effective.eq_ignore_ascii_case("Offline") => {
+                        format!("presence set to {req} (you appear Offline)")
+                    }
+                    // Graph settled on something else — usually a Teams client
+                    // that is running and idle, which outranks our session.
                     Some(req) => format!(
-                        "preferred status '{req}' saved, but Teams shows '{effective}' — its idle detection overrides Available; Busy/DND stick"
+                        "presence set to {req}; Teams currently shows '{effective}' (a signed-in Teams client can override this)"
                     ),
                     None => format!("presence: {effective}"),
                 };
@@ -882,6 +978,7 @@ impl App {
     /// the UI stays live even without the push tunnel.
     fn poll(&mut self) {
         self.last_sync = Some(now_hms());
+        self.renew_presence_session();
         // Mail: refresh folder unread counts + the open folder's messages.
         self.load_folders();
         if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
@@ -1592,13 +1689,13 @@ impl App {
             Some(Overlay::Presence) => match key.code {
                 KeyCode::Char(c @ '1'..='6') => {
                     let idx = (c as u8 - b'1') as usize;
-                    if let Some((_, availability, activity)) = PRESENCE_OPTIONS.get(idx) {
+                    if let Some(opt) = PRESENCE_OPTIONS.get(idx) {
                         if !self.session.config.can_write_presence() {
                             self.status =
                                 "setting presence needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
                         } else {
-                            self.status = "setting presence…".into();
-                            self.set_presence(availability.to_string(), activity.to_string());
+                            self.status = format!("setting presence to {}…", opt.label);
+                            self.set_presence(opt);
                         }
                     }
                 }

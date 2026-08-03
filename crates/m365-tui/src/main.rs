@@ -149,6 +149,17 @@ async fn run_tui(session: Session) -> Result<()> {
     execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
+    // Drop our presence session on the way out, otherwise the user would keep
+    // showing the status we published for up to the session lease.
+    if app.presence_session.is_some() {
+        let client_id = app.session.config.client_id.clone();
+        if let Err(e) =
+            m365_core::people::clear_session_presence(&app.session.graph, &client_id).await
+        {
+            tracing::warn!("could not clear presence session on exit: {e:#}");
+        }
+    }
+
     res
 }
 

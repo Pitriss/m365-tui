@@ -260,9 +260,17 @@ Two places take data from anyone who can send you a message:
 - **`Merge` can retain a deleted message** until the conversation is reopened,
   if it was deleted outside the refreshed window. The alternative — re-fetching
   every loaded page on each poll — costs far more.
-- **Effective presence is not ours to set.** `setUserPreferredPresence` records
-  a preference; Teams combines it with client session activity, so an idle or
-  absent Teams client still shows Away/Offline.
+- **Presence has two halves.** `setUserPreferredPresence` records a sticky
+  preference, but what colleagues see comes from an active *presence session* —
+  normally the Teams client. With no session the user reads as Offline whatever
+  the preference says. The app therefore also calls `setPresence` with its own
+  client ID as `sessionId`, which delegated `Presence.ReadWrite` permits, so a
+  status set from the terminal is actually visible. Sessions expire (5 min–4 h),
+  so the app leases an hour, renews every 30 minutes, and clears the session on
+  exit rather than leaving a stale status behind. A running Teams client still
+  outranks the app's session, and the session vocabulary is narrower than the
+  preference one (`Busy` must be `InACall`, `DoNotDisturb` must be
+  `Presenting`).
 - **No call media.** Joining Teams audio/video is not a terminal capability.
 
 ## Releases
