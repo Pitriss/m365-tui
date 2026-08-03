@@ -392,6 +392,12 @@ pub struct App {
     pub last_sync: Option<String>,
     /// Whether instant push is working (shown in the status bar).
     pub push: PushState,
+    /// Message ids already notified about, so a poll can't repeat them.
+    notified: std::collections::HashSet<String>,
+    /// Newest message id seen per chat, to spot arrivals in chats that aren't
+    /// open. `None` until the first chat list lands — the first sync must not
+    /// fire a burst of notifications for history.
+    chat_seen: Option<std::collections::HashMap<String, String>>,
     /// The presence session this app is currently publishing, and when it was
     /// last asserted — sessions expire, so they need renewing.
     pub presence_session: Option<(&'static str, &'static str)>,
@@ -441,6 +447,8 @@ impl App {
             my_presence: None,
             last_sync: None,
             push: PushState::Off,
+            notified: std::collections::HashSet::new(),
+            chat_seen: None,
             presence_session: None,
             presence_session_at: None,
             rss_kb: read_rss_kb(),
@@ -857,6 +865,7 @@ impl App {
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
             AppMessage::Chats(c) => {
+                self.notify_for_chats(&c);
                 self.teams.chats = c;
                 self.teams.chat_sel = self.teams.chat_sel.min(self.teams.chats.len().saturating_sub(1));
             }
@@ -1160,6 +1169,94 @@ impl App {
         match crate::opener::open_url(&url) {
             Ok(()) => self.status = format!("opening {}", truncate_url(&url)),
             Err(e) => self.status = format!("could not open link: {e:#}"),
+        }
+    }
+
+    /// Raise notifications for chats whose newest message changed: direct
+    /// messages always, group chats only when they `@mention` the user.
+    fn notify_for_chats(&mut self, chats: &[Chat]) {
+        if !self.session.config.notifications {
+            return;
+        }
+        let my_id = self.me.as_ref().map(|m| m.id.clone());
+        let my_name = self.me.as_ref().and_then(|m| m.display_name.clone());
+
+        // First sync only records the baseline; notifying here would announce
+        // every conversation's history at startup.
+        let Some(seen) = self.chat_seen.as_mut() else {
+            self.chat_seen = Some(
+                chats
+                    .iter()
+                    .filter_map(|c| {
+                        let id = c.last_message_preview.as_ref()?.id.clone()?;
+                        Some((c.id.clone(), id))
+                    })
+                    .collect(),
+            );
+            return;
+        };
+
+        let mut to_notify: Vec<(String, String)> = Vec::new();
+        for chat in chats {
+            let Some(preview) = chat.last_message_preview.as_ref() else {
+                continue;
+            };
+            let Some(msg_id) = preview.id.clone() else {
+                continue;
+            };
+            let previous = seen.insert(chat.id.clone(), msg_id.clone());
+            if previous.as_deref() == Some(msg_id.as_str()) {
+                continue; // nothing new here
+            }
+
+            // Never notify for our own messages, or twice for the same one.
+            let from_id = preview
+                .from
+                .as_ref()
+                .and_then(|f| f.user.as_ref())
+                .and_then(|u| u.id.as_deref());
+            if from_id.is_some() && from_id == my_id.as_deref() {
+                continue;
+            }
+            if !self.notified.insert(msg_id.clone()) {
+                continue;
+            }
+
+            let body = preview
+                .body
+                .as_ref()
+                .and_then(|b| b.content.clone())
+                .unwrap_or_default();
+            let mentioned = crate::notify::mentions_me(
+                &[],
+                &body,
+                my_id.as_deref(),
+                my_name.as_deref(),
+            );
+            if !crate::notify::should_notify(chat.chat_type.as_deref(), mentioned) {
+                continue;
+            }
+
+            let who = preview
+                .from
+                .as_ref()
+                .and_then(|f| f.user.as_ref())
+                .and_then(|u| u.display_name.clone())
+                .unwrap_or_else(|| chat.label(my_id.as_deref()));
+            let title = if mentioned {
+                format!("{who} mentioned you")
+            } else {
+                who
+            };
+            to_notify.push((title, content::plain(&content::render_body(None, &body).text)));
+        }
+
+        // Keep the id set from growing without bound over a long session.
+        if self.notified.len() > 1000 {
+            self.notified.clear();
+        }
+        for (title, body) in to_notify {
+            crate::notify::send(&title, &body);
         }
     }
 

@@ -886,6 +886,7 @@ dependencies = [
  "m365-core",
  "markup5ever_rcdom",
  "ratatui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -23,3 +23,6 @@ futures-util.workspace = true
 html5ever = "0.38"
 markup5ever_rcdom = "0.38"
 directories.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

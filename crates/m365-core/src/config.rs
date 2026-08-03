@@ -52,6 +52,8 @@ pub struct Config {
     /// Shared secret echoed in subscription `clientState` and verified by the
     /// webhook. Generated on first run if absent.
     pub client_state: String,
+    /// Desktop notifications for direct messages and `@mentions`.
+    pub notifications: bool,
 }
 
 impl Config {
@@ -95,6 +97,12 @@ impl Config {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        // On unless explicitly disabled.
+        let notifications = !matches!(
+            std::env::var("M365_NOTIFY").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        );
+
         Ok(Self {
             client_id,
             tenant_id,
@@ -103,6 +111,7 @@ impl Config {
             redis_url,
             token_cache_path,
             client_state,
+            notifications,
         })
     }
 
@@ -195,6 +204,7 @@ mod tests {
             redis_url: "redis://127.0.0.1:6379".into(),
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
+            notifications: true,
         }
     }
 

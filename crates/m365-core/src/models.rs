@@ -223,9 +223,21 @@ pub struct ConversationMember {
 #[serde(rename_all = "camelCase")]
 pub struct LastMessagePreview {
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
     pub body: Option<ItemBody>,
     #[serde(default)]
     pub created_date_time: Option<String>,
+    #[serde(default)]
+    pub from: Option<IdentitySet>,
+}
+
+/// An `@mention` inside a Teams message.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessageMention {
+    #[serde(default)]
+    pub mentioned: Option<IdentitySet>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -285,6 +297,8 @@ pub struct ChatMessage {
     pub reactions: Vec<MessageReaction>,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub mentions: Vec<ChatMessageMention>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -295,6 +309,11 @@ pub struct MessageReaction {
 }
 
 impl ChatMessage {
+    /// The sender's user id, when the message came from a person.
+    pub fn author_id(&self) -> Option<&str> {
+        self.from.as_ref()?.user.as_ref()?.id.as_deref()
+    }
+
     pub fn author(&self) -> String {
         self.from
             .as_ref()

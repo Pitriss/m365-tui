@@ -31,6 +31,7 @@ Everything below is optional:
 |---|---|---|
 | Opening links (`o`) | `xdg-open` | Links can still be copied |
 | Copying (`y`) | `wl-clipboard`, `xclip` or `xsel` | Falls back to the OSC 52 escape sequence, which most modern terminals support |
+| Notifications | `notify-send` (libnotify) | Falls back to the terminal bell |
 | Instant push | Docker + Docker Compose | Still refreshes every 20 seconds |
 | Building yourself | Rust, or Nix | Not needed — use the release binary |
 
@@ -177,6 +178,11 @@ tracking wrappers are unwrapped back to the real destination.
 **Copying text.** Press `y` to copy a message straight to the clipboard, or `z`
 for copy mode — a borderless full-width view where a normal mouse drag selects
 only the message text, with no side panes in the way.
+
+**Notifications.** Direct messages always notify; group chats and channels only
+when someone `@mentions` you — so a busy tenant stays quiet. Uses `notify-send`
+if it's installed, otherwise the terminal bell. Turn it off with `M365_NOTIFY=0`
+in `.env`.
 
 **Conversations read like a chat.** Consecutive messages from the same person
 are grouped under one name, each with its own timestamp down the left, and a

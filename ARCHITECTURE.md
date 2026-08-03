@@ -241,6 +241,22 @@ Transient text expires on a 2-second local tick that also samples memory. The
 tick counts how long the message has been unchanged rather than timestamping
 each write, which avoids threading an expiry through the ~30 places that set it.
 
+## Notifications
+
+Only messages actually addressed to the user raise one: direct chats always,
+group chats and channels only on an `@mention`. Anything looser would be
+unusable in a busy tenant.
+
+Detection prefers a message's `mentions` array, which is exact. Chat *previews*
+— which is all the chat list carries for conversations that aren't open — omit
+it, so there is a fallback that scans the rendered `<at>…</at>` spans for the
+user's name. Prose that merely contains the name is not a mention.
+
+Two guards stop it becoming noise: notified message ids are remembered so a
+20-second poll can't repeat itself, and the first chat-list sync only records a
+baseline — otherwise every conversation's history would announce itself at
+startup.
+
 ## Handling untrusted input
 
 Two places take data from anyone who can send you a message:

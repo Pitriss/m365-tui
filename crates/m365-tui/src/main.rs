@@ -11,6 +11,7 @@ mod content;
 mod editor;
 mod files;
 mod navigation;
+mod notify;
 mod opener;
 mod ui;
 
