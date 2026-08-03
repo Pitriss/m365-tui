@@ -346,8 +346,13 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
     let mut starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
     // Emit a "Today"/"Yesterday"/date separator whenever the day changes.
     let mut last_day: Option<chrono::NaiveDate> = None;
+    // Track the previous message so consecutive ones from the same person can
+    // share a single author header.
+    let mut prev: Option<(String, Option<chrono::DateTime<chrono::Local>>)> = None;
+
     for (i, m) in app.teams.messages.iter().enumerate() {
         let when = local_time(m.created_date_time.as_deref());
+        let mut day_changed = false;
         if let Some(when) = when {
             let day = when.date_naive();
             if last_day != Some(day) {
@@ -356,6 +361,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                 }
                 lines.push(day_separator(&day_label(day)));
                 last_day = Some(day);
+                day_changed = true;
             }
         }
         // Record the start *after* any separator, so scrolling to a message
@@ -370,41 +376,71 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
         } else {
             "  "
         };
-        let indent = if selectable { "    " } else { "  " };
+
+        // Every message opens with its own local time, so a run sharing one
+        // author header still shows when each line was sent. Wrapped body lines
+        // line up past that gutter.
+        let ts = when
+            .map(|w| w.format("%H:%M").to_string())
+            .unwrap_or_else(|| " ".repeat(TIME_WIDTH));
+        let gutter = " ".repeat(marker.chars().count() + TIME_WIDTH + 1);
+        let lead = |extra: Vec<Span<'static>>| {
+            let mut spans = vec![
+                Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
+                Span::styled(format!("{ts} "), Style::default().fg(DIM)),
+            ];
+            spans.extend(extra);
+            Line::from(spans)
+        };
 
         if m.deleted_date_time.is_some() {
-            lines.push(Line::from(vec![
-                Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
-                Span::styled("(message deleted)", Style::default().fg(DIM)),
-            ]));
+            lines.push(lead(vec![Span::styled(
+                "(message deleted)",
+                Style::default().fg(DIM),
+            )]));
+            prev = None; // a deletion breaks the run
             continue;
         }
 
-        // Local wall-clock time (Graph returns UTC).
-        let ts = when
-            .map(|w| w.format("%H:%M").to_string())
+        let author = m.author();
+        let grouped = !day_changed
+            && prev
+                .as_ref()
+                .is_some_and(|(a, t)| continues_run(a, *t, &author, when));
+
+        let mut body: Vec<Line<'static>> = app
+            .teams
+            .messages_rendered
+            .get(i)
+            .map(|b| b.lines.clone())
             .unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
-            Span::styled(
-                format!("{} ", m.author()),
+
+        if grouped {
+            // No repeated name — the body follows straight after the time.
+            let first = if body.is_empty() {
+                Vec::new()
+            } else {
+                body.remove(0).spans
+            };
+            lines.push(lead(first));
+        } else {
+            lines.push(lead(vec![Span::styled(
+                author.clone(),
                 Style::default()
                     .fg(if selected { Color::Cyan } else { Color::LightGreen })
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(ts, Style::default().fg(DIM)),
-        ]));
-        if let Some(body) = app.teams.messages_rendered.get(i) {
-            for line in &body.lines {
-                let mut spans = vec![Span::raw(indent)];
-                spans.extend(line.spans.iter().cloned());
-                lines.push(Line::from(spans));
-            }
+            )]));
+        }
+
+        for line in body {
+            let mut spans = vec![Span::raw(gutter.clone())];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
         }
         for att in &m.attachments {
             if let Some(name) = &att.name {
                 lines.push(Line::from(vec![
-                    Span::raw(indent),
+                    Span::raw(gutter.clone()),
                     Span::styled(
                         format!("📎 {name}"),
                         Style::default().fg(Color::LightBlue),
@@ -414,13 +450,38 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
         }
         if let Some(reactions) = m.reactions_summary() {
             lines.push(Line::from(vec![
-                Span::raw(indent),
+                Span::raw(gutter.clone()),
                 Span::styled(reactions, Style::default().fg(DIM)),
             ]));
         }
+        prev = Some((author, when));
     }
     (lines, starts)
 }
+
+/// Width of the `HH:MM` timestamp column.
+const TIME_WIDTH: usize = 5;
+
+/// Whether a message continues the previous one's run: same author, and close
+/// enough in time that repeating the name would just be noise.
+fn continues_run(
+    prev_author: &str,
+    prev_at: Option<chrono::DateTime<chrono::Local>>,
+    author: &str,
+    at: Option<chrono::DateTime<chrono::Local>>,
+) -> bool {
+    if prev_author != author {
+        return false;
+    }
+    match (prev_at, at) {
+        // Messages are newest-first, so the gap can run either way.
+        (Some(a), Some(b)) => (a - b).num_minutes().abs() <= RUN_GAP_MINUTES,
+        _ => true,
+    }
+}
+
+/// A pause this long starts a fresh header even for the same person.
+const RUN_GAP_MINUTES: i64 = 15;
 
 // ---------------------------------------------------------------------------
 // Teams
@@ -1126,6 +1187,45 @@ mod tests {
         // A separator above the first message must not select a negative index.
         assert_eq!(topmost_message_index(&[3, 9], 0), 0);
         assert_eq!(topmost_message_index(&[], 7), 0);
+    }
+
+    #[test]
+    fn groups_consecutive_messages_from_one_sender() {
+        use super::continues_run;
+        let at = |h, m| {
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 3)
+                    .unwrap()
+                    .and_hms_opt(h, m, 0)
+                    .unwrap()
+                    .and_local_timezone(chrono::Local)
+                    .unwrap(),
+            )
+        };
+
+        // Same person, a minute apart: one header covers both.
+        assert!(continues_run("Jaime", at(16, 30), "Jaime", at(16, 29)));
+        // Different people never group.
+        assert!(!continues_run("Jaime", at(16, 30), "António", at(16, 29)));
+        // A long pause earns a fresh header even for the same person.
+        assert!(!continues_run("Jaime", at(16, 30), "Jaime", at(15, 00)));
+        // Gap is symmetric — the list runs newest-first.
+        assert!(!continues_run("Jaime", at(15, 00), "Jaime", at(16, 30)));
+        // Missing timestamps fall back to the author check alone.
+        assert!(continues_run("Jaime", None, "Jaime", at(16, 30)));
+    }
+
+    #[test]
+    fn body_lines_align_under_the_timestamp_gutter() {
+        use super::TIME_WIDTH;
+        // Every message opens with `marker + HH:MM + space`; wrapped body lines
+        // are indented by exactly that, so text stays in one column whether or
+        // not the message is grouped.
+        for marker in ["▶ ", "  ", ""] {
+            let lead = marker.chars().count() + TIME_WIDTH + 1;
+            let gutter = " ".repeat(lead);
+            assert_eq!(gutter.chars().count(), lead, "marker {marker:?}");
+        }
     }
 
     #[test]

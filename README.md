@@ -178,6 +178,10 @@ tracking wrappers are unwrapped back to the real destination.
 for copy mode — a borderless full-width view where a normal mouse drag selects
 only the message text, with no side panes in the way.
 
+**Conversations read like a chat.** Consecutive messages from the same person
+are grouped under one name, each with its own timestamp down the left, and a
+`Today`/`Yesterday` header pinned at the top of the pane as you scroll.
+
 **Open chats update themselves.** New messages appear in the conversation you're
 reading — within a second with push enabled, otherwise on the 20-second refresh.
 If you're on the newest message the view follows along; if you've scrolled back

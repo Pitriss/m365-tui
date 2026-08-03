@@ -106,6 +106,16 @@ already displayed:
 user had scrolled back through. Selection is restored by message id rather than
 index, so arriving messages don't move the cursor.
 
+Consecutive messages from one person share a single author header, the way chat
+clients do. A run breaks on a different sender, a day boundary, a deleted
+message, or a pause over 15 minutes — long enough that repeating the name is
+useful context again.
+
+Every message opens with `marker + HH:MM`, so a run under one name still shows
+when each line was sent, and body lines are indented by exactly that gutter to
+keep the text in a single column. The marker staying in the margin means every
+message remains individually selectable for reactions, grouped or not.
+
 Teams conversations add the usual chat-client behaviour on top: messages are
 newest-first, so an arrival lands *above* the reader. If the selection is already
 on the newest message the view follows it; otherwise the position is held and the
