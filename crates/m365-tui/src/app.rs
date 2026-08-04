@@ -794,7 +794,9 @@ impl App {
     pub fn apply(&mut self, msg: AppMessage) {
         match msg {
             AppMessage::Status(s) => self.status = s,
-            AppMessage::Error(e) => self.status = format!("error: {e}"),
+            AppMessage::Error(e) => {
+                self.status = format!("error: {}", m365_core::util::graph_error_summary(&e));
+            }
             AppMessage::Whoami(u) => {
                 self.status = format!(
                     "signed in as {} <{}>",
@@ -1501,12 +1503,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
             KeyCode::PageUp => self.outlook_move(-10),
             KeyCode::PageDown => self.outlook_move(10),
-            // Back out of the reading pane to the message list, as in Teams.
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')
-                if self.outlook_focus == OutlookFocus::Reading =>
-            {
-                self.outlook_focus = OutlookFocus::Messages;
-            }
+            // h/l move between panes: out to the left, into the thing on the
+            // right. Esc is a synonym for backing out.
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.outlook_out(),
+            KeyCode::Right | KeyCode::Char('l') => self.outlook_into(),
             KeyCode::Home if self.outlook_focus == OutlookFocus::Reading => {
                 self.outlook.reading_scroll = 0;
             }
@@ -1546,6 +1546,22 @@ impl App {
                     self.load_more_messages();
                 }
             }
+        }
+    }
+
+    /// Move focus one pane left: Reading → Messages → Folders.
+    fn outlook_out(&mut self) {
+        self.outlook_focus = match self.outlook_focus {
+            OutlookFocus::Reading => OutlookFocus::Messages,
+            OutlookFocus::Messages | OutlookFocus::Folders => OutlookFocus::Folders,
+        };
+    }
+
+    /// Move focus one pane right, opening whatever is selected on the way — the
+    /// same thing Enter does.
+    fn outlook_into(&mut self) {
+        if self.outlook_focus != OutlookFocus::Reading {
+            self.outlook_enter();
         }
     }
 
@@ -1631,6 +1647,10 @@ impl App {
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 self.teams.focus = TeamsFocus::List;
             }
+            // ...and into the conversation from the list, opening it.
+            KeyCode::Right | KeyCode::Char('l') if self.teams.focus == TeamsFocus::List => {
+                self.teams_enter();
+            }
             KeyCode::Tab => {
                 self.teams.focus = match self.teams.focus {
                     TeamsFocus::List => TeamsFocus::Messages,
@@ -1639,9 +1659,14 @@ impl App {
                 };
             }
             KeyCode::Char('t') => {
-                // Toggle chats/channels mode.
+                // Toggle chats/channels mode. Listing teams needs a scope that
+                // chats don't, so say so plainly instead of letting Graph 403.
                 self.teams.mode = match self.teams.mode {
                     TeamsMode::Chats => {
+                        if !self.session.config.can_read_teams() {
+                            self.status = "channels need the Team.ReadBasic.All permission — grant it, then set M365_TEAMS_CHANNELS=1 and sign in again".into();
+                            return;
+                        }
                         if self.teams.teams.is_empty() {
                             self.load_teams();
                         }

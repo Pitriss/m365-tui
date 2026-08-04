@@ -34,6 +34,10 @@ pub const DEFAULT_SCOPES: &[&str] = &[
 /// the app registration and consented.
 pub const PRESENCE_WRITE_SCOPE: &str = "Presence.ReadWrite";
 
+/// Needed to list the teams and channels you belong to (`/me/joinedTeams`).
+/// Chats work without it. Opt in with `M365_TEAMS_CHANNELS=1`.
+pub const TEAMS_READ_SCOPE: &str = "Team.ReadBasic.All";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -74,6 +78,9 @@ impl Config {
                 // require admin approval.
                 if env_flag("M365_PRESENCE_WRITE") {
                     s.push(PRESENCE_WRITE_SCOPE.to_string());
+                }
+                if env_flag("M365_TEAMS_CHANNELS") {
+                    s.push(TEAMS_READ_SCOPE.to_string());
                 }
                 s
             }
@@ -127,9 +134,16 @@ impl Config {
 
     /// Whether the token we request can set presence.
     pub fn can_write_presence(&self) -> bool {
-        self.scopes
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(PRESENCE_WRITE_SCOPE))
+        self.has_scope(PRESENCE_WRITE_SCOPE)
+    }
+
+    /// Whether the token we request can enumerate teams and channels.
+    pub fn can_read_teams(&self) -> bool {
+        self.has_scope(TEAMS_READ_SCOPE)
+    }
+
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s.eq_ignore_ascii_case(scope))
     }
 
     pub fn devicecode_endpoint(&self) -> String {

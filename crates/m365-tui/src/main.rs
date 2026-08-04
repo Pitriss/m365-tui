@@ -267,7 +267,7 @@ async fn manage_subscriptions(
             }
             Err(e) => {
                 tracing::warn!("failed to subscribe to {res}: {e:#}");
-                last_error = Some(graph_error_summary(&format!("{e:#}")));
+                last_error = Some(m365_core::util::graph_error_summary(&format!("{e:#}")));
             }
         }
     }
@@ -292,18 +292,6 @@ async fn manage_subscriptions(
     }
 }
 
-/// Pull the useful sentence out of a Graph error blob for the status line.
-fn graph_error_summary(err: &str) -> String {
-    // Graph nests the human-readable part in `"message":"..."`.
-    if let Some(start) = err.find("\"message\":\"") {
-        let rest = &err[start + 11..];
-        if let Some(end) = rest.find('"') {
-            return rest[..end].to_string();
-        }
-    }
-    err.chars().take(120).collect()
-}
-
 /// Log to a file in the cache dir so we never corrupt the TUI on stdout/stderr.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -319,27 +307,4 @@ fn init_tracing() {
                 .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap())
         })
         .try_init();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::graph_error_summary;
-
-    #[test]
-    fn extracts_the_readable_part_of_a_graph_error() {
-        // The exact shape seen when the tunnel hostname is wrong.
-        let raw = r#"Graph request failed (400 Bad Request): {"error":{"code":"InvalidRequest","message":"Failed to resolve domain m365.xstf.pt: No such host is known","innerError":{"date":"2026-07-27"}}}"#;
-        assert_eq!(
-            graph_error_summary(raw),
-            "Failed to resolve domain m365.xstf.pt: No such host is known"
-        );
-    }
-
-    #[test]
-    fn falls_back_to_a_truncated_message() {
-        let raw = "connection refused";
-        assert_eq!(graph_error_summary(raw), "connection refused");
-        let long = "x".repeat(500);
-        assert_eq!(graph_error_summary(&long).chars().count(), 120);
-    }
 }

@@ -53,7 +53,15 @@ Tokens refresh silently 60 seconds before expiry.
 **Scopes are deliberately stable.** Changing the requested scope set invalidates
 an existing consent grant, and in tenants that disallow user consent that turns
 every sign-in into an admin-approval request. New optional capabilities are
-therefore opt-in (see `PRESENCE_WRITE_SCOPE`) rather than added to the defaults.
+therefore opt-in rather than added to the defaults:
+
+| Scope | Flag | Without it |
+|---|---|---|
+| `Team.ReadBasic.All` | `M365_TEAMS_CHANNELS` | Channels are unavailable; chats work |
+| `Presence.ReadWrite` | `M365_PRESENCE_WRITE` | The status picker is read-only |
+
+Capabilities behind an opt-in scope check `Config::can_*` before calling, so the
+UI explains what's missing instead of surfacing a Graph 403.
 
 ## The Graph client
 
@@ -221,6 +229,22 @@ single code path — the small-attachment route has to buffer anyway to base64 i
 — and is fine at ordinary attachment sizes. Streaming from disk would be the
 change if very large files ever mattered; it would mean `m365-core` doing
 filesystem I/O, which it otherwise avoids.
+
+## Navigation
+
+Panes are laid out left to right — folders, messages, reading; chat list,
+conversation — so movement follows that geometry, the way a file manager does:
+
+| Key | Effect |
+|---|---|
+| `h` / `←` / `Esc` | Out to the pane on the left |
+| `l` / `→` | Into the pane on the right, opening the selection (same as Enter) |
+| `j` / `k` / `↑` / `↓` | Move *within* the focused pane |
+
+`j`/`k` never cross a pane boundary. In a list they move the selection; in a
+reading pane or conversation they scroll, because nothing sits below to move to.
+The composer is reached with `i` rather than `l`, since it is below the
+conversation rather than beside it.
 
 ## Chrome layout
 

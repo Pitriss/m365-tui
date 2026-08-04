@@ -182,13 +182,13 @@ fn context_hints(app: &App) -> &'static str {
     }
     match app.screen {
         Screen::Outlook => match app.outlook_focus {
-            OutlookFocus::Folders => "Enter open · Tab next pane",
-            OutlookFocus::Messages => "Enter read · c compose · r reply · / search",
-            OutlookFocus::Reading => "j/k scroll · o links · A attach · y copy · Esc back",
+            OutlookFocus::Folders => "j/k move · l open folder",
+            OutlookFocus::Messages => "j/k move · l read · h back · c compose · r reply · / search",
+            OutlookFocus::Reading => "j/k scroll · h back · o links · A attach · y copy",
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "Enter open · t chats/channels",
-            TeamsFocus::Messages => "j/k select · e react · i write · Esc back",
+            TeamsFocus::List => "j/k move · l open · t chats/channels",
+            TeamsFocus::Messages => "j/k select · h back · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
     }
@@ -634,12 +634,13 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Copying: y yank focused message · Y yank whole view\n\
           z copy mode (full-width, borderless — drag-select cleanly)\n\
  \n\
- Outlook: Tab cycle panes · j/k move · Enter open · c compose\n\
-          in the reading pane: j/k scroll · Home/End · Esc back to list\n\
-          r reply · a reply-all · f forward · / search · g calendar\n\
+ Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
+          j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
  \n\
- Teams:   Tab cycle panes · Enter open · t chats/channels\n\
-          j/k select message · g newest · e react · Esc / ← / h back to list\n\
+ Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
+          / search · g calendar · in the reading pane j/k scroll\n\
+ \n\
+ Teams:   t chats/channels · j/k select message · g newest · e react\n\
           i type message · Enter send\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\

@@ -45,6 +45,21 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
+/// Pull the human-readable sentence out of a Graph error blob.
+///
+/// Graph returns a wall of JSON; the status bar wants the one sentence that
+/// says what went wrong.
+pub fn graph_error_summary(err: &str) -> String {
+    if let Some(start) = err.find("\"message\":\"") {
+        let rest = &err[start + 11..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    let flat: String = err.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(160).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +73,18 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn summarises_graph_errors() {
+        let raw = r#"Graph request failed (403 Forbidden): {"error":{"code":"Forbidden","message":"Missing scope permissions on the request.","innerError":{"date":"2026-08-04"}}}"#;
+        assert_eq!(
+            graph_error_summary(raw),
+            "Missing scope permissions on the request."
+        );
+        // Non-Graph errors are flattened and bounded.
+        assert_eq!(graph_error_summary("connection refused"), "connection refused");
+        assert_eq!(graph_error_summary(&"x".repeat(500)).chars().count(), 160);
     }
 
     #[test]

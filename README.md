@@ -97,6 +97,15 @@ Then two settings on that app:
    offline_access  openid  profile
    ```
 
+   Two capabilities are **opt-in**, because adding a scope later forces everyone
+   to re-consent. Add these now if you want them, then enable the matching flag
+   in `.env`:
+
+   | Permission | Enables | Flag |
+   |---|---|---|
+   | `Team.ReadBasic.All` | Teams **channels** (chats work without it) | `M365_TEAMS_CHANNELS=1` |
+   | `Presence.ReadWrite` | Setting your own status | `M365_PRESENCE_WRITE=1` |
+
 7. Click **Grant admin consent**.
 
 > **If you're not an admin**, that button is greyed out. `ChannelMessage.Read.All`
@@ -178,13 +187,19 @@ Press `?` in the app for this list at any time.
 | Scope | Keys |
 |---|---|
 | **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
-| **Outlook** | `Tab` change pane · `j`/`k` move · `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
-| **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `Esc` back to the list |
-| **Teams** | `Tab` change pane · `Enter` open · `t` chats↔channels · `j`/`k` select message · `g` newest · `e` react · `i` write · `Enter` send · `Esc` back |
+| **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
+| **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
+| **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `i` write · `Enter` send |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
 | **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+S` send · `Esc` cancel |
+
+`h` and `l` work like a file manager: `l` moves right into the pane beside you,
+opening whatever is selected, and `h` moves back out. `j`/`k` stay inside the
+focused pane — in a reading pane or conversation they scroll the text, since
+there's nothing below to move to.
 
 Scrolling to the end of a message list or conversation loads the next 50 items.
 
@@ -295,6 +310,11 @@ your tunnel hostname — Graph reports `Failed to resolve domain ...`. Check
 `docker compose logs webhook` to see requests arriving.
 
 ## Troubleshooting
+
+**Pressing `t` says channels need a permission.** Listing your teams requires
+`Team.ReadBasic.All`, which isn't requested by default. Add it to the app
+registration, set `M365_TEAMS_CHANNELS=1` in `.env`, delete
+`~/.config/m365-tui/token-cache.json` and sign in again. Chats need none of this.
 
 **Sign-in asks for admin approval.** The requested scopes no longer match what
 was consented. Either have an admin approve the new set, or pin the old one with
