@@ -127,7 +127,11 @@ message remains individually selectable for reactions, grouped or not.
 ### Conversation order
 
 Graph answers newest-first, but a conversation is read oldest-at-the-top, so the
-page is reversed on arrival and the list is stored chronologically. That shapes
+page is reversed on arrival and the list is stored chronologically. The list is
+then **sorted by creation time** (id breaking ties — Teams ids are epoch
+milliseconds) rather than trusting arrival order: Graph's ordering is not
+strictly chronological, and merging pages can interleave, which showed up as
+messages from the same minute appearing swapped. That shapes
 everything around it: an older page fetched by scrolling up is *prepended*, a
 refresh appends to the end, the newest message is the last index, and the pane
 scrolls so the selected message's last line rests on the bottom row — which for
@@ -154,6 +158,10 @@ holding `messageId`, `messagePreview` and `messageSender`; the body carries only
 an empty `<attachment id="…">` tag. Replies are therefore both read and written
 through that attachment — rendering the body alone shows the reply text with no
 sign of what it answers, which is what a first attempt at this did.
+
+The quote is drawn *before* the reply text. For a grouped message the quote takes
+the lead line beside the timestamp, so the reply's own text is never swallowed by
+the line that would otherwise carry it.
 
 Sending falls back to a plain `<blockquote>` if a tenant rejects the reference
 attachment, so a reply is never lost to a failed post.

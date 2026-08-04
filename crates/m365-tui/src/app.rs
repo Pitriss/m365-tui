@@ -1122,6 +1122,12 @@ impl App {
             }
         }
 
+        // Order the list ourselves rather than trusting the order pages arrive
+        // in: Graph's default ordering is not strictly by creation time, and
+        // merging pages can interleave. Sorting by timestamp (id breaks ties —
+        // Teams ids are epoch milliseconds) is cheap and always correct.
+        self.teams.messages.sort_by_key(sort_key);
+
         // Re-render bodies for whatever the list now holds (HTML parse is cached
         // per message, so this only costs on changed content).
         let rendered: Vec<_> = self
@@ -2293,6 +2299,17 @@ fn parse_vmrss(status: &str) -> Option<u64> {
         .ok()
 }
 
+/// Chronological sort key for a Teams message: creation time, then id.
+fn sort_key(m: &ChatMessage) -> (i64, u64) {
+    let at = m
+        .created_date_time
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(0);
+    (at, m.id.parse::<u64>().unwrap_or(0))
+}
+
 fn now_hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
@@ -2352,6 +2369,40 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{merge_newest_first, next_field, parse_recipients, step};
+
+    #[test]
+    fn messages_sort_chronologically_regardless_of_arrival_order() {
+        use super::sort_key;
+        let msg = |id: &str, at: &str| -> m365_core::models::ChatMessage {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "createdDateTime": at,
+                "body": { "contentType": "text", "content": "x" }
+            }))
+            .unwrap()
+        };
+        // Same minute, different seconds — the case Graph returned out of order.
+        let mut list = vec![
+            msg("1785859200000", "2026-08-04T15:59:50Z"),
+            msg("1785859141228", "2026-08-04T15:59:01Z"),
+            msg("1785859178276", "2026-08-04T15:59:38Z"),
+        ];
+        list.sort_by_key(sort_key);
+        let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["1785859141228", "1785859178276", "1785859200000"],
+            "oldest first"
+        );
+
+        // A missing timestamp must not panic or reorder everything else.
+        let mut with_gap = vec![
+            msg("2", "2026-08-04T16:00:00Z"),
+            serde_json::from_value(serde_json::json!({ "id": "1" })).unwrap(),
+        ];
+        with_gap.sort_by_key(sort_key);
+        assert_eq!(with_gap[0].id, "1");
+    }
 
     #[test]
     fn merge_keeps_older_pages_and_dedups() {

@@ -415,36 +415,48 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
             .map(|b| b.lines.clone())
             .unwrap_or_default();
 
-        if grouped {
-            // No repeated name — the body follows straight after the time.
-            let first = if body.is_empty() {
-                Vec::new()
-            } else {
-                body.remove(0).spans
-            };
-            lines.push(lead(first));
-        } else {
-            lines.push(lead(vec![Span::styled(
-                author.clone(),
-                Style::default()
-                    .fg(if selected { Color::Cyan } else { Color::LightGreen })
-                    .add_modifier(Modifier::BOLD),
-            )]));
-        }
-
         // A reply carries the message it answers as a `messageReference`
-        // attachment, not as HTML, so it has to be drawn explicitly.
-        if let Some(quote) = m.quoted() {
-            lines.push(Line::from(vec![
-                Span::raw(gutter.clone()),
+        // attachment, not as HTML, so it has to be drawn explicitly — and it
+        // has to come *before* the reply text to read correctly.
+        let quote = m.quoted().map(|q| {
+            vec![
                 Span::styled("┃ ", Style::default().fg(ACCENT)),
                 Span::styled(
-                    format!("{}: ", quote.author),
+                    format!("{}: ", q.author),
                     Style::default().fg(Color::LightGreen),
                 ),
-                Span::styled(truncate(&quote.preview, 70), Style::default().fg(DIM)),
-            ]));
+                Span::styled(truncate(&q.preview, 70), Style::default().fg(DIM)),
+            ]
+        });
+
+        match (grouped, quote) {
+            // Grouped reply: the quote takes the lead line, the text follows.
+            (true, Some(quote)) => lines.push(lead(quote)),
+            // Grouped message: the text starts right after the time.
+            (true, None) => {
+                let first = if body.is_empty() {
+                    Vec::new()
+                } else {
+                    body.remove(0).spans
+                };
+                lines.push(lead(first));
+            }
+            // New author: name on the lead line, then the quote if there is one.
+            (false, quote) => {
+                lines.push(lead(vec![Span::styled(
+                    author.clone(),
+                    Style::default()
+                        .fg(if selected { Color::Cyan } else { Color::LightGreen })
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                if let Some(quote) = quote {
+                    let mut spans = vec![Span::raw(gutter.clone())];
+                    spans.extend(quote);
+                    lines.push(Line::from(spans));
+                }
+            }
         }
+
         for line in body {
             let mut spans = vec![Span::raw(gutter.clone())];
             spans.extend(line.spans);

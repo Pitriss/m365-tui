@@ -518,6 +518,13 @@ mod tests {
     }
 
     #[test]
+    fn attachment_tag_body_still_renders_its_text() {
+        let out = render_html(r#"<attachment id="1785858892876"></attachment><p>Confirma por favor</p>"#);
+        let s = flat(&out.text);
+        assert!(s.contains("Confirma por favor"), "reply text lost: {s:?}");
+    }
+
+    #[test]
     fn script_and_style_are_dropped() {
         let out = render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
         let s = flat(&out.text);
