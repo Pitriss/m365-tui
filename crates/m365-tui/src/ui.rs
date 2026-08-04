@@ -432,6 +432,19 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
             )]));
         }
 
+        // A reply carries the message it answers as a `messageReference`
+        // attachment, not as HTML, so it has to be drawn explicitly.
+        if let Some(quote) = m.quoted() {
+            lines.push(Line::from(vec![
+                Span::raw(gutter.clone()),
+                Span::styled("┃ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{}: ", quote.author),
+                    Style::default().fg(Color::LightGreen),
+                ),
+                Span::styled(truncate(&quote.preview, 70), Style::default().fg(DIM)),
+            ]));
+        }
         for line in body {
             let mut spans = vec![Span::raw(gutter.clone())];
             spans.extend(line.spans);
@@ -557,16 +570,19 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ));
     }
-    // The conversation reads downward, so anchor to the bottom: the selected
-    // message's last line sits on the pane's last row, which for the newest
-    // message means the freshest text rests just above the composer.
-    let total = lines.len();
-    let pane_h = right[0].height.saturating_sub(3) as usize; // borders + date header
-    let sel_end = msg_starts
+    // Scrolling has to be measured in *wrapped* rows: `Paragraph::scroll` counts
+    // what it draws, and a long message occupies several rows. Measuring in
+    // logical lines scrolled too little and hid the newest messages.
+    let inner_w = right[0].width.saturating_sub(2).max(1) as usize;
+    let pane_h = right[0].height.saturating_sub(3).max(1) as usize; // borders + date header
+    let (wrapped_starts, total_wrapped) = wrapped_offsets(&lines, &msg_starts, inner_w);
+    let sel_end = wrapped_starts
         .get(app.teams.msg_sel + 1)
         .copied()
-        .unwrap_or(total);
-    let scroll = sel_end.saturating_sub(pane_h).min(total.saturating_sub(1)) as u16;
+        .unwrap_or(total_wrapped);
+    let scroll = sel_end
+        .saturating_sub(pane_h)
+        .min(total_wrapped.saturating_sub(pane_h)) as u16;
     // Flag messages that arrived while the user was reading further back.
     let title = if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
@@ -587,7 +603,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
-    if let Some(label) = sticky_day_label(app, &msg_starts, scroll) {
+    if let Some(label) = sticky_day_label(app, &wrapped_starts, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
     f.render_widget(
@@ -1035,6 +1051,35 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Wrapped-row offset of each message start, plus the total wrapped height.
+/// Keeps scrolling and the pinned header measuring the same thing the terminal
+/// actually draws.
+fn wrapped_offsets(lines: &[Line], starts: &[usize], width: usize) -> (Vec<usize>, usize) {
+    let mut offsets = Vec::with_capacity(starts.len());
+    let mut acc = 0usize;
+    let mut idx = 0usize;
+    for &start in starts {
+        while idx < start && idx < lines.len() {
+            acc += wrapped_rows(&lines[idx], width);
+            idx += 1;
+        }
+        offsets.push(acc);
+    }
+    while idx < lines.len() {
+        acc += wrapped_rows(&lines[idx], width);
+        idx += 1;
+    }
+    (offsets, acc)
+}
+
+fn wrapped_rows(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    chars.div_ceil(width).max(1)
 }
 
 /// Rows the given lines occupy once wrapped to `width`. Approximates ratatui's

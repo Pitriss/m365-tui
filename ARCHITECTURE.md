@@ -133,6 +133,11 @@ refresh appends to the end, the newest message is the last index, and the pane
 scrolls so the selected message's last line rests on the bottom row — which for
 the newest message puts the freshest text directly above the composer.
 
+That scroll is measured in **wrapped** rows, not logical lines: `Paragraph`
+scrolls by what it draws, and a long message occupies several rows, so measuring
+in logical lines scrolls too little and hides the newest messages behind the
+bottom edge.
+
 If the selection is already on the newest message the view follows new arrivals;
 otherwise the position is held and they are counted into `unseen`, surfaced in
 the pane title as `▼ n new`. Without that a new message would appear off-screen
@@ -140,11 +145,18 @@ below wherever the user was reading.
 
 ### Replies
 
-Channels have a real replies collection
-(`/messages/{id}/replies`), so a reply there threads. Chats have no such
-endpoint — Teams itself models a chat reply as a `<blockquote>` embedded in the
-message body — so replying in a chat posts HTML quoting the original, which
-Teams renders as a reply. Incoming quotes are marked `┃` by the HTML renderer.
+Channels have a real replies collection (`/messages/{id}/replies`), so a reply
+there threads.
+
+Chats have no such endpoint, and the quote is **not in the HTML**. Teams models a
+chat reply as a `messageReference` attachment whose `content` is a JSON *string*
+holding `messageId`, `messagePreview` and `messageSender`; the body carries only
+an empty `<attachment id="…">` tag. Replies are therefore both read and written
+through that attachment — rendering the body alone shows the reply text with no
+sign of what it answers, which is what a first attempt at this did.
+
+Sending falls back to a plain `<blockquote>` if a tenant rejects the reference
+attachment, so a reply is never lost to a failed post.
 
 ## Rendering message bodies
 

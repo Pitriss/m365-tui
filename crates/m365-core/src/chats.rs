@@ -59,28 +59,70 @@ pub async fn send_message(graph: &GraphClient, chat_id: &str, text: &str) -> Res
 
 /// Reply to a message in a chat.
 ///
-/// Chats have no reply endpoint — Teams itself models a reply as a quote
-/// embedded in the message body — so this posts HTML containing a blockquote of
-/// the original followed by the new text.
+/// Chats have no replies endpoint. Teams represents a reply as a
+/// `messageReference` attachment plus an empty `<attachment>` tag in the body —
+/// exactly what `ChatMessage::quoted` reads back — so that shape is what gets
+/// posted here.
 pub async fn send_reply(
     graph: &GraphClient,
     chat_id: &str,
-    quoted_author: &str,
-    quoted_text: &str,
+    original: &ChatMessage,
     text: &str,
 ) -> Result<ChatMessage> {
-    // Keep the quote short; the full message is a scroll away.
-    let quoted: String = quoted_text.chars().take(280).collect();
-    let body = format!(
-        "<blockquote><b>{}</b><br>{}</blockquote><p>{}</p>",
-        html_escape(quoted_author),
-        html_escape(&quoted),
-        html_escape(text),
-    );
-    let payload = json!({ "body": { "contentType": "html", "content": body } });
-    graph
+    let message_id = &original.id;
+    let preview: String = original.text_preview(250);
+    let sender = json!({
+        "user": {
+            "userIdentityType": "aadUser",
+            "id": original.author_id().unwrap_or_default(),
+            "displayName": original.author(),
+        }
+    });
+    let reference = json!({
+        "messageId": message_id,
+        "messagePreview": preview,
+        "messageSender": sender,
+    })
+    .to_string();
+
+    let payload = json!({
+        "body": {
+            "contentType": "html",
+            "content": format!(
+                "<attachment id=\"{message_id}\"></attachment><p>{}</p>",
+                html_escape(text)
+            ),
+        },
+        "attachments": [{
+            "id": message_id,
+            "contentType": "messageReference",
+            "content": reference,
+        }],
+    });
+
+    match graph
         .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
         .await
+    {
+        Ok(m) => Ok(m),
+        // If the tenant rejects the reference attachment, still deliver the
+        // message rather than losing what the user typed.
+        Err(e) => {
+            tracing::warn!("native reply rejected, sending as a quote instead: {e:#}");
+            let quoted = format!(
+                "<blockquote><b>{}</b><br>{}</blockquote><p>{}</p>",
+                html_escape(&original.author()),
+                html_escape(&preview),
+                html_escape(text),
+            );
+            graph
+                .post_json(
+                    &format!("me/chats/{chat_id}/messages"),
+                    &json!({ "body": { "contentType": "html", "content": quoted } }),
+                )
+                .await
+        }
+    }
 }
 
 /// React to a chat message with an emoji (unicode, e.g. "👍").

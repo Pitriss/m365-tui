@@ -329,6 +329,50 @@ impl ChatMessage {
             .unwrap_or_default()
     }
 
+    /// A short plain-text excerpt of the body, for quoting.
+    pub fn text_preview(&self, max: usize) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in self.text().chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        let flat: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() <= max {
+            flat
+        } else {
+            flat.chars().take(max).collect::<String>() + "…"
+        }
+    }
+
+    /// The message this one replies to, if any.
+    ///
+    /// Teams models a chat reply as a `messageReference` attachment — the body
+    /// only carries an empty `<attachment>` tag — so the quote has to be read
+    /// from there rather than from the HTML.
+    pub fn quoted(&self) -> Option<QuotedMessage> {
+        let att = self.attachments.iter().find(|a| {
+            a.content_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("messageReference"))
+        })?;
+        let reference: MessageReference = serde_json::from_str(att.content.as_deref()?).ok()?;
+        Some(QuotedMessage {
+            message_id: reference.message_id.unwrap_or_default(),
+            author: reference
+                .message_sender
+                .as_ref()
+                .and_then(|s| s.user.as_ref())
+                .and_then(|u| u.display_name.clone())
+                .unwrap_or_else(|| "(unknown)".into()),
+            preview: reference.message_preview.unwrap_or_default(),
+        })
+    }
+
     /// A short display of reactions, e.g. `👍 ❤️`. Maps the classic Teams
     /// reaction names to emoji; unicode reactions pass through as-is.
     pub fn reactions_summary(&self) -> Option<String> {
@@ -436,16 +480,41 @@ impl Attachment {
     }
 }
 
-/// A file shared in a Teams message (points at SharePoint/OneDrive).
+/// Something attached to a Teams message: a shared file, or — for a reply —
+/// a `messageReference` pointing at the message being answered.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageAttachment {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub content_url: Option<String>,
     #[serde(default)]
     pub content_type: Option<String>,
+    /// For `messageReference`, a JSON *string* describing the quoted message.
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+/// The message a reply is answering.
+#[derive(Debug, Clone)]
+pub struct QuotedMessage {
+    pub message_id: String,
+    pub author: String,
+    pub preview: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageReference {
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    message_preview: Option<String>,
+    #[serde(default)]
+    message_sender: Option<IdentitySet>,
 }
 
 /// Outbound draft used by the compose views for both mail and Teams messages.
@@ -454,4 +523,56 @@ pub struct Draft {
     pub to: Vec<String>,
     pub subject: String,
     pub body: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape Graph returns for a reply in a chat.
+    fn reply_message() -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": "1785859178276",
+            "createdDateTime": "2026-08-04T15:59:38.276Z",
+            "body": {
+                "contentType": "html",
+                "content": "<attachment id=\"1785858892876\"></attachment><p>Confirma por favor</p>"
+            },
+            "attachments": [{
+                "id": "1785858892876",
+                "contentType": "messageReference",
+                "content": "{\"messageId\":\"1785858892876\",\"messagePreview\":\"Nao implicam restart\",\"messageSender\":{\"user\":{\"userIdentityType\":\"aadUser\",\"id\":\"abc\",\"displayName\":\"Ricardo Joaquim\"}}}"
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reads_the_quoted_message_from_a_reference_attachment() {
+        let q = reply_message().quoted().expect("reply should carry a quote");
+        assert_eq!(q.author, "Ricardo Joaquim");
+        assert_eq!(q.preview, "Nao implicam restart");
+        assert_eq!(q.message_id, "1785858892876");
+    }
+
+    #[test]
+    fn an_ordinary_message_has_no_quote() {
+        let plain: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "body": { "contentType": "text", "content": "hello" }
+        }))
+        .unwrap();
+        assert!(plain.quoted().is_none());
+    }
+
+    #[test]
+    fn preview_flattens_html_and_bounds_length() {
+        let m: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "body": { "contentType": "html", "content": "<p>one   two</p>\n<p>three</p>" }
+        }))
+        .unwrap();
+        assert_eq!(m.text_preview(100), "one two three");
+        assert_eq!(m.text_preview(5).chars().count(), 6); // 5 + the ellipsis
+    }
 }

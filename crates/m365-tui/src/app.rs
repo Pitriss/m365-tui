@@ -1842,16 +1842,11 @@ impl App {
                     return;
                 };
                 let author = original.author();
-                let quoted = self
-                    .teams
-                    .messages_rendered
-                    .get(idx)
-                    .map(content::plain)
-                    .unwrap_or_default();
+                let original = original.clone();
                 let s = self.session.clone();
                 self.status = format!("replying to {author}…");
                 self.spawn(async move {
-                    chats::send_reply(&s.graph, &chat_id, &author, &quoted, &text).await?;
+                    chats::send_reply(&s.graph, &chat_id, &original, &text).await?;
                     Ok(AppMessage::Done("reply sent".into()))
                 });
             }
