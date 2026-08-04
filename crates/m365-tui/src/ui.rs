@@ -188,7 +188,7 @@ fn context_hints(app: &App) -> &'static str {
         },
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · l open · t chats/channels",
-            TeamsFocus::Messages => "j/k select · h back · e react · i write",
+            TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
     }
@@ -539,9 +539,14 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     // pinned date header, and a couple of message rows on small terminals.
     let composer_width = cols[1].width.saturating_sub(2).max(1) as usize;
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
+    // One extra row while a reply is being composed, for the quoted banner.
+    let reply_row = u16::from(app.teams.replying_to.is_some());
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(composer_rows + 2)])
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(composer_rows + reply_row + 2),
+        ])
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
@@ -552,16 +557,19 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ));
     }
-    // Scroll so the selected message sits near the top of the pane.
-    let total = lines.len() as u16;
-    let scroll = msg_starts
-        .get(app.teams.msg_sel)
-        .map(|&s| s as u16)
-        .unwrap_or(0)
-        .min(total.saturating_sub(1));
+    // The conversation reads downward, so anchor to the bottom: the selected
+    // message's last line sits on the pane's last row, which for the newest
+    // message means the freshest text rests just above the composer.
+    let total = lines.len();
+    let pane_h = right[0].height.saturating_sub(3) as usize; // borders + date header
+    let sel_end = msg_starts
+        .get(app.teams.msg_sel + 1)
+        .copied()
+        .unwrap_or(total);
+    let scroll = sel_end.saturating_sub(pane_h).min(total.saturating_sub(1)) as u16;
     // Flag messages that arrived while the user was reading further back.
     let title = if app.teams.unseen > 0 {
-        format!("Conversation — ▲ {} new (g to jump)", app.teams.unseen)
+        format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
     } else if focused {
         "Conversation (j/k select · e react · z copy-mode)".to_string()
     } else {
@@ -594,8 +602,39 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         "Message"
     };
     let composer_block = panel_block(title, composing);
-    let composer_inner = composer_block.inner(right[1]);
+    let mut composer_inner = composer_block.inner(right[1]);
     f.render_widget(composer_block, right[1]);
+
+    // Show what's being replied to, so the quote isn't a surprise on send.
+    if let Some(idx) = app.teams.replying_to {
+        let banner = Rect { height: 1, ..composer_inner };
+        composer_inner = Rect {
+            y: composer_inner.y + 1,
+            height: composer_inner.height.saturating_sub(1),
+            ..composer_inner
+        };
+        let who = app
+            .teams
+            .messages
+            .get(idx)
+            .map(|m| m.author())
+            .unwrap_or_default();
+        let excerpt = app
+            .teams
+            .messages_rendered
+            .get(idx)
+            .map(|t| truncate(&crate::content::plain(t).replace('\n', " "), 60))
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("┃ replying to ", Style::default().fg(ACCENT)),
+                Span::styled(who, Style::default().fg(Color::LightGreen)),
+                Span::styled(format!(": {excerpt}"), Style::default().fg(DIM)),
+            ])),
+            banner,
+        );
+    }
+
     app.text_width_hint
         .set(composer_inner.width.max(1) as usize);
     if app.teams.composer.is_empty() && !composing {
@@ -641,7 +680,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           / search · g calendar · in the reading pane j/k scroll\n\
  \n\
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
-          i type message · Enter send\n\
+          i type message · r reply to selected · Enter send\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\

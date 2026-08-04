@@ -38,6 +38,24 @@ pub async fn list_messages_more(
     graph.get_page_with_next(next_link).await
 }
 
+/// Reply to a channel message. Channels have a real replies collection, unlike
+/// chats, so this threads properly.
+pub async fn send_reply(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<ChatMessage> {
+    let payload = json!({ "body": { "contentType": "text", "content": text } });
+    graph
+        .post_json(
+            &format!("teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"),
+            &payload,
+        )
+        .await
+}
+
 /// React to a channel message with an emoji (unicode, e.g. "👍").
 pub async fn set_reaction(
     graph: &GraphClient,

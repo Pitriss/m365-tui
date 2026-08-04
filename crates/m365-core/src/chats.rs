@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::{DeltaPage, GraphClient};
+use crate::util::html_escape;
 use crate::models::{Chat, ChatMessage};
 
 /// List the signed-in user's chats, most-recently-updated first, with member
@@ -51,6 +52,32 @@ pub async fn delta_messages(
 /// Send a plain-text message to a chat.
 pub async fn send_message(graph: &GraphClient, chat_id: &str, text: &str) -> Result<ChatMessage> {
     let payload = json!({ "body": { "contentType": "text", "content": text } });
+    graph
+        .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
+        .await
+}
+
+/// Reply to a message in a chat.
+///
+/// Chats have no reply endpoint — Teams itself models a reply as a quote
+/// embedded in the message body — so this posts HTML containing a blockquote of
+/// the original followed by the new text.
+pub async fn send_reply(
+    graph: &GraphClient,
+    chat_id: &str,
+    quoted_author: &str,
+    quoted_text: &str,
+    text: &str,
+) -> Result<ChatMessage> {
+    // Keep the quote short; the full message is a scroll away.
+    let quoted: String = quoted_text.chars().take(280).collect();
+    let body = format!(
+        "<blockquote><b>{}</b><br>{}</blockquote><p>{}</p>",
+        html_escape(quoted_author),
+        html_escape(&quoted),
+        html_escape(text),
+    );
+    let payload = json!({ "body": { "contentType": "html", "content": body } });
     graph
         .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
         .await

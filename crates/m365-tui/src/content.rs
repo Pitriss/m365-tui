@@ -114,7 +114,7 @@ impl Renderer {
     fn start_block_line(&mut self) {
         let mut prefix = String::new();
         for _ in 0..self.blockquote {
-            prefix.push_str("▏ ");
+            prefix.push_str("┃ ");
         }
         let depth = self.list_stack.len().saturating_sub(1);
         for _ in 0..depth {
@@ -493,6 +493,28 @@ mod tests {
         assert_eq!(out.links.len(), 2, "duplicate targets share a number");
         assert_eq!(out.links[0], "https://example.com/login");
         assert_eq!(out.links[1], "https://other.example/x");
+    }
+
+    #[test]
+    fn renders_a_teams_reply_quote() {
+        // The shape Teams uses for a reply in a chat: the original is embedded
+        // as a blockquote, followed by the new text.
+        let html = r#"<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="1754321652000">
+              <strong itemprop="mri">Ricardo Joaquim</strong>
+              <span itemprop="time"></span>
+              <p itemprop="preview">Nao implicam restart do servico</p>
+            </blockquote><p>Confirma por favor</p>"#;
+        let out = render_html(html);
+        let text = flat(&out.text);
+        // Both the quoted original and the reply itself must survive.
+        assert!(text.contains("Ricardo Joaquim"), "quoted author missing: {text}");
+        assert!(
+            text.contains("Nao implicam restart do servico"),
+            "quoted text missing: {text}"
+        );
+        assert!(text.contains("Confirma por favor"), "reply missing: {text}");
+        // The quote is visually marked off from the reply.
+        assert!(text.contains('┃'), "quote marker missing: {text}");
     }
 
     #[test]

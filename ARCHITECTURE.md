@@ -124,12 +124,27 @@ when each line was sent, and body lines are indented by exactly that gutter to
 keep the text in a single column. The marker staying in the margin means every
 message remains individually selectable for reactions, grouped or not.
 
-Teams conversations add the usual chat-client behaviour on top: messages are
-newest-first, so an arrival lands *above* the reader. If the selection is already
-on the newest message the view follows it; otherwise the position is held and the
-new messages are counted into `unseen`, surfaced in the pane title. Without this
-a new message would silently appear off-screen above wherever the user was
-reading.
+### Conversation order
+
+Graph answers newest-first, but a conversation is read oldest-at-the-top, so the
+page is reversed on arrival and the list is stored chronologically. That shapes
+everything around it: an older page fetched by scrolling up is *prepended*, a
+refresh appends to the end, the newest message is the last index, and the pane
+scrolls so the selected message's last line rests on the bottom row — which for
+the newest message puts the freshest text directly above the composer.
+
+If the selection is already on the newest message the view follows new arrivals;
+otherwise the position is held and they are counted into `unseen`, surfaced in
+the pane title as `▼ n new`. Without that a new message would appear off-screen
+below wherever the user was reading.
+
+### Replies
+
+Channels have a real replies collection
+(`/messages/{id}/replies`), so a reply there threads. Chats have no such
+endpoint — Teams itself models a chat reply as a `<blockquote>` embedded in the
+message body — so replying in a chat posts HTML quoting the original, which
+Teams renders as a reply. Incoming quotes are marked `┃` by the HTML renderer.
 
 ## Rendering message bodies
 

@@ -347,6 +347,8 @@ pub struct TeamsState {
     pub loading_more: bool,
     /// Messages that arrived while the user was reading further back.
     pub unseen: usize,
+    /// Index of the message being replied to, while composing a reply.
+    pub replying_to: Option<usize>,
     pub open_chat_id: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: TextInput,
@@ -370,6 +372,7 @@ impl Default for TeamsState {
             messages_next: None,
             loading_more: false,
             unseen: 0,
+            replying_to: None,
             open_chat_id: None,
             open_channel: None,
             composer: TextInput::new(),
@@ -1062,23 +1065,31 @@ impl App {
         self.teams.loading_more = false;
         let mut follow_newest = false;
         // Remember what was selected so a refresh doesn't move the cursor to a
-        // different message when new ones arrive at the top.
+        // different message when others arrive.
         let selected_id = self
             .teams
             .messages
             .get(self.teams.msg_sel)
             .map(|m| m.id.clone());
 
+        // Graph answers newest-first; the conversation reads oldest-first, so
+        // the newest message sits at the bottom next to the composer.
+        let mut page = messages;
+        page.reverse();
+
         match mode {
             ListUpdate::Replace => {
-                self.teams.messages = messages;
+                self.teams.messages = page;
                 self.teams.messages_next = next;
             }
             ListUpdate::Append => {
-                self.teams.messages.extend(messages);
+                // An older page belongs *before* everything already loaded.
+                let existing = std::mem::take(&mut self.teams.messages);
+                self.teams.messages = page;
+                self.teams.messages.extend(existing);
                 self.teams.messages_next = next;
                 self.status = if self.teams.messages_next.is_some() {
-                    format!("{} messages loaded (more available)", self.teams.messages.len())
+                    format!("{} messages loaded (more above)", self.teams.messages.len())
                 } else {
                     format!(
                         "{} messages loaded (start of conversation)",
@@ -1090,19 +1101,24 @@ impl App {
                 // Chat convention: if the user is sitting on the newest message,
                 // follow new arrivals; if they've scrolled back to read history,
                 // hold their place and just count what came in.
-                follow_newest = self.teams.msg_sel == 0;
+                follow_newest = self.teams.msg_sel + 1 >= self.teams.messages.len();
                 let known: std::collections::HashSet<&str> =
                     self.teams.messages.iter().map(|m| m.id.as_str()).collect();
-                let arrived = messages.iter().filter(|m| !known.contains(m.id.as_str())).count();
+                let arrived = page.iter().filter(|m| !known.contains(m.id.as_str())).count();
                 if !follow_newest {
                     self.teams.unseen += arrived;
                 }
 
-                // Keep the older pages already scrolled into view; the fetched
-                // page only supersedes the newest window. `messages_next` is
-                // deliberately left alone — it points past everything loaded.
-                let existing = std::mem::take(&mut self.teams.messages);
-                self.teams.messages = merge_newest_first(messages, existing, |m| m.id.clone());
+                // The fetched page supersedes the newest window; everything
+                // older that the user has scrolled back through is kept.
+                let fresh: std::collections::HashSet<String> =
+                    page.iter().map(|m| m.id.clone()).collect();
+                let mut kept: Vec<ChatMessage> = std::mem::take(&mut self.teams.messages)
+                    .into_iter()
+                    .filter(|m| !fresh.contains(&m.id))
+                    .collect();
+                kept.extend(page);
+                self.teams.messages = kept;
             }
         }
 
@@ -1137,16 +1153,19 @@ impl App {
             .collect();
         self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
 
-        // Restore the selection: stick to the newest when following, otherwise
-        // keep the same message the user was reading.
-        self.teams.msg_sel = if follow_newest {
-            self.teams.unseen = 0;
-            0
-        } else {
-            selected_id
+        let last = self.teams.messages.len().saturating_sub(1);
+        self.teams.msg_sel = match mode {
+            // Opening a conversation lands on the newest message, at the bottom.
+            ListUpdate::Replace => last,
+            _ if follow_newest => {
+                self.teams.unseen = 0;
+                last
+            }
+            // Otherwise stay on the same message, wherever it moved to.
+            _ => selected_id
                 .and_then(|id| self.teams.messages.iter().position(|m| m.id == id))
                 .unwrap_or(self.teams.msg_sel)
-                .min(self.teams.messages.len().saturating_sub(1))
+                .min(last),
         };
     }
 
@@ -1608,7 +1627,10 @@ impl App {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let input = &mut self.teams.composer;
             match key.code {
-                KeyCode::Esc => self.teams.focus = TeamsFocus::Messages,
+                KeyCode::Esc => {
+                    self.teams.replying_to = None;
+                    self.teams.focus = TeamsFocus::Messages;
+                }
                 KeyCode::Tab => self.teams.focus = TeamsFocus::List,
                 // Enter sends; Shift/Alt+Enter inserts a newline instead.
                 KeyCode::Enter
@@ -1676,15 +1698,25 @@ impl App {
                 };
             }
             KeyCode::Char('i') => self.teams.focus = TeamsFocus::Composer,
+            // Reply to the selected message: same composer, quoted on send.
+            KeyCode::Char('r')
+                if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
+            {
+                self.teams.replying_to = Some(self.teams.msg_sel);
+                self.teams.focus = TeamsFocus::Composer;
+            }
             KeyCode::Char('e')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
             {
                 self.overlay = Some(Overlay::React);
             }
             // Jump back to the newest message and resume following it.
-            KeyCode::Home | KeyCode::Char('g') if self.teams.focus == TeamsFocus::Messages => {
-                self.teams.msg_sel = 0;
+            KeyCode::End | KeyCode::Char('g') if self.teams.focus == TeamsFocus::Messages => {
+                self.teams.msg_sel = self.teams.messages.len().saturating_sub(1);
                 self.teams.unseen = 0;
+            }
+            KeyCode::Home if self.teams.focus == TeamsFocus::Messages => {
+                self.teams.msg_sel = 0;
             }
             KeyCode::Up | KeyCode::Char('k') => self.teams_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.teams_move(1),
@@ -1705,21 +1737,22 @@ impl App {
             loop {
                 i += delta.signum();
                 if i < 0 {
-                    return; // at the newest message
-                }
-                if i >= n {
-                    // Past the oldest loaded message — pull the next page.
+                    // Past the oldest loaded message — pull the previous page.
                     self.load_more_teams_messages();
                     return;
                 }
+                if i >= n {
+                    return; // already on the newest
+                }
                 if self.teams.messages[i as usize].deleted_date_time.is_none() {
                     self.teams.msg_sel = i as usize;
-                    if self.teams.msg_sel == 0 {
-                        self.teams.unseen = 0; // caught up
+                    if self.teams.msg_sel + 1 >= self.teams.messages.len() {
+                        self.teams.unseen = 0;
+                    self.teams.replying_to = None; // caught up with the newest
                     }
-                    // Prefetch when landing on the last one, so the next press
-                    // doesn't stall at the bottom.
-                    if delta > 0 && self.teams.msg_sel + 1 >= self.teams.messages.len() {
+                    // Prefetch when landing on the oldest, so scrolling further
+                    // back doesn't stall.
+                    if delta < 0 && self.teams.msg_sel == 0 {
                         self.load_more_teams_messages();
                     }
                     return;
@@ -1757,6 +1790,7 @@ impl App {
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
                     self.teams.unseen = 0;
+                    self.teams.replying_to = None;
                     self.load_chat_messages(id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -1781,6 +1815,7 @@ impl App {
                     self.teams.messages_next = None;
                     self.teams.loading_more = false;
                     self.teams.unseen = 0;
+                    self.teams.replying_to = None;
                     self.load_channel_messages(team_id, ch_id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -1794,13 +1829,55 @@ impl App {
             return;
         }
         self.teams.composer.clear();
-        match self.teams.mode {
-            TeamsMode::Chats => {
+        let replying_to = self.teams.replying_to.take();
+
+        match (replying_to, self.teams.mode) {
+            // Replying in a chat: quote the original in the body, which is how
+            // Teams itself represents a chat reply.
+            (Some(idx), TeamsMode::Chats) => {
+                let (Some(chat_id), Some(original)) = (
+                    self.teams.open_chat_id.clone(),
+                    self.teams.messages.get(idx),
+                ) else {
+                    return;
+                };
+                let author = original.author();
+                let quoted = self
+                    .teams
+                    .messages_rendered
+                    .get(idx)
+                    .map(content::plain)
+                    .unwrap_or_default();
+                let s = self.session.clone();
+                self.status = format!("replying to {author}…");
+                self.spawn(async move {
+                    chats::send_reply(&s.graph, &chat_id, &author, &quoted, &text).await?;
+                    Ok(AppMessage::Done("reply sent".into()))
+                });
+            }
+            // Channels have a real replies collection, so the reply threads.
+            (Some(idx), TeamsMode::Channels) => {
+                let (Some((team_id, channel_id)), Some(original)) = (
+                    self.teams.open_channel.clone(),
+                    self.teams.messages.get(idx),
+                ) else {
+                    return;
+                };
+                let message_id = original.id.clone();
+                let s = self.session.clone();
+                self.status = "replying…".into();
+                self.spawn(async move {
+                    channels::send_reply(&s.graph, &team_id, &channel_id, &message_id, &text)
+                        .await?;
+                    Ok(AppMessage::Done("reply sent".into()))
+                });
+            }
+            (None, TeamsMode::Chats) => {
                 if let Some(id) = self.teams.open_chat_id.clone() {
                     self.send_chat_message(id, text);
                 }
             }
-            TeamsMode::Channels => {
+            (None, TeamsMode::Channels) => {
                 if let Some((t, c)) = self.teams.open_channel.clone() {
                     self.send_channel_message(t, c, text);
                 }

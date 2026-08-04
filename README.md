@@ -190,7 +190,7 @@ Press `?` in the app for this list at any time.
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `i` write · `Enter` send |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -238,9 +238,15 @@ Mail is announced even while you're reading another folder. Uses `notify-send`
 if installed, otherwise the terminal bell. Turn it off with `M365_NOTIFY=0` in
 `.env`.
 
-**Conversations read like a chat.** Consecutive messages from the same person
-are grouped under one name, each with its own timestamp down the left, and a
-`Today`/`Yesterday` header pinned at the top of the pane as you scroll.
+**Replying.** Select a message and press `r`: the composer opens with a banner
+showing what you're replying to, and `Enter` sends it as a quoted reply. In a
+channel it threads properly; in a chat it quotes the original the same way Teams
+does. Incoming replies show the quoted text marked with `┃`.
+
+**Conversations read like a chat.** Oldest at the top, newest at the bottom just
+above the composer. Consecutive messages from the same person are grouped under
+one name, each with its own timestamp down the left, and a `Today`/`Yesterday`
+header stays pinned at the top of the pane as you scroll.
 
 **Open chats update themselves.** New messages appear in the conversation you're
 reading — within a second with push enabled, otherwise on the 20-second refresh.
