@@ -64,11 +64,10 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
         Screen::Outlook => email_lines(app).unwrap_or_default(),
         Screen::Teams => conversation_lines(app, false).0,
     };
-    let total = lines.len() as u16;
+    let (wrapped, _) = crate::wrap::wrap_all(&lines, rows[1].width as usize);
+    let max = (wrapped.len() as u16).saturating_sub(rows[1].height);
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.copy_scroll.min(total.saturating_sub(1)), 0)),
+        Paragraph::new(wrapped).scroll((app.copy_scroll.min(max), 0)),
         rows[1],
     );
 }
@@ -288,17 +287,12 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
 
     match email_lines(app) {
         Some(lines) => {
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width as usize);
             // Tell the key handler how far it can usefully scroll.
-            let wrapped = wrapped_height(&lines, inner.width as usize);
             app.reading_max_scroll
-                .set(wrapped.saturating_sub(inner.height));
+                .set((rows.len() as u16).saturating_sub(inner.height));
             let scroll = app.outlook.reading_scroll.min(app.reading_max_scroll.get());
-            f.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0)),
-                inner,
-            );
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
         }
         None => {
             app.reading_max_scroll.set(0);
@@ -582,19 +576,24 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ));
     }
-    // Scrolling has to be measured in *wrapped* rows: `Paragraph::scroll` counts
-    // what it draws, and a long message occupies several rows. Measuring in
-    // logical lines scrolled too little and hid the newest messages.
+    // Wrap here rather than letting `Paragraph` do it: scrolling needs the exact
+    // row count, and `Paragraph` won't report one. Estimating it undercounts —
+    // words don't fill a row — which left the newest messages below the edge.
     let inner_w = right[0].width.saturating_sub(2).max(1) as usize;
     let pane_h = right[0].height.saturating_sub(3).max(1) as usize; // borders + date header
-    let (wrapped_starts, total_wrapped) = wrapped_offsets(&lines, &msg_starts, inner_w);
-    let sel_end = wrapped_starts
+    let (rows, row_of_line) = crate::wrap::wrap_all(&lines, inner_w);
+    // Where each message begins, in rendered rows.
+    let msg_rows: Vec<usize> = msg_starts
+        .iter()
+        .map(|&l| row_of_line.get(l).copied().unwrap_or(rows.len()))
+        .collect();
+    let sel_end = msg_rows
         .get(app.teams.msg_sel + 1)
         .copied()
-        .unwrap_or(total_wrapped);
+        .unwrap_or(rows.len());
     let scroll = sel_end
         .saturating_sub(pane_h)
-        .min(total_wrapped.saturating_sub(pane_h)) as u16;
+        .min(rows.len().saturating_sub(pane_h)) as u16;
     // Flag messages that arrived while the user was reading further back.
     let title = if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
@@ -615,13 +614,11 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
-    if let Some(label) = sticky_day_label(app, &wrapped_starts, scroll) {
+    if let Some(label) = sticky_day_label(app, &msg_rows, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
-        pane[1],
-    );
+    // Already wrapped, so no `Wrap` here — the rows are exactly what's drawn.
+    f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), pane[1]);
 
     let composing = app.teams.focus == TeamsFocus::Composer;
     let title = if composing {
@@ -1063,51 +1060,6 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
-}
-
-/// Wrapped-row offset of each message start, plus the total wrapped height.
-/// Keeps scrolling and the pinned header measuring the same thing the terminal
-/// actually draws.
-fn wrapped_offsets(lines: &[Line], starts: &[usize], width: usize) -> (Vec<usize>, usize) {
-    let mut offsets = Vec::with_capacity(starts.len());
-    let mut acc = 0usize;
-    let mut idx = 0usize;
-    for &start in starts {
-        while idx < start && idx < lines.len() {
-            acc += wrapped_rows(&lines[idx], width);
-            idx += 1;
-        }
-        offsets.push(acc);
-    }
-    while idx < lines.len() {
-        acc += wrapped_rows(&lines[idx], width);
-        idx += 1;
-    }
-    (offsets, acc)
-}
-
-fn wrapped_rows(line: &Line, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-    chars.div_ceil(width).max(1)
-}
-
-/// Rows the given lines occupy once wrapped to `width`. Approximates ratatui's
-/// word wrap closely enough to bound scrolling.
-fn wrapped_height(lines: &[Line], width: usize) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
-    }
-    let total: usize = lines
-        .iter()
-        .map(|l| {
-            let chars: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-            chars.div_ceil(width).max(1)
-        })
-        .sum();
-    total.min(u16::MAX as usize) as u16
 }
 
 /// The host part of a URL, for a readable link label.

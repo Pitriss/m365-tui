@@ -14,6 +14,7 @@ mod navigation;
 mod notify;
 mod opener;
 mod ui;
+mod wrap;
 
 use std::io::stdout;
 use std::time::Duration;

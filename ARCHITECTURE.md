@@ -39,7 +39,8 @@ The webhook shares the core only for its event types.
 | `ui.rs` | Rendering — a pure function of `&App` |
 | `content.rs` | HTML → styled terminal text, link extraction |
 | `editor.rs` | Text buffer with cursor, wrapping, and editing operations |
-| `clipboard.rs` `opener.rs` `files.rs` | System integration |
+| `wrap.rs` | Exact word wrapping, so scrolling can trust the row count |
+| `clipboard.rs` `opener.rs` `files.rs` `notify.rs` | System integration |
 | `navigation.rs` | Cross-links between the Outlook and Teams sides |
 
 ## Authentication
@@ -137,10 +138,18 @@ refresh appends to the end, the newest message is the last index, and the pane
 scrolls so the selected message's last line rests on the bottom row — which for
 the newest message puts the freshest text directly above the composer.
 
-That scroll is measured in **wrapped** rows, not logical lines: `Paragraph`
-scrolls by what it draws, and a long message occupies several rows, so measuring
-in logical lines scrolls too little and hides the newest messages behind the
-bottom edge.
+Scrolling needs the row count, and that is where two earlier attempts went
+wrong. `Paragraph::scroll` counts the rows it *draws*, so scrolling by logical
+lines under-scrolls whenever a message wraps; estimating the wrapped height as
+characters ÷ width under-counts too, because words don't fill a row exactly.
+Either way the newest messages stay hidden below the bottom edge.
+
+`wrap.rs` removes the guesswork: it word-wraps the styled lines itself, so the
+row count is exact by construction. The panes render the wrapped rows *without*
+`Wrap`, and scroll offsets are plain indices into them. It also hangs
+continuation rows under the original indent, so wrapped message text keeps its
+column instead of running back to the left margin. The reading pane and copy mode
+use the same function.
 
 If the selection is already on the newest message the view follows new arrivals;
 otherwise the position is held and they are counted into `unseen`, surfaced in
