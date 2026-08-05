@@ -13,6 +13,7 @@ crates/
                subscriptions, and the change-event bus
   m365-tui/    binary `m365` — the ratatui application
   webhook/     binary `m365-webhook` — axum change-notification receiver
+deploy/        the real-time stack, shipped as its own release asset
 ```
 
 `m365-core` knows nothing about the terminal, and the TUI holds no HTTP logic.
@@ -250,6 +251,47 @@ avoids that entirely, and keeps the internet-facing service credential-free.
 Teams chat subscriptions expire after about an hour, so the TUI renews every 45
 minutes and supplies a `lifecycleNotificationUrl` for reauthorization events.
 
+### Packaging the stack
+
+Push is optional, but it used to be the one part of setup that demanded a source
+checkout: the root `docker-compose.yml` builds the webhook image from the
+workspace. `deploy/` exists so a release user never needs that.
+
+| | |
+|---|---|
+| `deploy/Dockerfile` | Copies the prebuilt `m365-webhook` into Alpine. Builds in about a second — no Rust toolchain, no source tree, no registry |
+| `deploy/docker-compose.yml` | The three services, with the two tunnel flavours as Compose **profiles** |
+| `deploy/up.sh` | Preflight, secret generation, tunnel choice, and verification |
+
+Shipping the binary rather than an image keeps the bundle self-contained: no
+`docker pull` from a registry we'd have to publish to and keep public, and the
+tarball is auditable — you can see exactly what runs.
+
+That binary must be **statically** linked, or Alpine reports only
+`exec /usr/local/bin/m365-webhook: no such file or directory` — the dynamic
+loader's unhelpful way of saying the interpreter is missing. The release workflow
+therefore asserts `file` doesn't say "dynamically linked" before packaging.
+
+Two tunnel flavours, because requiring a domain to try push out is a poor trade:
+
+| Profile | Hostname | Needs |
+|---|---|---|
+| `named` | permanent, yours | a Cloudflare account, a domain, a tunnel token |
+| `quick` | random `*.trycloudflare.com`, new on every restart | nothing |
+
+`up.sh` picks `named` when a token is present and `quick` otherwise, and in quick
+mode scrapes the hostname out of `cloudflared`'s logs so it can print the exact
+`M365_TUNNEL_BASE_URL` to copy. That mismatch — the configured URL not matching
+the actual tunnel hostname — is the failure this whole script exists to prevent;
+it once degraded push silently for days. So `up.sh` finishes by fetching
+`$BASE_URL/healthz` *through* the tunnel, turning a misroute into an error at
+setup time instead of an opaque Graph subscription rejection later.
+
+The guard on the token is `${CLOUDFLARE_TUNNEL_TOKEN:-…}`, not the stricter
+`:?`. Compose interpolates every service regardless of the active profile, so a
+required-variable guard on the `named` service would break `quick` mode for
+exactly the users who have no token.
+
 ## Sending attachments
 
 Graph's one-shot `sendMail`/`reply`/`replyAll`/`forward` actions cannot carry
@@ -322,7 +364,12 @@ subprocess, each with a fallback so a missing tool degrades rather than fails:
 | `notify.rs` | `notify-send` | Terminal bell |
 
 Only the push path needs services, and those are containers rather than host
-installs: Redis, the webhook itself, and `cloudflared`.
+installs: Redis, the webhook itself, and `cloudflared`. So its one real
+prerequisite is Docker with Compose v2 — see
+[packaging the stack](#packaging-the-stack). `up.sh` additionally uses `curl` or
+`wget` to verify the tunnel, and `openssl`/`uuidgen`/`/dev/urandom` for the shared
+secret, each falling back to the next; a box with none of the three fetchers just
+skips verification rather than failing.
 
 The Rust dependency set is deliberately small: `tokio` and `reqwest` (rustls)
 for I/O, `ratatui`/`crossterm` for the terminal, `html5ever` for message bodies,
@@ -388,11 +435,18 @@ Two places take data from anyone who can send you a message:
 ## Releases
 
 Pushing a `v*.*` tag runs `.github/workflows/release.yml`: it builds both
-binaries for `x86_64-unknown-linux-musl` — statically linked, so the artifact
-has no libc dependency and runs on any distribution — and publishes them with a
-SHA-256 checksum.
+binaries for `x86_64-unknown-linux-musl` — statically linked, so the artifacts
+have no libc dependency and run on any distribution — checks they really are
+static, and publishes two assets, each with a SHA-256 checksum.
 
-The asset filename is deliberately **not** versioned
-(`m365-tui-x86_64-linux-musl.tar.gz`), so that
+| Asset | Contents |
+|---|---|
+| `m365-tui-x86_64-linux-musl.tar.gz` | `m365`, `m365-webhook`, and the docs |
+| `m365-tui-realtime-x86_64-linux-musl.tar.gz` | `deploy/` plus `m365-webhook` — the optional push stack, runnable with `./up.sh` |
+
+The webhook binary is in both: the first for anyone assembling their own setup,
+the second because the bundle's Dockerfile copies it.
+
+Asset filenames are deliberately **not** versioned, so that
 `/releases/latest/download/<asset>` always resolves and the README can offer a
-copy-paste install. The version lives in the directory inside the archive.
+copy-paste install. The version lives in the directory inside each archive.

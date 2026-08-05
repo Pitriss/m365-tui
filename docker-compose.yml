@@ -8,6 +8,13 @@
 # host; it connects to Redis on localhost:6379.
 #
 # Values come from the repo-root .env (see .env.example).
+#
+# This file is the **source-checkout** version: it builds the webhook image from
+# the workspace, so it needs no prebuilt binary. Released separately as
+# `m365-tui-realtime-*.tar.gz` is deploy/, which does the same thing from a
+# prebuilt static binary plus a `./up.sh` that handles setup for you — see
+# deploy/README.md. Both use the same Compose project and container names, so
+# they're the same stack: bringing one up replaces the other.
 
 services:
   redis:

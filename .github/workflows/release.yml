@@ -37,10 +37,25 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target "$TARGET" -p m365-tui -p webhook
 
+      # The realtime bundle wraps this binary in Alpine, which can only run it if
+      # it's genuinely static. A dynamically-linked build would pass CI here and
+      # then fail inside the container with an unhelpful "not found".
+      - name: Verify the binaries are static
+        run: |
+          set -euo pipefail
+          for bin in m365 m365-webhook; do
+            desc=$(file -b "target/$TARGET/release/$bin")
+            echo "$bin: $desc"
+            case "$desc" in
+              *"dynamically linked"*)
+                echo "::error::$bin is dynamically linked"; exit 1 ;;
+            esac
+          done
+
       - name: Package
         run: |
           set -euo pipefail
-          # The extracted directory carries the version, but the asset name is
+          # The extracted directories carry the version, but the asset names are
           # kept stable so /releases/latest/download/<asset> always resolves —
           # that's what the README's install one-liner relies on.
           dir="m365-tui-${GITHUB_REF_NAME}"
@@ -49,6 +64,22 @@ jobs:
           cp "target/$TARGET/release/m365" "dist/$dir/"
           cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
           cp README.md ARCHITECTURE.md "dist/$dir/"
+          tar -C dist -czf "$asset" "$dir"
+          sha256sum "$asset" > "$asset.sha256"
+
+      # Second asset: a self-contained real-time stack. Everything from deploy/
+      # plus the prebuilt webhook, so `./up.sh` needs no source checkout, no Rust
+      # toolchain and no container registry.
+      - name: Package the realtime bundle
+        run: |
+          set -euo pipefail
+          dir="m365-tui-realtime-${GITHUB_REF_NAME}"
+          asset="m365-tui-realtime-x86_64-linux-musl.tar.gz"
+          mkdir -p "dist/$dir"
+          cp deploy/docker-compose.yml deploy/Dockerfile deploy/.env.example \
+             deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/"
+          cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
+          chmod +x "dist/$dir/up.sh" "dist/$dir/down.sh" "dist/$dir/m365-webhook"
           tar -C dist -czf "$asset" "$dir"
           sha256sum "$asset" > "$asset.sha256"
 

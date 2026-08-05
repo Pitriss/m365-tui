@@ -1,0 +1,88 @@
+# Real-time stack for m365-tui: everything needed to give Graph a public HTTPS
+# endpoint to push change notifications to.
+#
+#   redis        message bus between the webhook and the TUI
+#   webhook      receives the notifications, publishes them to Redis
+#   cloudflared  tunnel that makes the webhook publicly reachable, with no open
+#                inbound ports on your machine
+#
+# The TUI itself is NOT here — it's an interactive terminal app you run on the
+# host. It connects to Redis on 127.0.0.1:6379.
+#
+# Two tunnel flavours, selected by profile (./up.sh picks for you):
+#   --profile named   a permanent hostname on your own domain (needs a token)
+#   --profile quick   a throwaway https://*.trycloudflare.com URL (needs nothing)
+#
+# This file ships in the `m365-tui-realtime-*.tar.gz` release asset next to a
+# prebuilt static `m365-webhook`. If you have the source checked out instead, the
+# repo-root docker-compose.yml does the same thing but builds from source.
+
+name: m365-tui
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: m365-tui-redis
+    restart: unless-stopped
+    # Pure message bus: nothing here is worth persisting to disk.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"   # the TUI reads from here
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: m365-tui-webhook:local
+    container_name: m365-tui-webhook
+    restart: unless-stopped
+    environment:
+      M365_REDIS_URL: "redis://redis:6379"
+      M365_CLIENT_STATE: "${M365_CLIENT_STATE:-}"
+      WEBHOOK_BIND: "0.0.0.0:8080"
+      RUST_LOG: "${RUST_LOG:-info}"
+    ports:
+      - "127.0.0.1:${WEBHOOK_PORT:-8080}:8080"   # local handshake testing
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Named tunnel: a hostname on a domain in your Cloudflare account, routed to
+  # http://webhook:8080. Survives restarts, so M365_TUNNEL_BASE_URL is stable.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: m365-tui-tunnel
+    profiles: ["named"]
+    restart: unless-stopped
+    # A `${VAR:?...}` guard would be nicer, but Compose interpolates every
+    # service regardless of the active profile — so it would break quick mode for
+    # exactly the people who have no token. up.sh checks the token instead; if you
+    # run compose by hand without one, cloudflared reports this placeholder.
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-NO_TOKEN_SET_SEE_README}
+    depends_on:
+      webhook:
+        condition: service_healthy
+
+  # Quick tunnel: no account, no domain, no token — Cloudflare hands out a random
+  # https://*.trycloudflare.com hostname, printed in this container's logs.
+  # It changes on every restart, so M365_TUNNEL_BASE_URL has to be updated each
+  # time. Fine for trying push out; use the named tunnel for daily use.
+  cloudflared-quick:
+    image: cloudflare/cloudflared:latest
+    container_name: m365-tui-tunnel-quick
+    profiles: ["quick"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://webhook:8080
+    depends_on:
+      webhook:
+        condition: service_healthy

@@ -55,8 +55,10 @@ Only if you want ~1-second updates instead of the 20-second refresh:
 
 - **Docker** and **Docker Compose** — they run the webhook, Redis and the tunnel;
   you don't install `cloudflared` or Redis yourself.
-- **A Cloudflare account with a domain on it**, for a named tunnel. Without a
-  domain you can use a throwaway `trycloudflare.com` tunnel instead.
+- **Nothing else.** A separate release asset contains the whole stack and a
+  `./up.sh` that sets it up — see [instant push](#instant-push-optional). A
+  Cloudflare account with a domain gets you a permanent hostname; without one you
+  get a working throwaway `trycloudflare.com` URL instead.
 
 ### To build from source
 
@@ -144,8 +146,11 @@ sudo install m365-tui-*/m365 /usr/local/bin/
 ```
 
 Each release also publishes a `.sha256` next to the tarball if you want to
-verify it. `m365-webhook` is in the same archive; you only need it for
-[instant push](#instant-push-optional), and Docker builds it for you there.
+verify it.
+
+Every release carries **two** assets. This one is the app. The other,
+`m365-tui-realtime-x86_64-linux-musl.tar.gz`, is the optional real-time stack —
+see [instant push](#instant-push-optional).
 
 <details>
 <summary>Other ways to install</summary>
@@ -273,28 +278,53 @@ Two quirks worth knowing:
 
 ## Instant push (optional)
 
-Polling every 20 seconds is the default and needs nothing. For ~1-second
-updates, run the webhook behind a Cloudflare tunnel.
+Polling every 20 seconds is the default and needs nothing. For ~1-second updates,
+Graph needs a public HTTPS URL to push notifications to — which a laptop behind
+NAT doesn't have. A Cloudflare tunnel provides one without opening any inbound
+port.
 
-1. Create a tunnel at [one.dash.cloudflare.com](https://one.dash.cloudflare.com)
-   → *Networks* → *Tunnels*, and copy its token.
-2. Add a route: **Published application** → a hostname on a domain in your
-   Cloudflare account → service `http://webhook:8080`.
-3. In `.env`:
-   ```dotenv
-   M365_TUNNEL_BASE_URL=https://<your-hostname>
-   CLOUDFLARE_TUNNEL_TOKEN=<the token>
-   M365_CLIENT_STATE=<openssl rand -hex 16>
-   ```
-4. Start it, **before** launching the app:
-   ```sh
-   docker compose up -d --build
-   curl https://<your-hostname>/healthz     # expect: ok
-   ```
+Download the second release asset and run one script:
 
-No domain? Use a throwaway tunnel instead — see the commented `command:` in
-[docker-compose.yml](docker-compose.yml) — and put the printed
-`https://*.trycloudflare.com` URL in `M365_TUNNEL_BASE_URL`.
+```sh
+curl -fsSL -o m365-tui-realtime.tar.gz \
+  https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-realtime-x86_64-linux-musl.tar.gz
+tar xzf m365-tui-realtime.tar.gz
+cd m365-tui-realtime-*/ && ./up.sh
+```
+
+It checks Docker, generates the shared secret, starts the webhook, Redis and the
+tunnel, verifies the tunnel end to end, and prints the two lines to paste into
+your `.env`:
+
+```dotenv
+M365_TUNNEL_BASE_URL=https://<hostname>
+M365_CLIENT_STATE=<generated secret>
+```
+
+Restart the app and the top-right should read `push live`. `./down.sh` stops it;
+the app carries on with the 20-second refresh.
+
+With no configuration you get a **throwaway** `trycloudflare.com` hostname — no
+account, no domain, but it changes on every restart. For a permanent one, put a
+Cloudflare tunnel token in the bundle's `.env` and re-run `./up.sh`; full
+instructions are in the bundle's own README, which is also
+[deploy/README.md](deploy/README.md) here.
+
+<details>
+<summary>From a source checkout instead</summary>
+
+The repo-root [docker-compose.yml](docker-compose.yml) is the same stack built
+from source, configured through the root `.env`:
+
+```sh
+docker compose up -d --build
+curl https://<your-hostname>/healthz     # expect: ok
+```
+
+Both use the same project and container names, so bringing one up replaces the
+other.
+
+</details>
 
 ### Is it actually working?
 
@@ -343,7 +373,8 @@ cargo clippy --workspace
 ```
 
 Pushing a `v*.*` tag builds the static `x86_64-linux-musl` binaries and publishes
-them as a GitHub release, which is what the install step downloads. Design notes
+two assets: the app, and the [`deploy/`](deploy/) real-time bundle with the
+webhook binary in it. That's what the install steps above download. Design notes
 and internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Not supported

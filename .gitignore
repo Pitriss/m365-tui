@@ -5,3 +5,6 @@
 token-cache.json
 *.log
 run-tunnel.sh
+# the webhook binary only lands in deploy/ when assembling the release bundle
+deploy/m365-webhook
+target-musl/
