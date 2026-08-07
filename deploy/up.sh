@@ -54,8 +54,8 @@ docker info >/dev/null 2>&1 \
     || die "the Docker daemon isn't reachable. Start it (\`systemctl --user start docker\`, or Docker Desktop), or add yourself to the \`docker\` group."
 
 [ -f m365-webhook ] || die "m365-webhook is missing from $(pwd).
-It ships in the m365-tui-realtime-*.tar.gz release asset — re-extract that, or
-build it from a source checkout:
+It ships in the realtime/ folder of the m365-tui release tarball — re-extract
+that, or build it from a source checkout:
   cargo build --release --target x86_64-unknown-linux-musl -p webhook
   cp target/x86_64-unknown-linux-musl/release/m365-webhook deploy/"
 
@@ -73,7 +73,7 @@ if command -v file >/dev/null 2>&1; then
     host_arch=$(uname -m)
     if [ -n "$bin_arch" ] && [ "$bin_arch" != "$host_arch" ]; then
         die "this bundle holds a $bin_arch binary but you're on $host_arch.
-Download the m365-tui-realtime-$host_arch-linux-musl.tar.gz asset instead."
+Download the m365-tui-$host_arch-linux-musl.tar.gz release instead."
     fi
 fi
 

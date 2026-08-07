@@ -66,34 +66,34 @@ jobs:
             esac
           done
 
+      # ONE asset per architecture. An earlier version published the app and the
+      # optional push stack separately, which meant the releases page offered two
+      # similarly-named tarballs with no way to tell which one was the program —
+      # and the wrong guess produced a download containing no `m365` at all.
+      # Everything ships together instead; the push stack is a subdirectory you
+      # only enter if you want it.
       - name: Package
         run: |
           set -euo pipefail
-          # The extracted directories carry the version, but the asset names are
+          # The extracted directory carries the version, but the asset name is
           # kept stable so /releases/latest/download/<asset> always resolves —
           # that's what the README's install one-liner relies on.
           dir="m365-tui-${GITHUB_REF_NAME}"
           asset="m365-tui-${{ matrix.arch }}-linux-musl.tar.gz"
-          mkdir -p "dist/$dir"
+          mkdir -p "dist/$dir/realtime"
+
           cp "target/$TARGET/release/m365" "dist/$dir/"
           cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
           cp README.md ARCHITECTURE.md LICENSE "dist/$dir/"
-          tar -C dist -czf "$asset" "$dir"
-          sha256sum "$asset" > "$asset.sha256"
 
-      # Second asset: a self-contained real-time stack. Everything from deploy/
-      # plus the prebuilt webhook, so `./up.sh` needs no source checkout, no Rust
-      # toolchain and no container registry.
-      - name: Package the realtime bundle
-        run: |
-          set -euo pipefail
-          dir="m365-tui-realtime-${GITHUB_REF_NAME}"
-          asset="m365-tui-realtime-${{ matrix.arch }}-linux-musl.tar.gz"
-          mkdir -p "dist/$dir"
           cp deploy/docker-compose.yml deploy/Dockerfile deploy/.env.example \
-             deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/"
-          cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
-          chmod +x "dist/$dir/up.sh" "dist/$dir/down.sh" "dist/$dir/m365-webhook"
+             deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/realtime/"
+          # A second copy of the webhook, so `docker build` inside realtime/ has a
+          # self-contained context and its Dockerfile stays a plain COPY.
+          cp "target/$TARGET/release/m365-webhook" "dist/$dir/realtime/"
+          chmod +x "dist/$dir/realtime/up.sh" "dist/$dir/realtime/down.sh" \
+                   "dist/$dir/realtime/m365-webhook"
+
           tar -C dist -czf "$asset" "$dir"
           sha256sum "$asset" > "$asset.sha256"
 

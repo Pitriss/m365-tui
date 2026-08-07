@@ -136,7 +136,7 @@ just polling instead of instant push.
 
 ## 3. Install
 
-**Download the release binary** — nothing else required:
+**One download, nothing else required:**
 
 ```sh
 curl -fsSL -o m365-tui.tar.gz \
@@ -145,14 +145,20 @@ tar xzf m365-tui.tar.gz
 sudo install m365-tui-*/m365 /usr/local/bin/
 ```
 
-`uname -m` picks the right build: `x86_64` and `aarch64` are both published.
+`uname -m` picks the right build — `x86_64` and `aarch64` are both published, one
+tarball each. That's the whole release; there's nothing else to fetch.
+
+Inside you get:
+
+| | |
+|---|---|
+| `m365` | **the app** — this is the one you install |
+| `realtime/` | optional add-on for [instant push](#instant-push-optional); ignore it unless you want that |
+| `m365-webhook` | used by `realtime/`; you never run it directly |
+| `README.md` `ARCHITECTURE.md` `LICENSE` | the docs you're reading |
 
 Each release also publishes a `.sha256` next to the tarball if you want to
 verify it.
-
-Every release carries **two** assets. This one is the app. The other,
-`m365-tui-realtime-x86_64-linux-musl.tar.gz`, is the optional real-time stack —
-see [instant push](#instant-push-optional).
 
 <details>
 <summary>Other ways to install</summary>
@@ -286,13 +292,11 @@ Graph needs a public HTTPS URL to push notifications to — which a laptop behin
 NAT doesn't have. A Cloudflare tunnel provides one without opening any inbound
 port.
 
-Download the second release asset and run one script:
+**You already have everything** — it's the `realtime/` folder in the tarball you
+downloaded in [step 3](#3-install). Nothing more to fetch:
 
 ```sh
-curl -fsSL -o m365-tui-realtime.tar.gz \
-  "https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-realtime-$(uname -m)-linux-musl.tar.gz"
-tar xzf m365-tui-realtime.tar.gz
-cd m365-tui-realtime-*/ && ./up.sh
+cd m365-tui-*/realtime && ./up.sh
 ```
 
 It checks Docker, generates the shared secret, starts the webhook, Redis and the
@@ -309,8 +313,8 @@ the app carries on with the 20-second refresh.
 
 With no configuration you get a **throwaway** `trycloudflare.com` hostname — no
 account, no domain, but it changes on every restart. For a permanent one, put a
-Cloudflare tunnel token in the bundle's `.env` and re-run `./up.sh`; full
-instructions are in the bundle's own README, which is also
+Cloudflare tunnel token in `realtime/.env` and re-run `./up.sh`; full
+instructions are in `realtime/README.md`, which is also
 [deploy/README.md](deploy/README.md) here.
 
 <details>
@@ -378,11 +382,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 Both run in CI on every push and pull request, along with `shellcheck` over the
 `deploy/` scripts, since those ship to users untouched.
 
-Pushing a `v*.*` tag builds static musl binaries for x86_64 and aarch64, then
-publishes two assets per architecture: the app, and the [`deploy/`](deploy/)
-real-time bundle with the webhook binary in it. That's what the install steps
-above download. Design notes and internals live in
-[ARCHITECTURE.md](ARCHITECTURE.md).
+Pushing a `v*.*` tag builds static musl binaries for x86_64 and aarch64 and
+publishes one tarball per architecture, with [`deploy/`](deploy/) packaged inside
+it as `realtime/`. That's what the install step above downloads. Design notes and
+internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Not supported
 

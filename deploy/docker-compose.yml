@@ -13,9 +13,9 @@
 #   --profile named   a permanent hostname on your own domain (needs a token)
 #   --profile quick   a throwaway https://*.trycloudflare.com URL (needs nothing)
 #
-# This file ships in the `m365-tui-realtime-*.tar.gz` release asset next to a
-# prebuilt static `m365-webhook`. If you have the source checked out instead, the
-# repo-root docker-compose.yml does the same thing but builds from source.
+# This file ships as `realtime/` inside the release tarball, next to a prebuilt
+# static `m365-webhook`. If you have the source checked out instead, the repo-root
+# docker-compose.yml does the same thing but builds from source.
 
 name: m365-tui
 

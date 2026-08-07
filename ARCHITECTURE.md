@@ -443,20 +443,30 @@ Two places take data from anyone who can send you a message:
 Pushing a `v*.*` tag runs `.github/workflows/release.yml`: it builds both
 binaries for `x86_64-unknown-linux-musl` — statically linked, so the artifacts
 have no libc dependency and run on any distribution — checks they really are
-static, and publishes two assets, each with a SHA-256 checksum.
+static, and publishes one asset per architecture with a SHA-256 checksum.
 
-| Asset | Contents |
-|---|---|
-| `m365-tui-<arch>-linux-musl.tar.gz` | `m365`, `m365-webhook`, and the docs |
-| `m365-tui-realtime-<arch>-linux-musl.tar.gz` | `deploy/` plus `m365-webhook` — the optional push stack, runnable with `./up.sh` |
+**One asset per architecture**, `m365-tui-<arch>-linux-musl.tar.gz`, containing:
+
+```
+m365                    the application
+m365-webhook            used by realtime/, never run directly
+realtime/               the optional push stack (deploy/, plus its own
+                        copy of m365-webhook so the docker build context
+                        is self-contained)
+README.md ARCHITECTURE.md LICENSE
+```
+
+This was briefly two assets — the app, and the push stack separately. That put
+two similarly-named tarballs on the releases page with nothing to distinguish
+them, and picking the wrong one got you a download with no `m365` in it. Shipping
+one asset makes the question unanswerable-in-the-wrong-way: the push stack is a
+subdirectory you either enter or ignore. The duplicated webhook binary costs a
+couple of megabytes and buys a Dockerfile that is a plain `COPY`.
 
 `<arch>` is `x86_64` or `aarch64`, built on native runners rather than through a
 cross toolchain, so `musl-tools` supplies a matching `musl-gcc` and nothing has
 to be cross-linked. A matrix job builds and packages each, and a dependent job
-collects both sets and publishes them in one release.
-
-The webhook binary is in both assets: the first for anyone assembling their own
-setup, the second because the bundle's Dockerfile copies it.
+collects both and publishes them in one release.
 
 A separate `ci.yml` runs build, `clippy -D warnings` (with `--all-targets`, so
 test code is linted too), the test suite, `shellcheck` over `deploy/`, and a
