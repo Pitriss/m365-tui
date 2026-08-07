@@ -11,10 +11,9 @@ use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team,
-    User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
 };
-use m365_core::{calendar, chats, channels, mail, people, Session};
+use m365_core::{calendar, channels, chats, mail, people, Session};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
@@ -44,7 +43,10 @@ pub enum AppMessage {
         mode: ListUpdate,
     },
     Teams(Vec<Team>),
-    Channels { team_id: String, channels: Vec<m365_core::models::Channel> },
+    Channels {
+        team_id: String,
+        channels: Vec<m365_core::models::Channel>,
+    },
     ChannelMessages {
         team_id: String,
         channel_id: String,
@@ -66,9 +68,15 @@ pub enum AppMessage {
     /// Newest inbox messages, fetched purely to drive notifications.
     InboxPeek(Vec<MailMessage>),
     /// Attachments of the open mail message.
-    Attachments { message_id: String, items: Vec<Attachment> },
+    Attachments {
+        message_id: String,
+        items: Vec<Attachment>,
+    },
     /// A downloaded attachment, ready to write to disk.
-    Downloaded { name: String, bytes: Vec<u8> },
+    Downloaded {
+        name: String,
+        bytes: Vec<u8>,
+    },
     /// Push-notification health, for the status bar.
     Push(PushState),
     /// Lightweight timer: refresh memory usage and expire stale status text.
@@ -113,8 +121,13 @@ pub enum TeamsFocus {
 /// A transient full-screen/modal overlay.
 pub enum Overlay {
     Help,
-    Palette { query: String, sel: usize },
-    Search { query: String },
+    Palette {
+        query: String,
+        sel: usize,
+    },
+    Search {
+        query: String,
+    },
     Compose(Compose),
     Calendar,
     /// Emoji reaction picker for the selected Teams message.
@@ -663,7 +676,11 @@ impl App {
 
     fn load_body(&self, id: String) {
         let s = self.session.clone();
-        self.spawn(async move { Ok(AppMessage::MessageBody(mail::get_message(&s.graph, &id).await?)) });
+        self.spawn(async move {
+            Ok(AppMessage::MessageBody(
+                mail::get_message(&s.graph, &id).await?,
+            ))
+        });
     }
 
     fn load_calendar(&self) {
@@ -891,7 +908,10 @@ impl App {
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
                 self.teams.chats = c;
-                self.teams.chat_sel = self.teams.chat_sel.min(self.teams.chats.len().saturating_sub(1));
+                self.teams.chat_sel = self
+                    .teams
+                    .chat_sel
+                    .min(self.teams.chats.len().saturating_sub(1));
             }
             AppMessage::ChatMessages {
                 chat_id,
@@ -967,8 +987,10 @@ impl App {
                 // Ignore a late response for a message we've navigated away from.
                 if self.outlook.reading.as_ref().map(|m| m.id.as_str()) == Some(&message_id) {
                     // Inline images (signatures, logos) aren't useful downloads.
-                    self.outlook.reading_attachments =
-                        items.into_iter().filter(|a| !a.is_inline.unwrap_or(false)).collect();
+                    self.outlook.reading_attachments = items
+                        .into_iter()
+                        .filter(|a| !a.is_inline.unwrap_or(false))
+                        .collect();
                 }
             }
             AppMessage::Downloaded { name, bytes } => {
@@ -1104,7 +1126,10 @@ impl App {
                 follow_newest = self.teams.msg_sel + 1 >= self.teams.messages.len();
                 let known: std::collections::HashSet<&str> =
                     self.teams.messages.iter().map(|m| m.id.as_str()).collect();
-                let arrived = page.iter().filter(|m| !known.contains(m.id.as_str())).count();
+                let arrived = page
+                    .iter()
+                    .filter(|m| !known.contains(m.id.as_str()))
+                    .count();
                 if !follow_newest {
                     self.teams.unseen += arrived;
                 }
@@ -1276,12 +1301,8 @@ impl App {
                 .as_ref()
                 .and_then(|b| b.content.clone())
                 .unwrap_or_default();
-            let mentioned = crate::notify::mentions_me(
-                &[],
-                &body,
-                my_id.as_deref(),
-                my_name.as_deref(),
-            );
+            let mentioned =
+                crate::notify::mentions_me(&[], &body, my_id.as_deref(), my_name.as_deref());
             if !crate::notify::should_notify(chat.chat_type.as_deref(), mentioned) {
                 continue;
             }
@@ -1297,7 +1318,10 @@ impl App {
             } else {
                 who
             };
-            to_notify.push((title, content::plain(&content::render_body(None, &body).text)));
+            to_notify.push((
+                title,
+                content::plain(&content::render_body(None, &body).text),
+            ));
         }
 
         // Keep the id set from growing without bound over a long session.
@@ -1519,7 +1543,9 @@ impl App {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
             KeyCode::Char('/') => {
-                self.overlay = Some(Overlay::Search { query: String::new() });
+                self.overlay = Some(Overlay::Search {
+                    query: String::new(),
+                });
             }
             KeyCode::Char('r') => self.open_reply(ReplyMode::Reply),
             KeyCode::Char('a') => self.open_reply(ReplyMode::ReplyAll),
@@ -1558,9 +1584,14 @@ impl App {
             OutlookFocus::Reading => {
                 let max = self.reading_max_scroll.get();
                 self.outlook.reading_scroll = if delta > 0 {
-                    self.outlook.reading_scroll.saturating_add(delta as u16).min(max)
+                    self.outlook
+                        .reading_scroll
+                        .saturating_add(delta as u16)
+                        .min(max)
                 } else {
-                    self.outlook.reading_scroll.saturating_sub(delta.unsigned_abs() as u16)
+                    self.outlook
+                        .reading_scroll
+                        .saturating_sub(delta.unsigned_abs() as u16)
                 };
             }
             OutlookFocus::Messages => {
@@ -1754,7 +1785,7 @@ impl App {
                     self.teams.msg_sel = i as usize;
                     if self.teams.msg_sel + 1 >= self.teams.messages.len() {
                         self.teams.unseen = 0;
-                    self.teams.replying_to = None; // caught up with the newest
+                        self.teams.replying_to = None; // caught up with the newest
                     }
                     // Prefetch when landing on the oldest, so scrolling further
                     // back doesn't stall.
@@ -1901,7 +1932,8 @@ impl App {
             });
         } else if let Some((team_id, channel_id)) = self.teams.open_channel.clone() {
             self.spawn(async move {
-                channels::set_reaction(&s.graph, &team_id, &channel_id, &message_id, &emoji).await?;
+                channels::set_reaction(&s.graph, &team_id, &channel_id, &message_id, &emoji)
+                    .await?;
                 Ok(AppMessage::Done("reaction added".into()))
             });
         }
@@ -2137,10 +2169,7 @@ impl App {
                     self.overlay = Some(Overlay::Compose(std::mem::replace(c, empty_compose())));
                     return;
                 }
-                Outgoing::Forward {
-                    id: id.clone(),
-                    to,
-                }
+                Outgoing::Forward { id: id.clone(), to }
             }
         };
 
@@ -2159,8 +2188,8 @@ impl App {
             // Read the staged files here, off the UI thread.
             let mut attachments = Vec::with_capacity(paths.len());
             for (path, _) in &paths {
-                let bytes = std::fs::read(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
+                let bytes =
+                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -2358,9 +2387,7 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
     PALETTE_COMMANDS
         .iter()
         .filter(|(id, label)| {
-            q.is_empty()
-                || label.to_ascii_lowercase().contains(&q)
-                || id.contains(&q)
+            q.is_empty() || label.to_ascii_lowercase().contains(&q) || id.contains(&q)
         })
         .copied()
         .collect()
@@ -2431,7 +2458,11 @@ mod tests {
     fn merge_is_idempotent_when_nothing_changed() {
         let existing = vec!["c", "b", "a"];
         let merged = merge_newest_first(vec!["c", "b", "a"], existing, |s: &&str| s.to_string());
-        assert_eq!(merged, vec!["c", "b", "a"], "no duplicates on an unchanged refresh");
+        assert_eq!(
+            merged,
+            vec!["c", "b", "a"],
+            "no duplicates on an unchanged refresh"
+        );
     }
 
     #[test]
