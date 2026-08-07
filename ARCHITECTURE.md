@@ -65,6 +65,12 @@ therefore opt-in rather than added to the defaults:
 Capabilities behind an opt-in scope check `Config::can_*` before calling, so the
 UI explains what's missing instead of surfacing a Graph 403.
 
+Sign-in runs once at startup, before the terminal is put into raw mode, so the
+device code can be printed normally. Command-line arguments are resolved *before*
+that — `--help` and `--version` must work on a machine with no client ID, no
+network and no account. Parsing them after sign-in meant asking a first-time user
+to authenticate before it would tell them what the flags were.
+
 ## The Graph client
 
 `GraphClient` wraps `reqwest` and centralises the things every call needs:
@@ -441,11 +447,20 @@ static, and publishes two assets, each with a SHA-256 checksum.
 
 | Asset | Contents |
 |---|---|
-| `m365-tui-x86_64-linux-musl.tar.gz` | `m365`, `m365-webhook`, and the docs |
-| `m365-tui-realtime-x86_64-linux-musl.tar.gz` | `deploy/` plus `m365-webhook` — the optional push stack, runnable with `./up.sh` |
+| `m365-tui-<arch>-linux-musl.tar.gz` | `m365`, `m365-webhook`, and the docs |
+| `m365-tui-realtime-<arch>-linux-musl.tar.gz` | `deploy/` plus `m365-webhook` — the optional push stack, runnable with `./up.sh` |
 
-The webhook binary is in both: the first for anyone assembling their own setup,
-the second because the bundle's Dockerfile copies it.
+`<arch>` is `x86_64` or `aarch64`, built on native runners rather than through a
+cross toolchain, so `musl-tools` supplies a matching `musl-gcc` and nothing has
+to be cross-linked. A matrix job builds and packages each, and a dependent job
+collects both sets and publishes them in one release.
+
+The webhook binary is in both assets: the first for anyone assembling their own
+setup, the second because the bundle's Dockerfile copies it.
+
+A separate `ci.yml` runs build, `clippy -D warnings` (with `--all-targets`, so
+test code is linted too), the test suite, `shellcheck` over `deploy/`, and a
+Compose config validation on every push and pull request.
 
 Asset filenames are deliberately **not** versioned, so that
 `/releases/latest/download/<asset>` always resolves and the README can offer a

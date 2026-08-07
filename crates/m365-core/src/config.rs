@@ -197,7 +197,7 @@ fn env_required(key: &str) -> Result<String> {
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("pt", "contoso", "m365-tui")
+    let dirs = directories::ProjectDirs::from("dev", "rootHytx", "m365-tui")
         .context("could not determine a config directory for this platform")?;
     let dir = dirs.config_dir().to_path_buf();
     std::fs::create_dir_all(&dir)

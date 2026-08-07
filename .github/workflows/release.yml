@@ -1,7 +1,7 @@
 name: release
 
 # Build and publish a GitHub Release whenever a version tag is pushed.
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v1.2.0 && git push origin v1.2.0
 on:
   push:
     tags:
@@ -11,11 +11,23 @@ permissions:
   contents: write # needed to create the release and upload assets
 
 jobs:
-  release:
-    name: Build & publish
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            # Native ARM runner rather than a cross toolchain: musl-tools then
+            # provides a matching musl-gcc and nothing has to be cross-linked.
+            runner: ubuntu-24.04-arm
     env:
-      TARGET: x86_64-unknown-linux-musl
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +36,7 @@ jobs:
       - name: Install Rust (musl target)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -32,14 +44,16 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ env.TARGET }}
+          key: ${{ matrix.target }}
 
       - name: Build
         run: cargo build --release --locked --target "$TARGET" -p m365-tui -p webhook
 
       # The realtime bundle wraps this binary in Alpine, which can only run it if
       # it's genuinely static. A dynamically-linked build would pass CI here and
-      # then fail inside the container with an unhelpful "not found".
+      # then fail inside the container with an unhelpful "not found". Note a Rust
+      # musl release is "static-pie linked", not "statically linked", so this
+      # tests for the absence of the dynamic marker rather than a static one.
       - name: Verify the binaries are static
         run: |
           set -euo pipefail
@@ -59,11 +73,11 @@ jobs:
           # kept stable so /releases/latest/download/<asset> always resolves —
           # that's what the README's install one-liner relies on.
           dir="m365-tui-${GITHUB_REF_NAME}"
-          asset="m365-tui-x86_64-linux-musl.tar.gz"
+          asset="m365-tui-${{ matrix.arch }}-linux-musl.tar.gz"
           mkdir -p "dist/$dir"
           cp "target/$TARGET/release/m365" "dist/$dir/"
           cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
-          cp README.md ARCHITECTURE.md "dist/$dir/"
+          cp README.md ARCHITECTURE.md LICENSE "dist/$dir/"
           tar -C dist -czf "$asset" "$dir"
           sha256sum "$asset" > "$asset.sha256"
 
@@ -74,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           dir="m365-tui-realtime-${GITHUB_REF_NAME}"
-          asset="m365-tui-realtime-x86_64-linux-musl.tar.gz"
+          asset="m365-tui-realtime-${{ matrix.arch }}-linux-musl.tar.gz"
           mkdir -p "dist/$dir"
           cp deploy/docker-compose.yml deploy/Dockerfile deploy/.env.example \
              deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/"
@@ -83,11 +97,32 @@ jobs:
           tar -C dist -czf "$asset" "$dir"
           sha256sum "$asset" > "$asset.sha256"
 
+      - name: Upload for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect every architecture's assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          merge-multiple: true
+          path: dist
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            *.tar.gz
-            *.tar.gz.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

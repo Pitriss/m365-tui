@@ -541,7 +541,7 @@ mod tests {
             "attachments": [{
                 "id": "1785858892876",
                 "contentType": "messageReference",
-                "content": "{\"messageId\":\"1785858892876\",\"messagePreview\":\"Nao implicam restart\",\"messageSender\":{\"user\":{\"userIdentityType\":\"aadUser\",\"id\":\"abc\",\"displayName\":\"Ricardo Joaquim\"}}}"
+                "content": "{\"messageId\":\"1785858892876\",\"messagePreview\":\"Sounds good to me\",\"messageSender\":{\"user\":{\"userIdentityType\":\"aadUser\",\"id\":\"abc\",\"displayName\":\"Alex Rivera\"}}}"
             }]
         }))
         .unwrap()
@@ -550,8 +550,8 @@ mod tests {
     #[test]
     fn reads_the_quoted_message_from_a_reference_attachment() {
         let q = reply_message().quoted().expect("reply should carry a quote");
-        assert_eq!(q.author, "Ricardo Joaquim");
-        assert_eq!(q.preview, "Nao implicam restart");
+        assert_eq!(q.author, "Alex Rivera");
+        assert_eq!(q.preview, "Sounds good to me");
         assert_eq!(q.message_id, "1785858892876");
     }
 

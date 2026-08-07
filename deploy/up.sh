@@ -61,6 +61,22 @@ build it from a source checkout:
 
 chmod +x m365-webhook 2>/dev/null || true
 
+# Releases are per-architecture. Downloading the wrong one otherwise surfaces as
+# a container that dies on "exec format error" and a health check that just times
+# out, which says nothing useful.
+if command -v file >/dev/null 2>&1; then
+    case "$(file -b m365-webhook)" in
+        *x86-64*)  bin_arch=x86_64 ;;
+        *aarch64*) bin_arch=aarch64 ;;
+        *)         bin_arch='' ;;
+    esac
+    host_arch=$(uname -m)
+    if [ -n "$bin_arch" ] && [ "$bin_arch" != "$host_arch" ]; then
+        die "this bundle holds a $bin_arch binary but you're on $host_arch.
+Download the m365-tui-realtime-$host_arch-linux-musl.tar.gz asset instead."
+    fi
+fi
+
 # One HTTP getter, whichever tool the box has. Empty HAVE_FETCH means the
 # verification steps get skipped rather than failing the run.
 HAVE_FETCH=''

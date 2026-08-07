@@ -22,7 +22,8 @@ Graph.
 ## Requirements
 
 - **Docker** with **Compose v2** (`docker compose version`)
-- **x86_64 Linux** — the bundled `m365-webhook` is a static musl binary
+- **Linux**, x86_64 or aarch64 — one bundle per architecture, since it carries a
+  prebuilt binary. `up.sh` checks and tells you if you took the wrong one.
 - For a *permanent* hostname: a **Cloudflare account with a domain**. Without
   one you still get a working throwaway URL.
 

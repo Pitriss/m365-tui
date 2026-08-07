@@ -137,22 +137,22 @@ mod tests {
 
     #[test]
     fn falls_back_to_scanning_the_body_when_previews_omit_mentions() {
-        let body = r#"<p><at id="0">Ricardo Joaquim</at> can you check this?</p>"#;
-        assert!(mentions_me(&[], body, None, Some("Ricardo Joaquim")));
+        let body = r#"<p><at id="0">Alex Rivera</at> can you check this?</p>"#;
+        assert!(mentions_me(&[], body, None, Some("Alex Rivera")));
         assert!(!mentions_me(&[], body, None, Some("Ana Silva")));
         // Teams often renders just the first name.
         assert!(mentions_me(
             &[],
-            r#"<p><at id="0">Ricardo</at> ping</p>"#,
+            r#"<p><at id="0">Alex</at> ping</p>"#,
             None,
-            Some("Ricardo Joaquim")
+            Some("Alex Rivera")
         ));
         // A plain mention of the name in prose is not an @mention.
         assert!(!mentions_me(
             &[],
-            "<p>ask Ricardo Joaquim about it</p>",
+            "<p>ask Alex Rivera about it</p>",
             None,
-            Some("Ricardo Joaquim")
+            Some("Alex Rivera")
         ));
     }
 

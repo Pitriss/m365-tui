@@ -464,13 +464,15 @@ mod tests {
 
     #[test]
     fn safelinks_are_unwrapped_to_the_real_target() {
-        let wrapped = "https://eur03.safelinks.protection.outlook.com/?url=https%3A%2F%2Ftickets.contoso.com%2Fscp%2Ftickets.php%3Fid%3D47398&data=05%7C02%7Cada.lovelace%40contoso.com%7C572b&reserved=0";
+        // Shaped exactly like a live Outlook rewrite: percent-encoded target,
+        // then the tracking parameters Exchange appends after it.
+        let wrapped = "https://eur03.safelinks.protection.outlook.com/?url=https%3A%2F%2Ftickets.example.org%2Fscp%2Ftickets.php%3Fid%3D47398&data=05%7C02%7Csomeone%40example.org%7C572b&reserved=0";
         assert_eq!(
             unwrap_safelink(wrapped),
-            "https://tickets.contoso.com/scp/tickets.php?id=47398"
+            "https://tickets.example.org/scp/tickets.php?id=47398"
         );
         // Ordinary links pass through untouched.
-        let plain = "https://github.com/contoso";
+        let plain = "https://github.com/rootHytx/m365-tui";
         assert_eq!(unwrap_safelink(plain), plain);
         // A malformed safelink must not panic or lose the original.
         let broken = "https://eur03.safelinks.protection.outlook.com/no-query-here";
@@ -500,16 +502,16 @@ mod tests {
         // The shape Teams uses for a reply in a chat: the original is embedded
         // as a blockquote, followed by the new text.
         let html = r#"<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="1754321652000">
-              <strong itemprop="mri">Ricardo Joaquim</strong>
+              <strong itemprop="mri">Alex Rivera</strong>
               <span itemprop="time"></span>
-              <p itemprop="preview">Nao implicam restart do servico</p>
+              <p itemprop="preview">Sounds good to me</p>
             </blockquote><p>Confirma por favor</p>"#;
         let out = render_html(html);
         let text = flat(&out.text);
         // Both the quoted original and the reply itself must survive.
-        assert!(text.contains("Ricardo Joaquim"), "quoted author missing: {text}");
+        assert!(text.contains("Alex Rivera"), "quoted author missing: {text}");
         assert!(
-            text.contains("Nao implicam restart do servico"),
+            text.contains("Sounds good to me"),
             "quoted text missing: {text}"
         );
         assert!(text.contains("Confirma por favor"), "reply missing: {text}");

@@ -1,0 +1,47 @@
+name: ci
+
+# Every push and pull request: the checks that must hold before a tag is worth
+# cutting. The release workflow assumes these already passed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Test & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  scripts:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # deploy/ ships to users as-is, so a syntax error there breaks setup for
+      # someone who never touched the Rust code.
+      - name: Shellcheck
+        run: shellcheck -s sh deploy/up.sh deploy/down.sh
+
+      - name: Validate the compose file
+        run: docker compose -f deploy/docker-compose.yml --profile quick config -q

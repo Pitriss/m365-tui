@@ -1208,6 +1208,25 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(v[1])[1]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{day_label, local_time};
@@ -1287,23 +1306,4 @@ mod tests {
         assert!(local_time(Some("not a date")).is_none());
         assert!(local_time(None).is_none());
     }
-}
-
-fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - pct_y) / 2),
-            Constraint::Percentage(pct_y),
-            Constraint::Percentage((100 - pct_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - pct_x) / 2),
-            Constraint::Percentage(pct_x),
-            Constraint::Percentage((100 - pct_x) / 2),
-        ])
-        .split(v[1])[1]
 }

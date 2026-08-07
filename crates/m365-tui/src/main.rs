@@ -4,6 +4,12 @@
 //!   m365            launch the TUI
 //!   m365 whoami     print the signed-in user and exit (auth smoke test)
 //!   m365 login      run device-code login and exit
+//!   m365 --help     usage; also --version
+//!
+//! Arguments are resolved before any configuration is read or sign-in is
+//! attempted, so `--help` and `--version` work on a machine that has never been
+//! configured. Anything else would greet a first-time user with a device-code
+//! prompt for asking what the flags are.
 
 mod app;
 mod clipboard;
@@ -42,8 +48,58 @@ const POLL_SECONDS: u64 = 20;
 /// Costs nothing on the network.
 const TICK_SECONDS: u64 = 2;
 
+/// What the command line asked for, decided before any I/O.
+enum Command {
+    Tui,
+    WhoAmI,
+    Login,
+}
+
+const USAGE: &str = "\
+m365 — a terminal client for Outlook and Microsoft Teams
+
+USAGE:
+    m365 [COMMAND]
+
+COMMANDS:
+    (none)      launch the TUI
+    login       sign in and cache the token, then exit
+    whoami      print the signed-in account, then exit
+
+OPTIONS:
+    -h, --help     print this help
+    -V, --version  print the version
+
+Configuration is read from the environment or a .env file; M365_CLIENT_ID is
+the only required value. See https://github.com/rootHytx/m365-tui for setup.";
+
+fn parse_args() -> Command {
+    match std::env::args().nth(1).as_deref() {
+        None => Command::Tui,
+        Some("whoami") => Command::WhoAmI,
+        Some("login") => Command::Login,
+        Some("-h") | Some("--help") | Some("help") => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("m365 {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some(other) => {
+            eprintln!("m365: unrecognised argument '{other}'\n");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything else: --help and --version must not require configuration,
+    // a network, or a signed-in account.
+    let command = parse_args();
+
     init_tracing();
 
     let session = match Session::from_env() {
@@ -61,8 +117,8 @@ async fn main() -> Result<()> {
         .await
         .context("sign-in failed")?;
 
-    match std::env::args().nth(1).as_deref() {
-        Some("whoami") => {
+    match command {
+        Command::WhoAmI => {
             let me = session.whoami().await?;
             println!(
                 "{} <{}>",
@@ -71,11 +127,11 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Some("login") => {
+        Command::Login => {
             println!("signed in — token cached.");
             Ok(())
         }
-        _ => run_tui(session).await,
+        Command::Tui => run_tui(session).await,
     }
 }
 

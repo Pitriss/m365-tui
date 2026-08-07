@@ -2382,7 +2382,7 @@ mod tests {
             .unwrap()
         };
         // Same minute, different seconds — the case Graph returned out of order.
-        let mut list = vec![
+        let mut list = [
             msg("1785859200000", "2026-08-04T15:59:50Z"),
             msg("1785859141228", "2026-08-04T15:59:01Z"),
             msg("1785859178276", "2026-08-04T15:59:38Z"),
@@ -2396,7 +2396,7 @@ mod tests {
         );
 
         // A missing timestamp must not panic or reorder everything else.
-        let mut with_gap = vec![
+        let mut with_gap = [
             msg("2", "2026-08-04T16:00:00Z"),
             serde_json::from_value(serde_json::json!({ "id": "1" })).unwrap(),
         ];

@@ -24,7 +24,7 @@ Built on the Microsoft Graph API in Rust. For how it works internally, see
 |---|---|
 | **A work or school Microsoft 365 account** | Personal accounts can't use the Teams messaging APIs |
 | **An Entra app registration** | See [step 1](#1-register-an-app-in-entra) — you need a client ID |
-| **Linux on x86_64** | The release binary is statically linked against musl: no libc, no shared libraries, runs on any distribution including NixOS |
+| **Linux on x86_64 or aarch64** | The release binaries are statically linked against musl: no libc, no shared libraries, runs on any distribution including NixOS |
 
 Nothing else. The binary has no runtime library dependencies.
 
@@ -140,10 +140,12 @@ just polling instead of instant push.
 
 ```sh
 curl -fsSL -o m365-tui.tar.gz \
-  https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-x86_64-linux-musl.tar.gz
+  "https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-$(uname -m)-linux-musl.tar.gz"
 tar xzf m365-tui.tar.gz
 sudo install m365-tui-*/m365 /usr/local/bin/
 ```
+
+`uname -m` picks the right build: `x86_64` and `aarch64` are both published.
 
 Each release also publishes a `.sha256` next to the tarball if you want to
 verify it.
@@ -175,6 +177,7 @@ nix develop -c cargo build --release    # or via the bundled dev shell
 ## 4. Run
 
 ```sh
+m365 --help     # usage; needs no configuration
 m365 whoami     # sign in and print your identity — a good first check
 m365            # launch
 ```
@@ -287,7 +290,7 @@ Download the second release asset and run one script:
 
 ```sh
 curl -fsSL -o m365-tui-realtime.tar.gz \
-  https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-realtime-x86_64-linux-musl.tar.gz
+  "https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-realtime-$(uname -m)-linux-musl.tar.gz"
 tar xzf m365-tui-realtime.tar.gz
 cd m365-tui-realtime-*/ && ./up.sh
 ```
@@ -369,16 +372,27 @@ Only needed if you're changing the code — running it doesn't require any of th
 
 ```sh
 cargo test --workspace
-cargo clippy --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Pushing a `v*.*` tag builds the static `x86_64-linux-musl` binaries and publishes
-two assets: the app, and the [`deploy/`](deploy/) real-time bundle with the
-webhook binary in it. That's what the install steps above download. Design notes
-and internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
+Both run in CI on every push and pull request, along with `shellcheck` over the
+`deploy/` scripts, since those ship to users untouched.
+
+Pushing a `v*.*` tag builds static musl binaries for x86_64 and aarch64, then
+publishes two assets per architecture: the app, and the [`deploy/`](deploy/)
+real-time bundle with the webhook binary in it. That's what the install steps
+above download. Design notes and internals live in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Not supported
 
 Joining Teams calls or meetings (audio/video isn't a terminal thing — you can
 still list and schedule them), and bulk chat export, which needs separately
 approved Graph permissions.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
+"Teams" are trademarks of Microsoft Corporation.
