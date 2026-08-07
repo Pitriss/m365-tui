@@ -25,7 +25,7 @@ The webhook shares the core only for its event types.
 |---|---|
 | `auth.rs` | OAuth2 device-code flow, token cache, silent refresh |
 | `graph.rs` | HTTP client: throttling, retries, paging, delta, uploads |
-| `config.rs` | Environment-driven settings and scope selection |
+| `config.rs` | Environment-driven settings, scope selection, Graph endpoint |
 | `models.rs` | Serde structs for the Graph resources actually rendered |
 | `mail.rs` `calendar.rs` `chats.rs` `channels.rs` `people.rs` | Endpoint wrappers |
 | `subscriptions.rs` | Change-notification lifecycle |
@@ -75,6 +75,11 @@ to authenticate before it would tell them what the flags were.
 
 `GraphClient` wraps `reqwest` and centralises the things every call needs:
 
+- **Endpoint** — `config::graph_base()`, normally the real Graph, overridable
+  with `M365_GRAPH_BASE`. Pointing it at a local mock lets the whole UI run on
+  fabricated data: useful offline, and necessary for recording a demo without a
+  real mailbox on screen. Combined with a stub token cache (`auth.rs` checks a
+  cached token's expiry, never its scopes) the app never contacts Microsoft.
 - **Throttling** — honours `Retry-After` on 429, exponential backoff on 5xx.
 - **Auth retry** — one forced token refresh on a 401.
 - **Paging** — `get_page` (single page), `get_page_with_next` (page + a

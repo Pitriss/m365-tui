@@ -10,3 +10,6 @@ deploy/m365-webhook
 target-musl/
 # direnv cache (the .envrc itself is committed)
 .direnv/
+
+# demo data + mock Graph (local only, never committed)
+demo/

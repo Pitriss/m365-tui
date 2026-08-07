@@ -11,7 +11,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::auth::Authenticator;
-use crate::config::GRAPH_BASE;
 
 const MAX_RETRIES: u32 = 5;
 
@@ -39,7 +38,7 @@ impl GraphClient {
                 .build()
                 .expect("building reqwest client"),
             auth,
-            base: GRAPH_BASE.to_string(),
+            base: crate::config::graph_base(),
         }
     }
 

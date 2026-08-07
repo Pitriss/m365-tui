@@ -7,6 +7,19 @@ use anyhow::{Context, Result};
 /// Microsoft Graph base URL (v1.0 endpoint).
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
+/// The Graph endpoint to talk to, overridable with `M365_GRAPH_BASE`.
+///
+/// Pointing this at a local mock lets the app run on fabricated data — useful
+/// for recording a demo without a real mailbox on screen, and for exercising the
+/// UI offline. Unset in normal use.
+pub fn graph_base() -> String {
+    std::env::var("M365_GRAPH_BASE")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| GRAPH_BASE.to_string())
+}
+
 /// The delegated scopes the app requests. `offline_access` is required for
 /// refresh tokens; `openid`/`profile` give us the signed-in user's identity.
 ///
@@ -238,6 +251,21 @@ mod tests {
             c.lifecycle_url().as_deref(),
             Some("https://m365.example.com/lifecycle")
         );
+    }
+
+    #[test]
+    fn graph_base_defaults_to_the_real_endpoint() {
+        // Serialised with the override test below: both touch process env.
+        std::env::remove_var("M365_GRAPH_BASE");
+        assert_eq!(graph_base(), GRAPH_BASE);
+
+        std::env::set_var("M365_GRAPH_BASE", "http://127.0.0.1:8765/v1.0/");
+        assert_eq!(graph_base(), "http://127.0.0.1:8765/v1.0");
+
+        // Empty means "not set", so an unfilled .env entry can't break the app.
+        std::env::set_var("M365_GRAPH_BASE", "  ");
+        assert_eq!(graph_base(), GRAPH_BASE);
+        std::env::remove_var("M365_GRAPH_BASE");
     }
 
     #[test]

@@ -3,6 +3,8 @@
 A terminal client for **Outlook and Microsoft Teams**, in one app. Switch
 between the two with `F2`.
 
+![Reading an HTML email in the terminal, then jumping from its sender straight into a Teams chat with them](demo.gif)
+
 - **Outlook** — read mail with proper HTML rendering, compose / reply /
   reply-all / forward, send and save attachments, search, and a 7-day calendar
   with RSVP.
