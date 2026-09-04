@@ -4,6 +4,7 @@ name: release
 # The workflow creates its own release tag, so no manual tagging is required.
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
