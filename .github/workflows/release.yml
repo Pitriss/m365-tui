@@ -1,13 +1,14 @@
 name: release
 
-# Build and publish a GitHub Release after CI succeeds on main.
-# Manual workflow_dispatch is kept as a fallback.
+# Build and publish a GitHub Release when explicitly dispatched.
+# CI dispatches this workflow only after all required checks succeed on main.
 on:
-  workflow_run:
-    workflows: ["ci"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit SHA to build and publish
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -15,29 +16,29 @@ permissions:
 jobs:
   meta:
     name: Release metadata
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       name: ${{ steps.meta.outputs.name }}
       commit: ${{ steps.meta.outputs.commit }}
+
     steps:
       - name: Generate release metadata
         id: meta
         shell: bash
         env:
-          COMMIT_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          REQUESTED_SHA: ${{ inputs.commit_sha }}
         run: |
           set -euo pipefail
-          short_sha="${COMMIT_SHA::7}"
+
+          commit="${REQUESTED_SHA:-$GITHUB_SHA}"
+          short_sha="${commit::7}"
           tag="build-${GITHUB_RUN_NUMBER}-${short_sha}"
           name="Build ${GITHUB_RUN_NUMBER} (${short_sha})"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "commit=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.arch }}
