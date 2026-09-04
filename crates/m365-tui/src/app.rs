@@ -34,6 +34,8 @@ pub enum AppMessage {
         mode: ListUpdate,
     },
     MessageBody(MailMessage),
+    AutoMarkReadDue { id: String, generation: u64 },
+    MailRead { id: String, read: bool },
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
     ChatMessages {
@@ -434,6 +436,8 @@ pub struct App {
     /// Largest useful reading-pane scroll offset, set by the renderer once it
     /// knows the wrapped height of the open message.
     pub reading_max_scroll: std::cell::Cell<u16>,
+    /// Generation token used to invalidate delayed automatic read timers.
+    read_timer_generation: u64,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -477,6 +481,7 @@ impl App {
             status_ticks: 0,
             text_width_hint: std::cell::Cell::new(60),
             reading_max_scroll: std::cell::Cell::new(0),
+            read_timer_generation: 0,
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
@@ -683,6 +688,62 @@ impl App {
         });
     }
 
+
+    fn cancel_read_timer(&mut self) {
+        self.read_timer_generation = self.read_timer_generation.wrapping_add(1);
+    }
+
+    fn schedule_read_timer(&mut self, id: String) {
+        self.cancel_read_timer();
+        let generation = self.read_timer_generation;
+        let timeout = self.session.config.read_msg_timeout;
+        self.spawn(async move {
+            if timeout > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
+            }
+            Ok(AppMessage::AutoMarkReadDue { id, generation })
+        });
+    }
+
+    fn schedule_current_read_timer(&mut self) {
+        if self.screen != Screen::Outlook || self.outlook_focus != OutlookFocus::Reading {
+            return;
+        }
+        let id = match self.outlook.reading.as_ref() {
+            Some(message) if !message.is_read.unwrap_or(false) => message.id.clone(),
+            _ => return,
+        };
+        self.schedule_read_timer(id);
+    }
+
+    fn set_mail_read(&mut self, id: String, read: bool) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            mail::mark_read(&s.graph, &id, read).await?;
+            Ok(AppMessage::MailRead { id, read })
+        });
+    }
+
+    fn toggle_current_mail_read(&mut self) {
+        let selected = if self.outlook_focus == OutlookFocus::Reading {
+            self.outlook
+                .reading
+                .as_ref()
+                .map(|message| (message.id.clone(), message.is_read.unwrap_or(false)))
+        } else {
+            self.current_mail()
+                .map(|message| (message.id.clone(), message.is_read.unwrap_or(false)))
+        };
+        let Some((id, is_read)) = selected else {
+            self.status = "select a message first".into();
+            return;
+        };
+        self.cancel_read_timer();
+        let read = !is_read;
+        self.status = format!("marking as {}…", if read { "read" } else { "unread" });
+        self.set_mail_read(id, read);
+    }
+
     fn load_calendar(&self) {
         let s = self.session.clone();
         // Today .. +7 days in UTC.
@@ -887,6 +948,7 @@ impl App {
                     .min(self.outlook.messages.len().saturating_sub(1));
             }
             AppMessage::MessageBody(m) => {
+                self.cancel_read_timer();
                 let (ct, raw) = match &m.body {
                     Some(b) => (
                         b.content_type.as_deref(),
@@ -903,6 +965,35 @@ impl App {
                     self.load_attachments(m.id.clone());
                 }
                 self.outlook.reading = Some(m);
+                self.schedule_current_read_timer();
+            }
+            AppMessage::AutoMarkReadDue { id, generation } => {
+                let still_open = generation == self.read_timer_generation
+                    && self.screen == Screen::Outlook
+                    && self.outlook_focus == OutlookFocus::Reading
+                    && self
+                        .outlook
+                        .reading
+                        .as_ref()
+                        .is_some_and(|message| {
+                            message.id == id && !message.is_read.unwrap_or(false)
+                        });
+                if still_open {
+                    self.cancel_read_timer();
+                    self.set_mail_read(id, true);
+                }
+            }
+            AppMessage::MailRead { id, read } => {
+                if let Some(message) = self.outlook.messages.iter_mut().find(|m| m.id == id) {
+                    message.is_read = Some(read);
+                }
+                if let Some(message) = self.outlook.reading.as_mut() {
+                    if message.id == id {
+                        message.is_read = Some(read);
+                    }
+                }
+                self.status = format!("marked as {}", if read { "read" } else { "unread" });
+                self.load_folders();
             }
             AppMessage::Calendar(e) => self.outlook.calendar = e,
             AppMessage::Chats(c) => {
@@ -946,6 +1037,7 @@ impl App {
                 self.refresh_current();
             }
             AppMessage::OpenChat(Some(id)) => {
+                self.cancel_read_timer();
                 self.screen = Screen::Teams;
                 self.teams.mode = TeamsMode::Chats;
                 self.teams.open_chat_id = Some(id.clone());
@@ -1481,10 +1573,16 @@ impl App {
                 return;
             }
             (KeyCode::F(2), _) => {
+                if self.screen == Screen::Outlook && self.outlook_focus == OutlookFocus::Reading {
+                    self.cancel_read_timer();
+                }
                 self.screen = match self.screen {
                     Screen::Outlook => Screen::Teams,
                     Screen::Teams => Screen::Outlook,
                 };
+                if self.screen == Screen::Outlook && self.outlook_focus == OutlookFocus::Reading {
+                    self.schedule_current_read_timer();
+                }
                 return;
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
@@ -1532,11 +1630,17 @@ impl App {
     fn on_key_outlook(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab => {
+                if self.outlook_focus == OutlookFocus::Reading {
+                    self.cancel_read_timer();
+                }
                 self.outlook_focus = match self.outlook_focus {
                     OutlookFocus::Folders => OutlookFocus::Messages,
                     OutlookFocus::Messages => OutlookFocus::Reading,
                     OutlookFocus::Reading => OutlookFocus::Folders,
                 };
+                if self.outlook_focus == OutlookFocus::Reading {
+                    self.schedule_current_read_timer();
+                }
             }
             KeyCode::Char('g') => self.load_calendar_and_show(),
             KeyCode::Char('c') => {
@@ -1550,6 +1654,12 @@ impl App {
             KeyCode::Char('r') => self.open_reply(ReplyMode::Reply),
             KeyCode::Char('a') => self.open_reply(ReplyMode::ReplyAll),
             KeyCode::Char('f') => self.open_reply(ReplyMode::Forward),
+            KeyCode::Char('u')
+                if key.modifiers == KeyModifiers::NONE
+                    && self.outlook_focus != OutlookFocus::Folders =>
+            {
+                self.toggle_current_mail_read();
+            }
             KeyCode::Up | KeyCode::Char('k') => self.outlook_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.outlook_move(1),
             KeyCode::PageUp => self.outlook_move(-10),
@@ -1607,6 +1717,9 @@ impl App {
 
     /// Move focus one pane left: Reading → Messages → Folders.
     fn outlook_out(&mut self) {
+        if self.outlook_focus == OutlookFocus::Reading {
+            self.cancel_read_timer();
+        }
         self.outlook_focus = match self.outlook_focus {
             OutlookFocus::Reading => OutlookFocus::Messages,
             OutlookFocus::Messages | OutlookFocus::Folders => OutlookFocus::Folders,
@@ -1633,6 +1746,7 @@ impl App {
             OutlookFocus::Messages | OutlookFocus::Reading => {
                 if let Some(m) = self.current_mail() {
                     let id = m.id.clone();
+                    self.cancel_read_timer();
                     self.load_body(id);
                     self.outlook_focus = OutlookFocus::Reading;
                 }
@@ -2227,8 +2341,14 @@ impl App {
     fn run_command(&mut self, id: &str) {
         self.overlay = None;
         match id {
-            "outlook" => self.screen = Screen::Outlook,
+            "outlook" => {
+                self.screen = Screen::Outlook;
+                if self.outlook_focus == OutlookFocus::Reading {
+                    self.schedule_current_read_timer();
+                }
+            }
             "teams" => {
+                self.cancel_read_timer();
                 self.screen = Screen::Teams;
                 if self.teams.chats.is_empty() {
                     self.load_chats();
