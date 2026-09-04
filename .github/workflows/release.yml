@@ -1,18 +1,37 @@
 name: release
 
-# Build and publish a GitHub Release whenever a version tag is pushed.
-#   git tag v1.2.0 && git push origin v1.2.0
+# Build and publish a GitHub Release automatically for every push to main.
+# The workflow creates its own release tag, so no manual tagging is required.
 on:
   push:
-    tags:
-      - "v*.*"
+    branches:
+      - main
 
 permissions:
-  contents: write # needed to create the release and upload assets
+  contents: write
 
 jobs:
+  meta:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      name: ${{ steps.meta.outputs.name }}
+    steps:
+      - name: Generate release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          tag="build-${GITHUB_RUN_NUMBER}-${short_sha}"
+          name="Build ${GITHUB_RUN_NUMBER} (${short_sha})"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: meta
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -23,16 +42,15 @@ jobs:
             runner: ubuntu-latest
           - arch: aarch64
             target: aarch64-unknown-linux-musl
-            # Native ARM runner rather than a cross toolchain: musl-tools then
-            # provides a matching musl-gcc and nothing has to be cross-linked.
             runner: ubuntu-24.04-arm
+
     env:
       TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v4
 
-      # Static musl build so the binaries run anywhere (incl. NixOS) with no
-      # glibc dependency. reqwest uses rustls, so no OpenSSL is needed.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Install Rust (musl target)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,12 +67,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target "$TARGET" -p m365-tui -p webhook
 
-      # The realtime bundle wraps this binary in Alpine, which can only run it if
-      # it's genuinely static. A dynamically-linked build would pass CI here and
-      # then fail inside the container with an unhelpful "not found". Note a Rust
-      # musl release is "static-pie linked", not "statically linked", so this
-      # tests for the absence of the dynamic marker rather than a static one.
       - name: Verify the binaries are static
+        shell: bash
         run: |
           set -euo pipefail
           for bin in m365 m365-webhook; do
@@ -62,24 +76,20 @@ jobs:
             echo "$bin: $desc"
             case "$desc" in
               *"dynamically linked"*)
-                echo "::error::$bin is dynamically linked"; exit 1 ;;
+                echo "::error::$bin is dynamically linked"
+                exit 1
+                ;;
             esac
           done
 
-      # ONE asset per architecture. An earlier version published the app and the
-      # optional push stack separately, which meant the releases page offered two
-      # similarly-named tarballs with no way to tell which one was the program —
-      # and the wrong guess produced a download containing no `m365` at all.
-      # Everything ships together instead; the push stack is a subdirectory you
-      # only enter if you want it.
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
-          # The extracted directory carries the version, but the asset name is
-          # kept stable so /releases/latest/download/<asset> always resolves —
-          # that's what the README's install one-liner relies on.
-          dir="m365-tui-${GITHUB_REF_NAME}"
+
+          dir="m365-tui-${{ needs.meta.outputs.tag }}"
           asset="m365-tui-${{ matrix.arch }}-linux-musl.tar.gz"
+
           mkdir -p "dist/$dir/realtime"
 
           cp "target/$TARGET/release/m365" "dist/$dir/"
@@ -88,10 +98,13 @@ jobs:
 
           cp deploy/docker-compose.yml deploy/Dockerfile deploy/.env.example \
              deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/realtime/"
-          # A second copy of the webhook, so `docker build` inside realtime/ has a
-          # self-contained context and its Dockerfile stays a plain COPY.
+
           cp "target/$TARGET/release/m365-webhook" "dist/$dir/realtime/"
-          chmod +x "dist/$dir/realtime/up.sh" "dist/$dir/realtime/down.sh" \
+
+          chmod +x "dist/$dir/m365" \
+                   "dist/$dir/m365-webhook" \
+                   "dist/$dir/realtime/up.sh" \
+                   "dist/$dir/realtime/down.sh" \
                    "dist/$dir/realtime/m365-webhook"
 
           tar -C dist -czf "$asset" "$dir"
@@ -108,8 +121,11 @@ jobs:
 
   publish:
     name: Publish release
-    needs: build
+    needs:
+      - meta
+      - build
     runs-on: ubuntu-latest
+
     steps:
       - name: Collect every architecture's assets
         uses: actions/download-artifact@v4
@@ -119,8 +135,11 @@ jobs:
           path: dist
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.meta.outputs.name }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
