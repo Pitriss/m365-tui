@@ -85,10 +85,25 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!(" {name} "), Style::default().fg(DIM))
         }
     };
+    let outlook_unread = app
+        .outlook
+        .folders
+        .iter()
+        .any(|folder| folder.unread_item_count.unwrap_or(0) > 0);
+    let outlook_tab = if outlook_unread {
+        "Outlook (F2) *"
+    } else {
+        "Outlook (F2)"
+    };
+    let teams_tab = if app.teams_unread {
+        "Teams (F2) *"
+    } else {
+        "Teams (F2)"
+    };
     let tabs = Line::from(vec![
-        tab("Outlook (F2)", app.screen == Screen::Outlook),
+        tab(outlook_tab, app.screen == Screen::Outlook),
         Span::raw("  "),
-        tab("Teams (F2)", app.screen == Screen::Teams),
+        tab(teams_tab, app.screen == Screen::Teams),
     ]);
 
     // Right-hand state: presence · push · memory · last sync.

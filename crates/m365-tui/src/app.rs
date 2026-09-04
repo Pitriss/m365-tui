@@ -438,6 +438,8 @@ pub struct App {
     pub reading_max_scroll: std::cell::Cell<u16>,
     /// Generation token used to invalidate delayed automatic read timers.
     read_timer_generation: u64,
+    /// A new Teams chat message arrived since Teams was last opened.
+    pub teams_unread: bool,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -482,6 +484,7 @@ impl App {
             text_width_hint: std::cell::Cell::new(60),
             reading_max_scroll: std::cell::Cell::new(0),
             read_timer_generation: 0,
+            teams_unread: false,
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
@@ -1048,6 +1051,7 @@ impl App {
             AppMessage::OpenChat(Some(id)) => {
                 self.cancel_read_timer();
                 self.screen = Screen::Teams;
+                self.teams_unread = false;
                 self.teams.mode = TeamsMode::Chats;
                 self.teams.open_chat_id = Some(id.clone());
                 self.teams.focus = TeamsFocus::Messages;
@@ -1350,9 +1354,6 @@ impl App {
     /// Raise notifications for chats whose newest message changed: direct
     /// messages always, group chats only when they `@mention` the user.
     fn notify_for_chats(&mut self, chats: &[Chat]) {
-        if !self.session.config.notifications {
-            return;
-        }
         let my_id = self.me.as_ref().map(|m| m.id.clone());
         let my_name = self.me.as_ref().and_then(|m| m.display_name.clone());
 
@@ -1391,6 +1392,12 @@ impl App {
                 .and_then(|f| f.user.as_ref())
                 .and_then(|u| u.id.as_deref());
             if from_id.is_some() && from_id == my_id.as_deref() {
+                continue;
+            }
+            if self.screen != Screen::Teams {
+                self.teams_unread = true;
+            }
+            if !self.session.config.notifications {
                 continue;
             }
             if !self.notified.insert(msg_id.clone()) {
@@ -1589,6 +1596,9 @@ impl App {
                     Screen::Outlook => Screen::Teams,
                     Screen::Teams => Screen::Outlook,
                 };
+                if self.screen == Screen::Teams {
+                    self.teams_unread = false;
+                }
                 if self.screen == Screen::Outlook && self.outlook_focus == OutlookFocus::Reading {
                     self.schedule_current_read_timer();
                 }
@@ -2359,6 +2369,7 @@ impl App {
             "teams" => {
                 self.cancel_read_timer();
                 self.screen = Screen::Teams;
+                self.teams_unread = false;
                 if self.teams.chats.is_empty() {
                     self.load_chats();
                 }
