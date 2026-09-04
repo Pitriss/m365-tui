@@ -709,8 +709,17 @@ impl App {
         if self.screen != Screen::Outlook || self.outlook_focus != OutlookFocus::Reading {
             return;
         }
+
+        let Some(current_id) = self.current_mail().map(|message| message.id.clone()) else {
+            return;
+        };
+
         let id = match self.outlook.reading.as_ref() {
-            Some(message) if !message.is_read.unwrap_or(false) => message.id.clone(),
+            Some(message)
+                if message.id == current_id && !message.is_read.unwrap_or(false) =>
+            {
+                message.id.clone()
+            }
             _ => return,
         };
         self.schedule_read_timer(id);
