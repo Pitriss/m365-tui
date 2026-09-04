@@ -182,8 +182,8 @@ fn context_hints(app: &App) -> &'static str {
     match app.screen {
         Screen::Outlook => match app.outlook_focus {
             OutlookFocus::Folders => "j/k move · l open folder",
-            OutlookFocus::Messages => "j/k move · l read · h back · c compose · r reply · / search",
-            OutlookFocus::Reading => "j/k scroll · h back · o links · A attach · y copy",
+            OutlookFocus::Messages => "j/k move · l read · u read/unread · h back · c compose · r reply · / search",
+            OutlookFocus::Reading => "j/k scroll · u read/unread · h back · o links · A attach · y copy",
         },
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · l open · t chats/channels",
@@ -701,8 +701,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
           j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
  \n\
- Outlook: Enter open · c compose · r reply · a reply-all · f forward\n\
-          / search · g calendar · in the reading pane j/k scroll\n\
+ Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
+          f forward · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           i type message · r reply to selected · Enter send\n\

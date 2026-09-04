@@ -71,6 +71,9 @@ pub struct Config {
     pub client_state: String,
     /// Desktop notifications for direct messages and `@mentions`.
     pub notifications: bool,
+    /// Seconds an unread message must remain open before it is marked read.
+    /// Zero marks it read immediately after the body is displayed.
+    pub read_msg_timeout: u64,
 }
 
 impl Config {
@@ -122,6 +125,13 @@ impl Config {
             std::env::var("M365_NOTIFY").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         );
+        let read_msg_timeout = match std::env::var("M365_READ_MSG_TIMEOUT") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<u64>()
+                .context("M365_READ_MSG_TIMEOUT must be an integer number of seconds")?,
+            _ => 0,
+        };
 
         Ok(Self {
             client_id,
@@ -132,6 +142,7 @@ impl Config {
             token_cache_path,
             client_state,
             notifications,
+            read_msg_timeout,
         })
     }
 
@@ -232,6 +243,7 @@ mod tests {
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
             notifications: true,
+            read_msg_timeout: 0,
         }
     }
 
