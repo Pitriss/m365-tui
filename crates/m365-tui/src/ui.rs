@@ -216,7 +216,8 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             let unread = folder.unread_item_count.unwrap_or(0);
             let name = folder.display_name.clone().unwrap_or_default();
             let label = if unread > 0 {
-                format!("{name} ({unread})")
+                let count = if unread > 99 { "+".to_string() } else { unread.to_string() };
+                format!("{name} [{count}]")
             } else {
                 name
             };
