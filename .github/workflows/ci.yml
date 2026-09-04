@@ -7,6 +7,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  actions: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -45,3 +49,25 @@ jobs:
 
       - name: Validate the compose file
         run: docker compose -f deploy/docker-compose.yml --profile quick config -q
+
+  release:
+    name: Trigger release
+    needs:
+      - rust
+      - scripts
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Trigger release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f commit_sha="$GITHUB_SHA"
