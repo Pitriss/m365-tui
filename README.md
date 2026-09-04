@@ -401,3 +401,19 @@ MIT — see [LICENSE](LICENSE).
 
 Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 "Teams" are trademarks of Microsoft Corporation.
+
+## Local enhancements
+
+This fork includes a small set of usability improvements focused on Outlook mail handling and unread indicators:
+
+- Added configurable delayed marking of Outlook messages as read using `M365_READ_MSG_TIMEOUT`.
+- Added the `u` key to toggle the selected Outlook message between read and unread.
+- Added protection so the automatic read timer only applies to the message that is currently selected and displayed.
+- Added unread message counts to Outlook folders:
+  - `[1]`–`[99]` for unread counts up to 99.
+  - `[+]` for counts greater than 99.
+- Added an `*` indicator to the Outlook application tab when unread mail exists.
+- Added an `*` indicator to the Teams application tab when a new chat message arrives while Teams is not open.
+- The Teams unread indicator is cleared when the Teams view is opened.
+
+These changes were developed and tested with assistance from ChatGPT by OpenAI.
