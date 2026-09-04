@@ -1,0 +1,148 @@
+name: release
+
+# Build and publish a GitHub Release automatically for every push to main.
+# The workflow creates its own release tag, so no manual tagging is required.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      name: ${{ steps.meta.outputs.name }}
+    steps:
+      - name: Generate release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          tag="build-${GITHUB_RUN_NUMBER}-${short_sha}"
+          name="Build ${GITHUB_RUN_NUMBER} (${short_sha})"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+
+    env:
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET" -p m365-tui -p webhook
+
+      - name: Verify the binaries are static
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in m365 m365-webhook; do
+            desc=$(file -b "target/$TARGET/release/$bin")
+            echo "$bin: $desc"
+            case "$desc" in
+              *"dynamically linked"*)
+                echo "::error::$bin is dynamically linked"
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dir="m365-tui-${{ needs.meta.outputs.tag }}"
+          asset="m365-tui-${{ matrix.arch }}-linux-musl.tar.gz"
+
+          mkdir -p "dist/$dir/realtime"
+
+          cp "target/$TARGET/release/m365" "dist/$dir/"
+          cp "target/$TARGET/release/m365-webhook" "dist/$dir/"
+          cp README.md ARCHITECTURE.md LICENSE "dist/$dir/"
+
+          cp deploy/docker-compose.yml deploy/Dockerfile deploy/.env.example \
+             deploy/README.md deploy/up.sh deploy/down.sh "dist/$dir/realtime/"
+
+          cp "target/$TARGET/release/m365-webhook" "dist/$dir/realtime/"
+
+          chmod +x "dist/$dir/m365" \
+                   "dist/$dir/m365-webhook" \
+                   "dist/$dir/realtime/up.sh" \
+                   "dist/$dir/realtime/down.sh" \
+                   "dist/$dir/realtime/m365-webhook"
+
+          tar -C dist -czf "$asset" "$dir"
+          sha256sum "$asset" > "$asset.sha256"
+
+      - name: Upload for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs:
+      - meta
+      - build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Collect every architecture's assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.meta.outputs.name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
