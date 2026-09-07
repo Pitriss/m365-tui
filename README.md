@@ -404,7 +404,7 @@ Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 
 ## Local enhancements
 
-This fork includes a small set of usability improvements focused on Outlook mail handling and unread indicators:
+This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, and polling feedback.
 
 - Added configurable delayed marking of Outlook messages as read using `M365_READ_MSG_TIMEOUT`.
 - Added the `u` key to toggle the selected Outlook message between read and unread.
@@ -442,6 +442,7 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Tree guide characters use the same dimmed colour as the polling progress indicator.
 - Top-level folders remain unprefixed.
 - Existing unread counts (`[1]`–`[99]`, `[+]`) are preserved unchanged.
+- Outlook folder unread counts are right-aligned for a cleaner and more consistent layout.
 - Folder loading and unread-count logic are unchanged; this is a visual-only improvement.
 
 ### Polling progress indicator
