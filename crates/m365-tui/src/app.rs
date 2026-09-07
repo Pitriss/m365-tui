@@ -606,7 +606,43 @@ impl App {
 
     fn load_folders(&self) {
         let s = self.session.clone();
-        self.spawn(async move { Ok(AppMessage::Folders(mail::list_folders(&s.graph).await?)) });
+        self.spawn(async move {
+            let roots = mail::list_folders(&s.graph).await?;
+            let mut folders = Vec::new();
+
+            // Depth-first traversal. Reverse-pushing preserves the order
+            // returned by Graph while keeping every parent before its children.
+            let mut stack = roots
+                .into_iter()
+                .rev()
+                .map(|folder| (folder, 0usize))
+                .collect::<Vec<_>>();
+
+            while let Some((mut folder, depth)) = stack.pop() {
+                let child_count = folder.child_folder_count.unwrap_or(0);
+                let folder_id = folder.id.clone();
+
+                // Keep the existing flat folder-pane model. Only the label is
+                // indented; id and unread count remain unchanged.
+                if depth > 0 {
+                    if let Some(name) = folder.display_name.as_mut() {
+                        *name = format!("{}{name}", "  ".repeat(depth));
+                    }
+                }
+
+                folders.push(folder);
+
+                // Avoid an extra Graph request for leaf folders.
+                if child_count > 0 {
+                    let children = mail::list_child_folders(&s.graph, &folder_id).await?;
+                    for child in children.into_iter().rev() {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+
+            Ok(AppMessage::Folders(folders))
+        });
     }
 
     fn load_messages(&self, folder_id: String, mode: ListUpdate) {
