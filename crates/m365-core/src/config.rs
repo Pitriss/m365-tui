@@ -78,6 +78,9 @@ pub struct Config {
     pub presence_read: bool,
     /// Keep an Available application presence session active while the TUI runs.
     pub presence_primary: bool,
+    /// Minutes of local inactivity before an automatic primary session becomes Away.
+    /// Zero disables the automatic Away transition.
+    pub presence_available_timeout_min: u64,
 }
 
 impl Config {
@@ -87,6 +90,13 @@ impl Config {
         let client_id = env_required("M365_CLIENT_ID")?;
         let tenant_id = std::env::var("M365_TENANT_ID").unwrap_or_else(|_| "organizations".into());
         let presence_primary = env_flag("M365_PRESENCE_PRIMARY");
+        let presence_available_timeout_min =
+            match std::env::var("M365_PRESENCE_AVAILABLE_TIMEOUT_MIN") {
+                Ok(value) if !value.trim().is_empty() => value.trim().parse::<u64>().context(
+                    "M365_PRESENCE_AVAILABLE_TIMEOUT_MIN must be an integer number of minutes",
+                )?,
+                _ => 5,
+            };
 
         let scopes = match std::env::var("M365_SCOPES") {
             Ok(s) if !s.trim().is_empty() => {
@@ -151,6 +161,7 @@ impl Config {
             read_msg_timeout,
             presence_read,
             presence_primary,
+            presence_available_timeout_min,
         })
     }
 
@@ -254,6 +265,7 @@ mod tests {
             read_msg_timeout: 0,
             presence_read: false,
             presence_primary: false,
+            presence_available_timeout_min: 5,
         }
     }
 

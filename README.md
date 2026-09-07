@@ -458,4 +458,15 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - The polling progress indicator has been tested in poll-only mode.
 - The behavior with a fully working push connection has not yet been tested by the maintainer.
 
+### Primary Teams presence
+
+- `M365_PRESENCE_PRIMARY=1` makes m365-tui publish its own Teams application presence session while it is running.
+- The automatic session starts as `Available` without setting a sticky user-preferred presence, so higher-priority states such as `Busy` or `DoNotDisturb` from other Teams clients can still take precedence.
+- When default scopes are used, primary presence automatically enables the required `Presence.ReadWrite` scope. If `M365_SCOPES` is set explicitly, it must include `Presence.ReadWrite`.
+- `M365_PRESENCE_AVAILABLE_TIMEOUT_MIN` controls how long the TUI remains `Available` without local activity. The default is 5 minutes.
+- After the timeout the automatic session changes to `Away`; any keypress or terminal paste changes it back to `Available`.
+- Set `M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=0` to disable the automatic `Available` -> `Away` transition.
+- Manually selecting a presence status disables the idle automation so it cannot overwrite `Busy`, `DoNotDisturb`, or another explicitly selected state.
+- `Clear / revert to automatic` returns control to the automatic `Available` / `Away` mode when `M365_PRESENCE_PRIMARY=1`.
+
 These changes were developed and tested with assistance from ChatGPT by OpenAI.

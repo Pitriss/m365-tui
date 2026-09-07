@@ -438,6 +438,10 @@ pub struct App {
     /// last asserted — sessions expire, so they need renewing.
     pub presence_session: Option<(&'static str, &'static str)>,
     presence_session_at: Option<std::time::Instant>,
+    /// Whether Available/Away is currently managed by primary-presence mode.
+    presence_primary_auto: bool,
+    /// Last local keyboard/paste activity used by the primary-presence timer.
+    presence_last_activity: std::time::Instant,
     /// Resident memory in KiB, refreshed on each tick.
     pub rss_kb: Option<u64>,
     /// Copy of `status` as of the last tick, plus how many ticks it has been
@@ -493,6 +497,8 @@ impl App {
             mail_seen: None,
             presence_session: None,
             presence_session_at: None,
+            presence_primary_auto: false,
+            presence_last_activity: std::time::Instant::now(),
             rss_kb: read_rss_kb(),
             last_status: String::new(),
             status_ticks: 0,
@@ -559,6 +565,8 @@ impl App {
 
         self.presence_session = Some(("Available", "Available"));
         self.presence_session_at = Some(std::time::Instant::now());
+        self.presence_primary_auto = true;
+        self.presence_last_activity = std::time::Instant::now();
 
         let s = self.session.clone();
         let client_id = self.session.config.client_id.clone();
@@ -578,10 +586,79 @@ impl App {
         });
     }
 
+    /// Record local activity. If the automatic primary session had gone idle,
+    /// immediately publish Available again.
+    fn note_presence_activity(&mut self) {
+        if !self.session.config.presence_primary || !self.presence_primary_auto {
+            return;
+        }
+
+        self.presence_last_activity = std::time::Instant::now();
+        if self.presence_session == Some(("Available", "Available")) {
+            return;
+        }
+
+        self.presence_session = Some(("Available", "Available"));
+        self.presence_session_at = Some(std::time::Instant::now());
+        let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
+        self.spawn(async move {
+            people::set_session_presence(
+                &s.graph,
+                &client_id,
+                "Available",
+                "Available",
+                PRESENCE_SESSION_LEASE,
+            )
+            .await?;
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: Some("Available".to_string()),
+            })
+        });
+    }
+
+    /// Change the automatic primary session to Away after the configured period
+    /// of local inactivity. The normal UI Tick provides the timer cadence.
+    fn update_primary_presence_idle(&mut self) {
+        if !self.session.config.presence_primary || !self.presence_primary_auto {
+            return;
+        }
+
+        let timeout_min = self.session.config.presence_available_timeout_min;
+        if timeout_min == 0
+            || self.presence_last_activity.elapsed()
+                < std::time::Duration::from_secs(timeout_min.saturating_mul(60))
+            || self.presence_session == Some(("Away", "Away"))
+        {
+            return;
+        }
+
+        self.presence_session = Some(("Away", "Away"));
+        self.presence_session_at = Some(std::time::Instant::now());
+        let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
+        self.spawn(async move {
+            people::set_session_presence(
+                &s.graph,
+                &client_id,
+                "Away",
+                "Away",
+                PRESENCE_SESSION_LEASE,
+            )
+            .await?;
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: Some("Away".to_string()),
+            })
+        });
+    }
+
     /// Apply a chosen status: record the sticky preference *and* publish this
     /// app as a presence session, which is what actually makes the status
     /// visible when no Teams client is running.
     fn set_presence(&mut self, opt: &'static PresenceOption) {
+        self.presence_primary_auto = false;
         self.presence_session = opt.session;
         self.presence_session_at = Some(std::time::Instant::now());
 
@@ -634,13 +711,29 @@ impl App {
     }
 
     fn clear_presence(&mut self) {
-        self.presence_session = None;
-        self.presence_session_at = None;
+        let primary =
+            self.session.config.presence_primary && self.session.config.can_write_presence();
+        self.presence_primary_auto = primary;
+        self.presence_last_activity = std::time::Instant::now();
+        self.presence_session = primary.then_some(("Available", "Available"));
+        self.presence_session_at = primary.then_some(std::time::Instant::now());
+
         let s = self.session.clone();
         let client_id = self.session.config.client_id.clone();
         self.spawn(async move {
             people::clear_preferred_presence(&s.graph).await?;
-            let _ = people::clear_session_presence(&s.graph, &client_id).await;
+            if primary {
+                people::set_session_presence(
+                    &s.graph,
+                    &client_id,
+                    "Available",
+                    "Available",
+                    PRESENCE_SESSION_LEASE,
+                )
+                .await?;
+            } else {
+                let _ = people::clear_session_presence(&s.graph, &client_id).await;
+            }
             Ok(AppMessage::Presence {
                 presence: people::my_presence(&s.graph).await?,
                 requested: None,
@@ -1420,6 +1513,7 @@ impl App {
                 self.push = state;
             }
             AppMessage::Tick => {
+                self.update_primary_presence_idle();
                 self.rss_kb = read_rss_kb();
                 // Clear a message once it has sat unchanged for a while, so the
                 // status bar never shows something from half an hour ago.
@@ -1838,6 +1932,7 @@ impl App {
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        self.note_presence_activity();
         // Overlays capture input first.
         if self.overlay.is_some() {
             self.on_key_overlay(key);
@@ -2563,6 +2658,7 @@ impl App {
 
     /// Bracketed-paste text from the terminal.
     pub fn on_paste(&mut self, text: String) {
+        self.note_presence_activity();
         match self.overlay.take() {
             Some(Overlay::Compose(mut c)) => {
                 c.active_mut().insert_str(&text);
