@@ -186,6 +186,15 @@ pub struct Chat {
     pub members: Vec<ConversationMember>,
     #[serde(default)]
     pub last_message_preview: Option<LastMessagePreview>,
+    #[serde(default)]
+    pub viewpoint: Option<ChatViewpoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatViewpoint {
+    #[serde(default)]
+    pub last_message_read_date_time: Option<String>,
 }
 
 impl Chat {

@@ -426,6 +426,16 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Presence lookup failures are non-fatal and do not interrupt Teams chat functionality.
 - Status indicators: `●` Available, `●` Busy / In a call / In a meeting, `◐` Away / Be right back, `×` Do not disturb / Presenting, `○` Offline / unknown.
 
+### Teams unread counts
+
+- One-to-one Teams chats show the number of unread messages.
+- `[1]`–`[99]` show the exact unread count; `[+]` means 100 or more unread messages.
+- The unread indicator is right-aligned in the chat list.
+- Counts are derived from the server-side Teams read state, so reading a chat in another Teams client is reflected after the next refresh.
+- Messages sent by the signed-in user, deleted messages, and system event messages are not counted as unread.
+- Group and meeting chats do not show unread counts.
+- Presence indicators and unread counts are independent; unread counts remain visible even when contact presence is disabled.
+
 ### Polling progress indicator
 
 - When push notifications are off, the `push off` label is replaced by a 10-segment polling progress bar.

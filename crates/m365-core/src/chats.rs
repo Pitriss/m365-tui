@@ -28,6 +28,19 @@ pub async fn list_messages(
     graph.get_page_with_next(&path).await
 }
 
+/// List messages newest-first by creation time. Used for unread counting so
+/// paging can stop as soon as the chat viewpoint is reached.
+pub async fn list_messages_created_desc(
+    graph: &GraphClient,
+    chat_id: &str,
+    top: u32,
+) -> Result<(Vec<ChatMessage>, Option<String>)> {
+    let path = format!(
+        "me/chats/{chat_id}/messages?$top={top}&$orderby=createdDateTime desc"
+    );
+    graph.get_page_with_next(&path).await
+}
+
 /// Fetch the next (older) page from an `@odata.nextLink`.
 pub async fn list_messages_more(
     graph: &GraphClient,

@@ -573,20 +573,46 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                 .iter()
                 .map(|c| {
                     let label = c.label(me_id);
-                    if !app.session.config.presence_read {
-                        return ListItem::new(truncate(&label, 30));
-                    }
-
+                    let inner_width = cols[0].width.saturating_sub(3) as usize;
                     let Some(user_id) = c.peer_user_id(me_id) else {
-                        // Group/meeting chats deliberately have no presence.
-                        return ListItem::new(truncate(&label, 30));
+                        // Group/meeting chats deliberately have no presence or count.
+                        return ListItem::new(truncate(&label, inner_width));
                     };
+
+                    let unread = app.teams.chat_unread_counts.get(&c.id).copied().unwrap_or(0);
+                    let suffix = match unread {
+                        0 => String::new(),
+                        1..=99 => format!("[{unread}]"),
+                        _ => "[+]".to_string(),
+                    };
+                    let suffix_width = suffix.chars().count();
+
+                    if !app.session.config.presence_read {
+                        let label_width = inner_width.saturating_sub(suffix_width);
+                        let label = truncate(&label, label_width);
+                        let padding = inner_width
+                            .saturating_sub(label.chars().count() + suffix_width);
+                        return ListItem::new(format!(
+                            "{}{}{}",
+                            label,
+                            " ".repeat(padding),
+                            suffix
+                        ));
+                    }
 
                     let presence = app.teams.contact_presences.get(user_id);
                     let (symbol, color) = contact_presence_marker(presence);
+                    let prefix_width = 2usize;
+                    let label_width = inner_width.saturating_sub(prefix_width + suffix_width);
+                    let label = truncate(&label, label_width);
+                    let padding = inner_width.saturating_sub(
+                        prefix_width + label.chars().count() + suffix_width,
+                    );
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("{symbol} "), Style::default().fg(color)),
-                        Span::raw(truncate(&label, 28)),
+                        Span::raw(label),
+                        Span::raw(" ".repeat(padding)),
+                        Span::raw(suffix),
                     ]))
                 })
                 .collect();
