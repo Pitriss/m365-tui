@@ -74,6 +74,8 @@ pub struct Config {
     /// Seconds an unread message must remain open before it is marked read.
     /// Zero marks it read immediately after the body is displayed.
     pub read_msg_timeout: u64,
+    /// Show presence indicators for contacts in one-to-one Teams chats.
+    pub presence_read: bool,
 }
 
 impl Config {
@@ -132,6 +134,7 @@ impl Config {
                 .context("M365_READ_MSG_TIMEOUT must be an integer number of seconds")?,
             _ => 0,
         };
+        let presence_read = env_flag("M365_PRESENCE_READ");
 
         Ok(Self {
             client_id,
@@ -143,6 +146,7 @@ impl Config {
             client_state,
             notifications,
             read_msg_timeout,
+            presence_read,
         })
     }
 
@@ -244,6 +248,7 @@ mod tests {
             client_state: "secret".into(),
             notifications: true,
             read_msg_timeout: 0,
+            presence_read: false,
         }
     }
 

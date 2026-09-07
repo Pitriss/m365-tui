@@ -522,6 +522,34 @@ const RUN_GAP_MINUTES: i64 = 15;
 // Teams
 // ---------------------------------------------------------------------------
 
+fn contact_presence_marker(
+    presence: Option<&m365_core::models::Presence>,
+) -> (&'static str, Color) {
+    let availability = presence
+        .and_then(|p| p.availability.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let activity = presence
+        .and_then(|p| p.activity.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if activity == "presenting" || availability == "donotdisturb" {
+        ("×", Color::Red)
+    } else if activity == "inacall"
+        || activity == "inameeting"
+        || availability.starts_with("busy")
+    {
+        ("●", Color::Yellow)
+    } else if availability == "away" || availability == "berightback" {
+        ("◐", Color::Yellow)
+    } else if availability.starts_with("available") {
+        ("●", Color::LightGreen)
+    } else {
+        ("○", Color::DarkGray)
+    }
+}
+
 fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -537,7 +565,24 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                 .teams
                 .chats
                 .iter()
-                .map(|c| ListItem::new(truncate(&c.label(me_id), 30)))
+                .map(|c| {
+                    let label = c.label(me_id);
+                    if !app.session.config.presence_read {
+                        return ListItem::new(truncate(&label, 30));
+                    }
+
+                    let Some(user_id) = c.peer_user_id(me_id) else {
+                        // Group/meeting chats deliberately have no presence.
+                        return ListItem::new(truncate(&label, 30));
+                    };
+
+                    let presence = app.teams.contact_presences.get(user_id);
+                    let (symbol, color) = contact_presence_marker(presence);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{symbol} "), Style::default().fg(color)),
+                        Span::raw(truncate(&label, 28)),
+                    ]))
+                })
                 .collect();
             ("Chats (t→channels)", items, app.teams.chat_sel)
         }
