@@ -39,6 +39,7 @@ pub enum AppMessage {
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
     ContactPresences(Vec<Presence>),
+    ChatUnreadCount { chat_id: String, count: usize },
     ChatMessages {
         chat_id: String,
         messages: Vec<ChatMessage>,
@@ -348,6 +349,8 @@ pub struct TeamsState {
     pub chat_sel: usize,
     /// Presence by directory user id for one-to-one chat contacts.
     pub contact_presences: std::collections::HashMap<String, Presence>,
+    /// Server-derived unread message count by one-to-one chat id.
+    pub chat_unread_counts: std::collections::HashMap<String, usize>,
     pub teams: Vec<Team>,
     pub team_sel: usize,
     pub channels: Vec<m365_core::models::Channel>,
@@ -380,6 +383,7 @@ impl Default for TeamsState {
             chats: Vec::new(),
             chat_sel: 0,
             contact_presences: std::collections::HashMap::new(),
+            chat_unread_counts: std::collections::HashMap::new(),
             teams: Vec::new(),
             team_sel: 0,
             channels: Vec::new(),
@@ -858,6 +862,135 @@ impl App {
         });
     }
 
+    fn refresh_chat_unread_counts(&mut self, chats_list: &[Chat]) {
+        let Some(me_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            return;
+        };
+
+        let candidates: Vec<(String, String)> = chats_list
+            .iter()
+            .filter_map(|chat| {
+                // Counts are intentionally limited to one-to-one chats.
+                chat.peer_user_id(Some(&me_id))?;
+
+                let read_at = chat
+                    .viewpoint
+                    .as_ref()?
+                    .last_message_read_date_time
+                    .as_deref()?;
+                let latest_at = chat
+                    .last_message_preview
+                    .as_ref()?
+                    .created_date_time
+                    .as_deref()?;
+
+                let read_at_parsed = chrono::DateTime::parse_from_rfc3339(read_at).ok()?;
+                let latest_at_parsed = chrono::DateTime::parse_from_rfc3339(latest_at).ok()?;
+                (latest_at_parsed > read_at_parsed)
+                    .then(|| (chat.id.clone(), read_at.to_string()))
+            })
+            .collect();
+
+        // Immediately remove counts for chats that the server viewpoint now
+        // considers read, while preserving known counts during a refresh.
+        let candidate_ids: std::collections::HashSet<&str> =
+            candidates.iter().map(|(id, _)| id.as_str()).collect();
+        self.teams
+            .chat_unread_counts
+            .retain(|id, _| candidate_ids.contains(id.as_str()));
+
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            for (chat_id, read_at) in candidates {
+                let read_at = match chrono::DateTime::parse_from_rfc3339(&read_at) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+
+                let mut count = 0usize;
+                let mut next: Option<String> = None;
+                let mut first_page = true;
+
+                loop {
+                    let result = if first_page {
+                        first_page = false;
+                        chats::list_messages_created_desc(&s.graph, &chat_id, 50).await
+                    } else if let Some(link) = next.as_deref() {
+                        chats::list_messages_more(&s.graph, link).await
+                    } else {
+                        break;
+                    };
+
+                    let (messages, next_link) = match result {
+                        Ok(page) => page,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Teams unread count refresh failed for {chat_id}: {e:#}"
+                            );
+                            // Keep the previous known count on a transient error.
+                            break;
+                        }
+                    };
+
+                    let mut reached_viewpoint = false;
+                    for message in messages {
+                        let Some(created) = message
+                            .created_date_time
+                            .as_deref()
+                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        else {
+                            continue;
+                        };
+
+                        if created <= read_at {
+                            reached_viewpoint = true;
+                            break;
+                        }
+
+                        if message.deleted_date_time.is_some()
+                            || message.author_id().is_none()
+                            || message.author_id() == Some(me_id.as_str())
+                            || message
+                                .message_type
+                                .as_deref()
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("systemEventMessage"))
+                        {
+                            continue;
+                        }
+
+                        count += 1;
+                        if count >= 100 {
+                            reached_viewpoint = true;
+                            break;
+                        }
+                    }
+
+                    if reached_viewpoint {
+                        let _ = tx
+                            .send(AppMessage::ChatUnreadCount {
+                                chat_id: chat_id.clone(),
+                                count,
+                            })
+                            .await;
+                        break;
+                    }
+
+                    next = next_link;
+                    if next.is_none() {
+                        let _ = tx
+                            .send(AppMessage::ChatUnreadCount {
+                                chat_id: chat_id.clone(),
+                                count,
+                            })
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     fn load_chat_messages(&self, chat_id: String, mode: ListUpdate) {
         let s = self.session.clone();
         self.spawn(async move {
@@ -1094,6 +1227,7 @@ impl App {
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
                 self.load_contact_presences(&c);
+                self.refresh_chat_unread_counts(&c);
                 self.teams.chats = c;
                 self.teams.chat_sel = self
                     .teams
@@ -1105,6 +1239,13 @@ impl App {
                     .into_iter()
                     .filter_map(|presence| presence.id.clone().map(|id| (id, presence)))
                     .collect();
+            }
+            AppMessage::ChatUnreadCount { chat_id, count } => {
+                if count == 0 {
+                    self.teams.chat_unread_counts.remove(&chat_id);
+                } else {
+                    self.teams.chat_unread_counts.insert(chat_id, count);
+                }
             }
             AppMessage::ChatMessages {
                 chat_id,
