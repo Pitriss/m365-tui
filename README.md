@@ -413,8 +413,12 @@ This fork includes a small set of usability improvements focused on Outlook mail
   - `[1]`–`[99]` for unread counts up to 99.
   - `[+]` for counts greater than 99.
 - Added an `*` indicator to the Outlook application tab when unread mail exists.
-- Added an `*` indicator to the Teams application tab when a new chat message arrives while Teams is not open.
-- The Teams unread indicator is cleared when the Teams view is opened.
+- Added Teams application-tab unread states for one-to-one chats:
+  - `Teams (F2) *` means a new chat message arrived since Teams was last opened.
+  - `Teams (F2) •` means Teams has been opened, but one or more one-to-one chats are still unread.
+  - `Teams (F2)` means there are no known unread one-to-one chats.
+- Opening a one-to-one chat clears its local unread count after the conversation loads successfully.
+- A locally opened chat stays treated as read while Microsoft Graph temporarily reports a stale chat `viewpoint`; a genuinely new message with a new `lastMessagePreview.id` makes it unread again.
 
 ### Teams contact presence
 
