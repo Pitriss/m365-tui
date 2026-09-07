@@ -621,23 +621,30 @@ impl App {
             let roots = mail::list_folders(&s.graph).await?;
             let mut folders = Vec::new();
 
-            // Depth-first traversal. Reverse-pushing preserves the order
-            // returned by Graph while keeping every parent before its children.
+            // Depth-first traversal. Each stack entry carries the continuation
+            // state of its ancestors plus whether this item is the last sibling.
+            // Root folders intentionally have no tree prefix.
             let mut stack = roots
                 .into_iter()
                 .rev()
-                .map(|folder| (folder, 0usize))
+                .map(|folder| (folder, Vec::<bool>::new(), None))
                 .collect::<Vec<_>>();
 
-            while let Some((mut folder, depth)) = stack.pop() {
+            while let Some((mut folder, ancestor_continuations, is_last)) = stack.pop() {
                 let child_count = folder.child_folder_count.unwrap_or(0);
                 let folder_id = folder.id.clone();
 
-                // Keep the existing flat folder-pane model. Only the label is
-                // indented; id and unread count remain unchanged.
-                if depth > 0 {
+                // Keep the existing flat folder-pane model. Encode only the
+                // visual tree prefix into display_name; id and unread count
+                // remain unchanged.
+                if let Some(is_last) = is_last {
                     if let Some(name) = folder.display_name.as_mut() {
-                        *name = format!("{}{name}", "  ".repeat(depth));
+                        let mut prefix = String::new();
+                        for continues in &ancestor_continuations {
+                            prefix.push_str(if *continues { "│ " } else { "  " });
+                        }
+                        prefix.push_str(if is_last { "└ " } else { "├ " });
+                        *name = format!("{prefix}{name}");
                     }
                 }
 
@@ -646,8 +653,18 @@ impl App {
                 // Avoid an extra Graph request for leaf folders.
                 if child_count > 0 {
                     let children = mail::list_child_folders(&s.graph, &folder_id).await?;
-                    for child in children.into_iter().rev() {
-                        stack.push((child, depth + 1));
+                    let child_len = children.len();
+                    let mut child_ancestors = ancestor_continuations;
+                    if let Some(is_last) = is_last {
+                        child_ancestors.push(!is_last);
+                    }
+
+                    for (index, child) in children.into_iter().enumerate().rev() {
+                        stack.push((
+                            child,
+                            child_ancestors.clone(),
+                            Some(index + 1 == child_len),
+                        ));
                     }
                 }
             }
