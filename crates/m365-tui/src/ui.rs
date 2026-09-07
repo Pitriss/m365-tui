@@ -241,6 +241,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // Folders
+    let folder_inner_width = cols[0].width.saturating_sub(3) as usize;
     let items: Vec<ListItem> = app
         .outlook
         .folders
@@ -249,15 +250,23 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             let unread = folder.unread_item_count.unwrap_or(0);
             let full_name = folder.display_name.as_deref().unwrap_or("");
             let (tree, name) = split_folder_tree_label(full_name);
-            let label = if unread > 0 {
-                let count = if unread > 99 { "+".to_string() } else { unread.to_string() };
-                format!("{name} [{count}]")
-            } else {
-                name.to_string()
+            let suffix = match unread {
+                0 => String::new(),
+                1..=99 => format!("[{unread}]"),
+                _ => "[+]".to_string(),
             };
+            let tree_width = tree.chars().count();
+            let suffix_width = suffix.chars().count();
+            let name_width = folder_inner_width.saturating_sub(tree_width + suffix_width);
+            let name = truncate(name, name_width);
+            let padding = folder_inner_width
+                .saturating_sub(tree_width + name.chars().count() + suffix_width);
+
             ListItem::new(Line::from(vec![
                 Span::styled(tree.to_string(), Style::default().fg(DIM)),
-                Span::raw(label),
+                Span::raw(name),
+                Span::raw(" ".repeat(padding)),
+                Span::raw(suffix),
             ]))
         })
         .collect();
