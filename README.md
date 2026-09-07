@@ -416,4 +416,14 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Added an `*` indicator to the Teams application tab when a new chat message arrives while Teams is not open.
 - The Teams unread indicator is cleared when the Teams view is opened.
 
+### Teams contact presence
+
+- Optional Teams presence indicators for contacts in one-to-one chats.
+- Enable with `M365_PRESENCE_READ=1`.
+- Uses the existing `Presence.Read.All` delegated permission and fetches contact presence in batches.
+- Presence is refreshed together with the regular Teams polling cycle.
+- Group and meeting chats intentionally do not show a presence indicator.
+- Presence lookup failures are non-fatal and do not interrupt Teams chat functionality.
+- Status indicators: `●` Available, `●` Busy / In a call / In a meeting, `◐` Away / Be right back, `×` Do not disturb / Presenting, `○` Offline / unknown.
+
 These changes were developed and tested with assistance from ChatGPT by OpenAI.
