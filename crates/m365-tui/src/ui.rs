@@ -109,10 +109,16 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     // Right-hand state: presence · push · memory · last sync.
     let (dot, avail) = presence_indicator(app);
     let (push_label, push_colour) = match &app.push {
-        PushState::Off => ("push off", DIM),
-        PushState::Connecting => ("push …", Color::Yellow),
-        PushState::Live => ("push live", Color::Green),
-        PushState::Failed(_) => ("push FAILED", Color::Red),
+        PushState::Off => {
+            let filled = ((app.poll_started_at.elapsed().as_secs() / 2) as usize).min(10);
+            (
+                format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled)),
+                DIM,
+            )
+        }
+        PushState::Connecting => ("push …".to_string(), Color::Yellow),
+        PushState::Live => ("push live".to_string(), Color::Green),
+        PushState::Failed(_) => ("push FAILED".to_string(), Color::Red),
     };
     let ram = match app.rss_kb {
         Some(kb) if kb >= 1024 => format!("{:.0} MB", kb as f64 / 1024.0),
