@@ -510,6 +510,7 @@ impl App {
     pub fn bootstrap(&mut self) {
         self.load_whoami();
         self.load_presence();
+        self.start_primary_presence();
         self.load_folders();
         self.load_chats();
     }
@@ -545,6 +546,34 @@ impl App {
             Ok(AppMessage::Presence {
                 presence: people::my_presence(&s.graph).await?,
                 requested: None,
+            })
+        });
+    }
+
+    /// Start the opt-in application presence session without setting a sticky
+    /// user-preferred status. Existing higher-priority Teams states can still win.
+    fn start_primary_presence(&mut self) {
+        if !self.session.config.presence_primary || !self.session.config.can_write_presence() {
+            return;
+        }
+
+        self.presence_session = Some(("Available", "Available"));
+        self.presence_session_at = Some(std::time::Instant::now());
+
+        let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
+        self.spawn(async move {
+            people::set_session_presence(
+                &s.graph,
+                &client_id,
+                "Available",
+                "Available",
+                PRESENCE_SESSION_LEASE,
+            )
+            .await?;
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: Some("Available".to_string()),
             })
         });
     }

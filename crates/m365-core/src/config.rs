@@ -76,6 +76,8 @@ pub struct Config {
     pub read_msg_timeout: u64,
     /// Show presence indicators for contacts in one-to-one Teams chats.
     pub presence_read: bool,
+    /// Keep an Available application presence session active while the TUI runs.
+    pub presence_primary: bool,
 }
 
 impl Config {
@@ -84,6 +86,7 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let client_id = env_required("M365_CLIENT_ID")?;
         let tenant_id = std::env::var("M365_TENANT_ID").unwrap_or_else(|_| "organizations".into());
+        let presence_primary = env_flag("M365_PRESENCE_PRIMARY");
 
         let scopes = match std::env::var("M365_SCOPES") {
             Ok(s) if !s.trim().is_empty() => {
@@ -94,7 +97,7 @@ impl Config {
                 // Presence *writing* is opt-in: adding a scope invalidates any
                 // existing consent grant, which is disruptive in tenants that
                 // require admin approval.
-                if env_flag("M365_PRESENCE_WRITE") {
+                if env_flag("M365_PRESENCE_WRITE") || presence_primary {
                     s.push(PRESENCE_WRITE_SCOPE.to_string());
                 }
                 if env_flag("M365_TEAMS_CHANNELS") {
@@ -147,6 +150,7 @@ impl Config {
             notifications,
             read_msg_timeout,
             presence_read,
+            presence_primary,
         })
     }
 
@@ -249,6 +253,7 @@ mod tests {
             notifications: true,
             read_msg_timeout: 0,
             presence_read: false,
+            presence_primary: false,
         }
     }
 
