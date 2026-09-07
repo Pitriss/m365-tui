@@ -414,6 +414,8 @@ pub struct App {
     pub my_presence: Option<Presence>,
     /// Wall-clock of the last poll refresh (shown in the tab bar).
     pub last_sync: Option<String>,
+    /// Monotonic start of the current 20-second polling cycle.
+    pub poll_started_at: std::time::Instant,
     /// Whether instant push is working (shown in the status bar).
     pub push: PushState,
     /// Message ids already notified about, so a poll can't repeat them.
@@ -476,6 +478,7 @@ impl App {
             me: None,
             my_presence: None,
             last_sync: None,
+            poll_started_at: std::time::Instant::now(),
             push: PushState::Off,
             notified: std::collections::HashSet::new(),
             chat_seen: None,
@@ -1218,7 +1221,10 @@ impl App {
                     self.status_ticks = 0;
                 }
             }
-            AppMessage::Poll => self.poll(),
+            AppMessage::Poll => {
+                self.poll_started_at = std::time::Instant::now();
+                self.poll();
+            }
         }
     }
 

@@ -426,4 +426,13 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Presence lookup failures are non-fatal and do not interrupt Teams chat functionality.
 - Status indicators: `●` Available, `●` Busy / In a call / In a meeting, `◐` Away / Be right back, `×` Do not disturb / Presenting, `○` Offline / unknown.
 
+### Polling progress indicator
+
+- When push notifications are off, the `push off` label is replaced by a 10-segment polling progress bar.
+- Each segment represents approximately 2 seconds of the 20-second polling interval.
+- The bar resets when the periodic poll runs.
+- `push …`, `push live`, and `push FAILED` keep their original labels and colors.
+- The polling progress indicator has been tested in poll-only mode.
+- The behavior with a fully working push connection has not yet been tested by the maintainer.
+
 These changes were developed and tested with assistance from ChatGPT by OpenAI.
