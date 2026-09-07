@@ -23,6 +23,11 @@ jobs:
       commit: ${{ steps.meta.outputs.commit }}
 
     steps:
+      - name: Checkout CI-tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+
       - name: Generate release metadata
         id: meta
         shell: bash
@@ -34,7 +39,7 @@ jobs:
           commit="${REQUESTED_SHA:-$GITHUB_SHA}"
           short_sha="${commit::7}"
           tag="build-${GITHUB_RUN_NUMBER}-${short_sha}"
-          name="Build ${GITHUB_RUN_NUMBER} (${short_sha})"
+          name="$(git log -1 --format=%s "$commit")"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
