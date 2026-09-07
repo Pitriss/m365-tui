@@ -38,6 +38,7 @@ pub enum AppMessage {
     MailRead { id: String, read: bool },
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
+    ContactPresences(Vec<Presence>),
     ChatMessages {
         chat_id: String,
         messages: Vec<ChatMessage>,
@@ -345,6 +346,8 @@ pub struct TeamsState {
     pub mode: TeamsMode,
     pub chats: Vec<Chat>,
     pub chat_sel: usize,
+    /// Presence by directory user id for one-to-one chat contacts.
+    pub contact_presences: std::collections::HashMap<String, Presence>,
     pub teams: Vec<Team>,
     pub team_sel: usize,
     pub channels: Vec<m365_core::models::Channel>,
@@ -376,6 +379,7 @@ impl Default for TeamsState {
             mode: TeamsMode::Chats,
             chats: Vec::new(),
             chat_sel: 0,
+            contact_presences: std::collections::HashMap::new(),
             teams: Vec::new(),
             team_sel: 0,
             channels: Vec::new(),
@@ -811,6 +815,46 @@ impl App {
         self.spawn(async move { Ok(AppMessage::Chats(chats::list_chats(&s.graph, 40).await?)) });
     }
 
+    fn load_contact_presences(&self, chats: &[Chat]) {
+        if !self.session.config.presence_read {
+            return;
+        }
+
+        // Only one-to-one chats get a contact status. Collecting both members
+        // avoids depending on whether /me has completed before the chat list.
+        let mut user_ids: Vec<String> = chats
+            .iter()
+            .filter(|chat| {
+                chat.chat_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+            })
+            .flat_map(|chat| chat.members.iter())
+            .filter_map(|member| member.user_id.clone())
+            .collect();
+        user_ids.sort();
+        user_ids.dedup();
+
+        if user_ids.is_empty() {
+            return;
+        }
+
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match people::presences(&s.graph, &user_ids).await {
+                Ok(items) => {
+                    let _ = tx.send(AppMessage::ContactPresences(items)).await;
+                }
+                Err(e) => {
+                    // Presence is optional UI decoration: never turn a 403 or
+                    // transient Graph failure into a broken Teams experience.
+                    tracing::warn!("contact presence refresh failed: {e:#}");
+                }
+            }
+        });
+    }
+
     fn load_chat_messages(&self, chat_id: String, mode: ListUpdate) {
         let s = self.session.clone();
         self.spawn(async move {
@@ -1046,11 +1090,18 @@ impl App {
             AppMessage::Calendar(e) => self.outlook.calendar = e,
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
+                self.load_contact_presences(&c);
                 self.teams.chats = c;
                 self.teams.chat_sel = self
                     .teams
                     .chat_sel
                     .min(self.teams.chats.len().saturating_sub(1));
+            }
+            AppMessage::ContactPresences(items) => {
+                self.teams.contact_presences = items
+                    .into_iter()
+                    .filter_map(|presence| presence.id.clone().map(|id| (id, presence)))
+                    .collect();
             }
             AppMessage::ChatMessages {
                 chat_id,

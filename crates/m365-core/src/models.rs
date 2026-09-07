@@ -206,6 +206,22 @@ impl Chat {
             names.join(", ")
         }
     }
+
+    /// Directory user id of the other participant in a one-to-one chat.
+    pub fn peer_user_id<'a>(&'a self, me_id: Option<&str>) -> Option<&'a str> {
+        if !self
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            return None;
+        }
+
+        self.members
+            .iter()
+            .filter_map(|member| member.user_id.as_deref())
+            .find(|id| me_id != Some(*id))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
