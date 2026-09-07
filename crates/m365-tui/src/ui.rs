@@ -218,6 +218,18 @@ fn context_hints(app: &App) -> &'static str {
 // Outlook
 // ---------------------------------------------------------------------------
 
+/// Split the tree decoration encoded by the folder loader from the actual
+/// Outlook folder name. Tree glyphs are rendered separately so they can use
+/// the same unobtrusive DIM colour as the polling progress indicator.
+fn split_folder_tree_label(label: &str) -> (&str, &str) {
+    let split = label
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, '│' | '├' | '└' | ' '))
+        .map(|(index, _)| index)
+        .unwrap_or(label.len());
+    label.split_at(split)
+}
+
 fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -235,14 +247,18 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|folder| {
             let unread = folder.unread_item_count.unwrap_or(0);
-            let name = folder.display_name.clone().unwrap_or_default();
+            let full_name = folder.display_name.as_deref().unwrap_or("");
+            let (tree, name) = split_folder_tree_label(full_name);
             let label = if unread > 0 {
                 let count = if unread > 99 { "+".to_string() } else { unread.to_string() };
                 format!("{name} [{count}]")
             } else {
-                name
+                name.to_string()
             };
-            ListItem::new(label)
+            ListItem::new(Line::from(vec![
+                Span::styled(tree.to_string(), Style::default().fg(DIM)),
+                Span::raw(label),
+            ]))
         })
         .collect();
     let mut fstate = ListState::default();

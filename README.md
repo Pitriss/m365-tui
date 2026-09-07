@@ -436,6 +436,14 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Group and meeting chats do not show unread counts.
 - Presence indicators and unread counts are independent; unread counts remain visible even when contact presence is disabled.
 
+### Outlook folder tree
+
+- Nested Outlook folders are rendered as a compact tree using `├`, `└`, and `│`.
+- Tree guide characters use the same dimmed colour as the polling progress indicator.
+- Top-level folders remain unprefixed.
+- Existing unread counts (`[1]`–`[99]`, `[+]`) are preserved unchanged.
+- Folder loading and unread-count logic are unchanged; this is a visual-only improvement.
+
 ### Polling progress indicator
 
 - When push notifications are off, the `push off` label is replaced by a 10-segment polling progress bar.
