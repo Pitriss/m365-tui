@@ -95,8 +95,15 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "Outlook (F2)"
     };
+    let teams_has_unread = app
+        .teams
+        .chat_unread_counts
+        .values()
+        .any(|count| *count > 0);
     let teams_tab = if app.teams_unread {
         "Teams (F2) *"
+    } else if teams_has_unread {
+        "Teams (F2) •"
     } else {
         "Teams (F2)"
     };

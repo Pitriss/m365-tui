@@ -351,6 +351,9 @@ pub struct TeamsState {
     pub contact_presences: std::collections::HashMap<String, Presence>,
     /// Server-derived unread message count by one-to-one chat id.
     pub chat_unread_counts: std::collections::HashMap<String, usize>,
+    /// Latest message id already shown to the user per one-to-one chat.
+    /// Shields local read state from a temporarily stale Graph viewpoint.
+    pub locally_read_through: std::collections::HashMap<String, String>,
     pub teams: Vec<Team>,
     pub team_sel: usize,
     pub channels: Vec<m365_core::models::Channel>,
@@ -384,6 +387,7 @@ impl Default for TeamsState {
             chat_sel: 0,
             contact_presences: std::collections::HashMap::new(),
             chat_unread_counts: std::collections::HashMap::new(),
+            locally_read_through: std::collections::HashMap::new(),
             teams: Vec::new(),
             team_sel: 0,
             channels: Vec::new(),
@@ -890,16 +894,23 @@ impl App {
                 // Counts are intentionally limited to one-to-one chats.
                 chat.peer_user_id(Some(&me_id))?;
 
+                let latest_preview = chat.last_message_preview.as_ref()?;
+                let latest_id = latest_preview.id.as_deref()?;
+                if self
+                    .teams
+                    .locally_read_through
+                    .get(&chat.id)
+                    .is_some_and(|id| id == latest_id)
+                {
+                    return None;
+                }
+
                 let read_at = chat
                     .viewpoint
                     .as_ref()?
                     .last_message_read_date_time
                     .as_deref()?;
-                let latest_at = chat
-                    .last_message_preview
-                    .as_ref()?
-                    .created_date_time
-                    .as_deref()?;
+                let latest_at = latest_preview.created_date_time.as_deref()?;
 
                 let read_at_parsed = chrono::DateTime::parse_from_rfc3339(read_at).ok()?;
                 let latest_at_parsed = chrono::DateTime::parse_from_rfc3339(latest_at).ok()?;
@@ -1271,7 +1282,24 @@ impl App {
                 mode,
             } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
+                    let first_load = matches!(&mode, ListUpdate::Replace);
+                    let latest_id = first_load
+                        .then(|| {
+                            self.teams
+                                .chats
+                                .iter()
+                                .find(|chat| chat.id == chat_id)
+                                .and_then(|chat| chat.last_message_preview.as_ref())
+                                .and_then(|preview| preview.id.clone())
+                        })
+                        .flatten();
                     self.set_teams_messages(messages, next, mode);
+                    if first_load {
+                        self.teams.chat_unread_counts.remove(&chat_id);
+                        if let Some(latest_id) = latest_id {
+                            self.teams.locally_read_through.insert(chat_id, latest_id);
+                        }
+                    }
                 }
             }
             AppMessage::Teams(t) => self.teams.teams = t,
