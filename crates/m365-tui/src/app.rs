@@ -5,6 +5,7 @@
 //! which the main loop applies to the state before the next redraw.
 
 use std::future::Future;
+use std::io::IsTerminal;
 
 use anyhow::Context;
 
@@ -34,12 +35,21 @@ pub enum AppMessage {
         mode: ListUpdate,
     },
     MessageBody(MailMessage),
-    AutoMarkReadDue { id: String, generation: u64 },
-    MailRead { id: String, read: bool },
+    AutoMarkReadDue {
+        id: String,
+        generation: u64,
+    },
+    MailRead {
+        id: String,
+        read: bool,
+    },
     Calendar(Vec<CalEvent>),
     Chats(Vec<Chat>),
     ContactPresences(Vec<Presence>),
-    ChatUnreadCount { chat_id: String, count: usize },
+    ChatUnreadCount {
+        chat_id: String,
+        count: usize,
+    },
     ChatMessages {
         chat_id: String,
         messages: Vec<ChatMessage>,
@@ -82,6 +92,11 @@ pub enum AppMessage {
         bytes: Vec<u8>,
     },
     /// Push-notification health, for the status bar.
+    /// Decoded image attachments for the currently open Outlook message.
+    MailImages {
+        message_id: String,
+        images: Vec<image::DynamicImage>,
+    },
     Push(PushState),
     /// Lightweight timer: refresh memory usage and expire stale status text.
     Tick,
@@ -321,6 +336,10 @@ impl Compose {
     }
 }
 
+pub struct MailImage {
+    pub state: std::cell::RefCell<ratatui_image::protocol::StatefulProtocol>,
+}
+
 #[derive(Default)]
 pub struct OutlookState {
     pub folders: Vec<MailFolder>,
@@ -338,6 +357,8 @@ pub struct OutlookState {
     pub reading_links: Vec<String>,
     /// Attachments of the open message (fetched when it has any).
     pub reading_attachments: Vec<Attachment>,
+    /// Image attachments decoded for a Kitty-protocol preview.
+    pub reading_images: Vec<MailImage>,
     /// Line scroll offset of the reading pane.
     pub reading_scroll: u16,
     pub calendar: Vec<CalEvent>,
@@ -413,6 +434,8 @@ pub struct App {
     pub tx: mpsc::Sender<AppMessage>,
     pub screen: Screen,
     pub outlook: OutlookState,
+    /// Present only when terminal probing detects the Kitty graphics protocol.
+    image_picker: Option<ratatui_image::picker::Picker>,
     pub outlook_focus: OutlookFocus,
     pub teams: TeamsState,
     pub overlay: Option<Overlay>,
@@ -476,13 +499,80 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("quit", "Quit"),
 ];
 
+const MAX_MAIL_IMAGES: usize = 4;
+const MAX_MAIL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MAIL_IMAGE_WIDTH: u32 = 1600;
+const MAX_MAIL_IMAGE_HEIGHT: u32 = 1200;
+
+fn is_supported_mail_image_attachment(attachment: &Attachment) -> bool {
+    if !attachment.is_file() {
+        return false;
+    }
+
+    if attachment
+        .size
+        .is_some_and(|size| size < 0 || size as u64 > MAX_MAIL_IMAGE_BYTES as u64)
+    {
+        return false;
+    }
+
+    let mime_ok = attachment.content_type.as_deref().is_some_and(|mime| {
+        mime.eq_ignore_ascii_case("image/png")
+            || mime.eq_ignore_ascii_case("image/jpeg")
+            || mime.eq_ignore_ascii_case("image/jpg")
+            || mime.eq_ignore_ascii_case("image/gif")
+    });
+
+    let extension_ok = attachment
+        .name
+        .as_deref()
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("png")
+                || extension.eq_ignore_ascii_case("jpg")
+                || extension.eq_ignore_ascii_case("jpeg")
+                || extension.eq_ignore_ascii_case("gif")
+        });
+
+    mime_ok || extension_ok
+}
+
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
+        let image_picker = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            match ratatui_image::picker::Picker::from_query_stdio() {
+                Ok(picker)
+                    if picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty =>
+                {
+                    tracing::debug!(
+                        "Kitty graphics protocol detected; mail image previews enabled"
+                    );
+                    Some(picker)
+                }
+                Ok(picker) => {
+                    tracing::debug!(
+                        "terminal image protocol {:?} detected; keeping text fallback",
+                        picker.protocol_type()
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "terminal image protocol detection failed ({error}); keeping text fallback"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             session,
             tx,
             screen: Screen::Outlook,
             outlook: OutlookState::default(),
+            image_picker,
             outlook_focus: OutlookFocus::Messages,
             teams: TeamsState::default(),
             overlay: None,
@@ -786,11 +876,7 @@ impl App {
                     }
 
                     for (index, child) in children.into_iter().enumerate().rev() {
-                        stack.push((
-                            child,
-                            child_ancestors.clone(),
-                            Some(index + 1 == child_len),
-                        ));
+                        stack.push((child, child_ancestors.clone(), Some(index + 1 == child_len)));
                     }
                 }
             }
@@ -841,6 +927,74 @@ impl App {
         });
     }
 
+    fn load_mail_images(&self, message_id: String, items: &[Attachment]) {
+        if self.image_picker.is_none() {
+            return;
+        }
+
+        let candidates: Vec<String> = items
+            .iter()
+            .filter(|attachment| is_supported_mail_image_attachment(attachment))
+            .take(MAX_MAIL_IMAGES)
+            .map(|attachment| attachment.id.clone())
+            .collect();
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let s = self.session.clone();
+        self.spawn(async move {
+            let mut images = Vec::with_capacity(candidates.len());
+
+            for attachment_id in candidates {
+                let bytes =
+                    match mail::download_attachment(&s.graph, &message_id, &attachment_id).await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            tracing::debug!(
+                                "mail image attachment {attachment_id} could not be downloaded: {error:#}"
+                            );
+                            continue;
+                        }
+                    };
+
+                if bytes.len() > MAX_MAIL_IMAGE_BYTES {
+                    tracing::debug!(
+                        "mail image attachment {attachment_id} exceeds {} bytes; skipping",
+                        MAX_MAIL_IMAGE_BYTES
+                    );
+                    continue;
+                }
+
+                let decoded =
+                    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await;
+                match decoded {
+                    Ok(Ok(image)) if image.width() > 1 && image.height() > 1 => {
+                        let image =
+                            image.thumbnail(MAX_MAIL_IMAGE_WIDTH, MAX_MAIL_IMAGE_HEIGHT);
+                        images.push(image);
+                    }
+                    Ok(Ok(_)) => {
+                        // Ignore 1x1 tracking pixels.
+                    }
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            "mail image attachment {attachment_id} could not be decoded: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "mail image decoder task failed for {attachment_id}: {error}"
+                        );
+                    }
+                }
+            }
+
+            Ok(AppMessage::MailImages { message_id, images })
+        });
+    }
+
     fn load_attachments(&self, message_id: String) {
         let s = self.session.clone();
         self.spawn(async move {
@@ -881,7 +1035,6 @@ impl App {
         });
     }
 
-
     fn cancel_read_timer(&mut self) {
         self.read_timer_generation = self.read_timer_generation.wrapping_add(1);
     }
@@ -908,9 +1061,7 @@ impl App {
         };
 
         let id = match self.outlook.reading.as_ref() {
-            Some(message)
-                if message.id == current_id && !message.is_read.unwrap_or(false) =>
-            {
+            Some(message) if message.id == current_id && !message.is_read.unwrap_or(false) => {
                 message.id.clone()
             }
             _ => return,
@@ -1036,8 +1187,7 @@ impl App {
 
                 let read_at_parsed = chrono::DateTime::parse_from_rfc3339(read_at).ok()?;
                 let latest_at_parsed = chrono::DateTime::parse_from_rfc3339(latest_at).ok()?;
-                (latest_at_parsed > read_at_parsed)
-                    .then(|| (chat.id.clone(), read_at.to_string()))
+                (latest_at_parsed > read_at_parsed).then(|| (chat.id.clone(), read_at.to_string()))
             })
             .collect();
 
@@ -1338,8 +1488,9 @@ impl App {
                 self.outlook.reading_links = rendered.links;
                 self.outlook.reading_body = Some(rendered.text);
                 self.outlook.reading_attachments.clear();
+                self.outlook.reading_images.clear();
                 self.outlook.reading_scroll = 0;
-                if m.has_attachments.unwrap_or(false) {
+                if m.has_attachments.unwrap_or(false) || self.image_picker.is_some() {
                     self.load_attachments(m.id.clone());
                 }
                 self.outlook.reading = Some(m);
@@ -1349,13 +1500,9 @@ impl App {
                 let still_open = generation == self.read_timer_generation
                     && self.screen == Screen::Outlook
                     && self.outlook_focus == OutlookFocus::Reading
-                    && self
-                        .outlook
-                        .reading
-                        .as_ref()
-                        .is_some_and(|message| {
-                            message.id == id && !message.is_read.unwrap_or(false)
-                        });
+                    && self.outlook.reading.as_ref().is_some_and(|message| {
+                        message.id == id && !message.is_read.unwrap_or(false)
+                    });
                 if still_open {
                     self.cancel_read_timer();
                     self.set_mail_read(id, true);
@@ -1489,11 +1636,33 @@ impl App {
             AppMessage::Attachments { message_id, items } => {
                 // Ignore a late response for a message we've navigated away from.
                 if self.outlook.reading.as_ref().map(|m| m.id.as_str()) == Some(&message_id) {
-                    // Inline images (signatures, logos) aren't useful downloads.
+                    self.outlook.reading_images.clear();
+                    self.load_mail_images(message_id.clone(), &items);
+
+                    // Keep inline images out of the manual attachment download list.
                     self.outlook.reading_attachments = items
                         .into_iter()
                         .filter(|a| !a.is_inline.unwrap_or(false))
                         .collect();
+                }
+            }
+            AppMessage::MailImages { message_id, images } => {
+                // Ignore a late response after the user has opened another message.
+                if self
+                    .outlook
+                    .reading
+                    .as_ref()
+                    .map(|message| message.id.as_str())
+                    == Some(message_id.as_str())
+                {
+                    if let Some(picker) = self.image_picker.as_ref() {
+                        self.outlook.reading_images = images
+                            .into_iter()
+                            .map(|image| MailImage {
+                                state: std::cell::RefCell::new(picker.new_resize_protocol(image)),
+                            })
+                            .collect();
+                    }
                 }
             }
             AppMessage::Downloaded { name, bytes } => {

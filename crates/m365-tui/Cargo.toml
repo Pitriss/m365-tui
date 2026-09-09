@@ -11,6 +11,12 @@ name = "m365"
 path = "src/main.rs"
 
 [dependencies]
+# Keep image decoding deliberately narrow: only formats rendered in mail previews.
+image = { version = "0.25.6", default-features = false, features = ["gif", "jpeg", "png"] }
+# 8.x matches this project's ratatui 0.29 API. Disable image-defaults so Cargo
+# does not pull support for unrelated image formats.
+ratatui-image = { version = "8.1.1", default-features = false, features = ["crossterm"] }
+
 m365-core = { path = "../m365-core" }
 tokio.workspace = true
 anyhow.workspace = true
