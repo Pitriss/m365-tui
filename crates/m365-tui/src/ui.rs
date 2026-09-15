@@ -1037,7 +1037,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F2 switch app · Ctrl+P palette · p set presence · ? help · q quit\n\
+ Global:  F2 switch app · F5 force poll · Ctrl+P palette · p set presence · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\

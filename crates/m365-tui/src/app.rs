@@ -2950,6 +2950,11 @@ impl App {
                 }
                 return;
             }
+            (KeyCode::F(5), _) => {
+                self.poll_started_at = std::time::Instant::now();
+                self.poll();
+                return;
+            }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.overlay = Some(Overlay::Palette {
                     query: String::new(),
