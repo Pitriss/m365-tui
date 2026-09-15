@@ -958,10 +958,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         &mut *state,
                     );
 
-                    if let Some(result) = state.last_encoding_result() {
-                        if let Err(error) = result {
-                            tracing::warn!("Teams inline image encoding failed: {error}");
-                        }
+                    if let Some(Err(error)) = state.last_encoding_result() {
+                        tracing::warn!("Teams inline image encoding failed: {error}");
                     }
                 }
             }

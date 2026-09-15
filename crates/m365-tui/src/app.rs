@@ -786,7 +786,7 @@ fn prune_teams_disk_cache(dir: &std::path::Path, max_bytes: u64) -> std::io::Res
         let entry = grouped.entry(key.to_string()).or_default();
         entry.size = entry.size.saturating_add(metadata.len());
         if let Ok(modified) = metadata.modified() {
-            if entry.modified.map_or(true, |current| modified > current) {
+            if entry.modified.is_none_or(|current| modified > current) {
                 entry.modified = Some(modified);
             }
         }

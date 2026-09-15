@@ -529,9 +529,7 @@ fn remote_drive_target_from_microsoft_search(
     let mut url_matches = Vec::new();
     let mut name_matches = Vec::new();
 
-    let Some(search_responses) = response.get("value").and_then(|value| value.as_array()) else {
-        return None;
-    };
+    let search_responses = response.get("value").and_then(|value| value.as_array())?;
 
     for search_response in search_responses {
         let Some(containers) = search_response
