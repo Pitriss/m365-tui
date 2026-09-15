@@ -8,13 +8,17 @@ use crate::models::{Channel, ChatMessage, Team};
 
 /// Teams the signed-in user has joined.
 pub async fn joined_teams(graph: &GraphClient) -> Result<Vec<Team>> {
-    graph.get_collection("me/joinedTeams?$select=id,displayName,description").await
+    graph
+        .get_collection("me/joinedTeams?$select=id,displayName,description")
+        .await
 }
 
 /// Channels within a team.
 pub async fn list_channels(graph: &GraphClient, team_id: &str) -> Result<Vec<Channel>> {
     graph
-        .get_collection(&format!("teams/{team_id}/channels?$select=id,displayName,description"))
+        .get_collection(&format!(
+            "teams/{team_id}/channels?$select=id,displayName,description"
+        ))
         .await
 }
 
@@ -85,5 +89,20 @@ pub async fn send_message(
             &format!("teams/{team_id}/channels/{channel_id}/messages"),
             &payload,
         )
+        .await
+}
+
+/// Download one Teams-hosted inline content item from a channel message.
+pub async fn hosted_content_bytes(
+    graph: &GraphClient,
+    team_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    hosted_content_id: &str,
+) -> Result<Vec<u8>> {
+    graph
+        .get_bytes(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{message_id}/hostedContents/{hosted_content_id}/$value"
+        ))
         .await
 }

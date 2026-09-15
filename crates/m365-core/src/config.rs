@@ -51,6 +51,10 @@ pub const PRESENCE_WRITE_SCOPE: &str = "Presence.ReadWrite";
 /// Chats work without it. Opt in with `M365_TEAMS_CHANNELS=1`.
 pub const TEAMS_READ_SCOPE: &str = "Team.ReadBasic.All";
 
+/// Needed to download regular Teams file attachments from SharePoint/OneDrive.
+/// Opt in with `M365_TEAMS_FILE_IMAGES=1`.
+pub const FILES_READ_SCOPE: &str = "Files.Read.All";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -81,6 +85,13 @@ pub struct Config {
     /// Minutes of local inactivity before an automatic primary session becomes Away.
     /// Zero disables the automatic Away transition.
     pub presence_available_timeout_min: u64,
+    /// Download regular Teams image file attachments from SharePoint/OneDrive.
+    pub teams_file_images: bool,
+    /// Optional persistent cache for decoded Teams image thumbnails.
+    /// Unset keeps Teams image caching memory-only.
+    pub teams_image_cache_dir: Option<PathBuf>,
+    /// Maximum persistent Teams image cache size in MiB.
+    pub teams_image_cache_max_mb: u64,
 }
 
 impl Config {
@@ -90,6 +101,26 @@ impl Config {
         let client_id = env_required("M365_CLIENT_ID")?;
         let tenant_id = std::env::var("M365_TENANT_ID").unwrap_or_else(|_| "organizations".into());
         let presence_primary = env_flag("M365_PRESENCE_PRIMARY");
+        let teams_file_images = env_flag("M365_TEAMS_FILE_IMAGES");
+        let teams_image_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let teams_image_cache_max_mb =
+            match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
+                Ok(value) if !value.trim().is_empty() => {
+                    let value = value.trim().parse::<u64>().context(
+                        "M365_TEAMS_IMAGE_CACHE_MAX_MB must be a positive integer number of MiB",
+                    )?;
+                    anyhow::ensure!(
+                        value > 0,
+                        "M365_TEAMS_IMAGE_CACHE_MAX_MB must be greater than zero"
+                    );
+                    value
+                }
+                _ => 256,
+            };
         let presence_available_timeout_min =
             match std::env::var("M365_PRESENCE_AVAILABLE_TIMEOUT_MIN") {
                 Ok(value) if !value.trim().is_empty() => value.trim().parse::<u64>().context(
@@ -99,9 +130,7 @@ impl Config {
             };
 
         let scopes = match std::env::var("M365_SCOPES") {
-            Ok(s) if !s.trim().is_empty() => {
-                s.split_whitespace().map(|s| s.to_string()).collect()
-            }
+            Ok(s) if !s.trim().is_empty() => s.split_whitespace().map(|s| s.to_string()).collect(),
             _ => {
                 let mut s: Vec<String> = DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
                 // Presence *writing* is opt-in: adding a scope invalidates any
@@ -112,6 +141,9 @@ impl Config {
                 }
                 if env_flag("M365_TEAMS_CHANNELS") {
                     s.push(TEAMS_READ_SCOPE.to_string());
+                }
+                if teams_file_images {
+                    s.push(FILES_READ_SCOPE.to_string());
                 }
                 s
             }
@@ -162,6 +194,9 @@ impl Config {
             presence_read,
             presence_primary,
             presence_available_timeout_min,
+            teams_file_images,
+            teams_image_cache_dir,
+            teams_image_cache_max_mb,
         })
     }
 
@@ -183,6 +218,11 @@ impl Config {
     /// Whether the token we request can enumerate teams and channels.
     pub fn can_read_teams(&self) -> bool {
         self.has_scope(TEAMS_READ_SCOPE)
+    }
+
+    /// Whether the current token request includes read access to files.
+    pub fn can_read_files(&self) -> bool {
+        self.has_scope(FILES_READ_SCOPE)
     }
 
     fn has_scope(&self, scope: &str) -> bool {
@@ -266,6 +306,9 @@ mod tests {
             presence_read: false,
             presence_primary: false,
             presence_available_timeout_min: 5,
+            teams_file_images: false,
+            teams_image_cache_dir: None,
+            teams_image_cache_max_mb: 256,
         }
     }
 

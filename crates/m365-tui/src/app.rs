@@ -68,6 +68,11 @@ pub enum AppMessage {
         next: Option<String>,
         mode: ListUpdate,
     },
+    /// Kitty image previews for the currently selected Teams message.
+    TeamsImages {
+        key: TeamsImageKey,
+        images: Vec<image::DynamicImage>,
+    },
     /// A send/action completed; optional status text and refresh hint.
     Done(String),
     /// Result of a cross-navigation request to open a chat by email.
@@ -364,6 +369,18 @@ pub struct OutlookState {
     pub calendar: Vec<CalEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TeamsImageSource {
+    Chat(String),
+    Channel { team_id: String, channel_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TeamsImageKey {
+    source: TeamsImageSource,
+    message_id: String,
+}
+
 pub struct TeamsState {
     pub mode: TeamsMode,
     pub chats: Vec<Chat>,
@@ -386,6 +403,16 @@ pub struct TeamsState {
     pub messages_links: Vec<Vec<String>>,
     /// Selected message index in the conversation pane (drives scroll + react).
     pub msg_sel: usize,
+    /// Kitty previews for the currently selected Teams message.
+    pub selected_images: Vec<MailImage>,
+    /// Key currently represented by `selected_images`.
+    selected_image_key: Option<TeamsImageKey>,
+    /// Decoded Teams thumbnails cached for the lifetime of this process/session.
+    /// Empty vectors are cached too, so messages without usable images are not
+    /// repeatedly inspected or downloaded.
+    image_cache: std::collections::HashMap<TeamsImageKey, Vec<image::DynamicImage>>,
+    /// Image requests already running in the background.
+    image_in_flight: std::collections::HashSet<TeamsImageKey>,
     /// `@odata.nextLink` for older messages in the open conversation.
     pub messages_next: Option<String>,
     /// Guards against firing multiple "load older" requests at once.
@@ -417,6 +444,10 @@ impl Default for TeamsState {
             messages_rendered: Vec::new(),
             messages_links: Vec::new(),
             msg_sel: 0,
+            selected_images: Vec::new(),
+            selected_image_key: None,
+            image_cache: std::collections::HashMap::new(),
+            image_in_flight: std::collections::HashSet::new(),
             messages_next: None,
             loading_more: false,
             unseen: 0,
@@ -503,6 +534,10 @@ const MAX_MAIL_IMAGES: usize = 4;
 const MAX_MAIL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MAIL_IMAGE_WIDTH: u32 = 1600;
 const MAX_MAIL_IMAGE_HEIGHT: u32 = 1200;
+const MAX_TEAMS_IMAGES: usize = MAX_MAIL_IMAGES;
+const MAX_TEAMS_IMAGE_BYTES: usize = MAX_MAIL_IMAGE_BYTES;
+const MAX_TEAMS_IMAGE_WIDTH: u32 = MAX_MAIL_IMAGE_WIDTH;
+const MAX_TEAMS_IMAGE_HEIGHT: u32 = MAX_MAIL_IMAGE_HEIGHT;
 
 fn is_supported_mail_image_attachment(attachment: &Attachment) -> bool {
     if !attachment.is_file() {
@@ -535,6 +570,374 @@ fn is_supported_mail_image_attachment(attachment: &Attachment) -> bool {
         });
 
     mime_ok || extension_ok
+}
+
+fn is_supported_teams_image_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, extension)| {
+            extension.eq_ignore_ascii_case("png")
+                || extension.eq_ignore_ascii_case("jpg")
+                || extension.eq_ignore_ascii_case("jpeg")
+                || extension.eq_ignore_ascii_case("gif")
+        })
+        .unwrap_or(false)
+}
+
+const TEAMS_DISK_CACHE_KEY_HEX_LEN: usize = 32;
+
+fn teams_disk_cache_key(key: &TeamsImageKey) -> String {
+    fn update(mut hash: u64, bytes: &[u8]) -> u64 {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+
+    fn feed(hash: u64, part: &str) -> u64 {
+        let hash = update(hash, part.as_bytes());
+        update(hash, &[0])
+    }
+
+    // Two deterministic FNV-1a streams give a compact 128-bit cache filename
+    // without introducing a hashing crate or exposing chat/file names.
+    let mut first = 0xcbf2_9ce4_8422_2325;
+    let mut second = 0x8422_2325_cbf2_9ce4;
+
+    match &key.source {
+        TeamsImageSource::Chat(chat_id) => {
+            first = feed(first, "chat");
+            first = feed(first, chat_id);
+            second = feed(second, "chat");
+            second = feed(second, chat_id);
+        }
+        TeamsImageSource::Channel {
+            team_id,
+            channel_id,
+        } => {
+            first = feed(first, "channel");
+            first = feed(first, team_id);
+            first = feed(first, channel_id);
+            second = feed(second, "channel");
+            second = feed(second, channel_id);
+            second = feed(second, team_id);
+        }
+    }
+
+    first = feed(first, &key.message_id);
+    second = feed(second, &key.message_id);
+    format!("{first:016x}{second:016x}")
+}
+
+#[cfg(unix)]
+fn create_private_cache_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(path)?;
+
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn create_private_cache_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
+fn write_private_cache_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
+#[cfg(not(unix))]
+fn write_private_cache_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
+fn remove_teams_disk_cache_entry(dir: &std::path::Path, cache_key: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let image_prefix = format!("{cache_key}-");
+    let meta_name = format!("{cache_key}.meta");
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let matches = name == meta_name
+            || name.starts_with(&format!("{cache_key}.meta.tmp-"))
+            || (name.starts_with(&image_prefix)
+                && (name.ends_with(".png") || name.contains(".tmp-")));
+        if matches {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn load_teams_disk_cache(
+    dir: &std::path::Path,
+    cache_key: &str,
+) -> std::io::Result<Option<Vec<image::DynamicImage>>> {
+    let meta_path = dir.join(format!("{cache_key}.meta"));
+    let count_text = match std::fs::read_to_string(&meta_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    let count = match count_text.trim().parse::<usize>() {
+        Ok(value) if (1..=MAX_TEAMS_IMAGES).contains(&value) => value,
+        _ => {
+            remove_teams_disk_cache_entry(dir, cache_key);
+            return Ok(None);
+        }
+    };
+
+    let mut images = Vec::with_capacity(count);
+    for index in 0..count {
+        let path = dir.join(format!("{cache_key}-{index}.png"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() <= MAX_TEAMS_IMAGE_BYTES => bytes,
+            _ => {
+                remove_teams_disk_cache_entry(dir, cache_key);
+                return Ok(None);
+            }
+        };
+
+        match image::load_from_memory(&bytes) {
+            Ok(image)
+                if image.width() > 1
+                    && image.height() > 1
+                    && image.width() <= MAX_TEAMS_IMAGE_WIDTH
+                    && image.height() <= MAX_TEAMS_IMAGE_HEIGHT =>
+            {
+                images.push(image);
+            }
+            _ => {
+                remove_teams_disk_cache_entry(dir, cache_key);
+                return Ok(None);
+            }
+        }
+    }
+
+    // Refresh the metadata mtime on a successful hit so pruning behaves as LRU
+    // without another filesystem dependency.
+    write_private_cache_file(&meta_path, format!("{count}\n").as_bytes())?;
+    Ok(Some(images))
+}
+
+fn prune_teams_disk_cache(dir: &std::path::Path, max_bytes: u64) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    #[derive(Default)]
+    struct Entry {
+        size: u64,
+        modified: Option<SystemTime>,
+    }
+
+    let mut grouped: HashMap<String, Entry> = HashMap::new();
+
+    for item in std::fs::read_dir(dir)? {
+        let item = item?;
+        let metadata = match item.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => continue,
+        };
+        let name = item.file_name();
+        let name = name.to_string_lossy();
+
+        if name.len() < TEAMS_DISK_CACHE_KEY_HEX_LEN {
+            continue;
+        }
+        let key = &name[..TEAMS_DISK_CACHE_KEY_HEX_LEN];
+        if !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let delimiter = name.as_bytes().get(TEAMS_DISK_CACHE_KEY_HEX_LEN).copied();
+        if !matches!(delimiter, Some(b'.') | Some(b'-')) {
+            continue;
+        }
+
+        let entry = grouped.entry(key.to_string()).or_default();
+        entry.size = entry.size.saturating_add(metadata.len());
+        if let Ok(modified) = metadata.modified() {
+            if entry.modified.map_or(true, |current| modified > current) {
+                entry.modified = Some(modified);
+            }
+        }
+    }
+
+    let mut total = grouped
+        .values()
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
+    if total <= max_bytes {
+        return Ok(());
+    }
+
+    let mut entries: Vec<_> = grouped.into_iter().collect();
+    entries.sort_by_key(|(_, entry)| entry.modified.unwrap_or(SystemTime::UNIX_EPOCH));
+
+    for (key, entry) in entries {
+        if total <= max_bytes {
+            break;
+        }
+        remove_teams_disk_cache_entry(dir, &key);
+        total = total.saturating_sub(entry.size);
+    }
+
+    Ok(())
+}
+
+fn store_teams_disk_cache(
+    dir: &std::path::Path,
+    cache_key: &str,
+    images: &[image::DynamicImage],
+    max_bytes: u64,
+) -> std::io::Result<()> {
+    use std::io::Cursor;
+
+    if images.is_empty() {
+        return Ok(());
+    }
+
+    create_private_cache_dir(dir)?;
+
+    let mut encoded = Vec::with_capacity(images.len());
+    for image in images.iter().take(MAX_TEAMS_IMAGES) {
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+        let bytes = cursor.into_inner();
+        if bytes.len() > MAX_TEAMS_IMAGE_BYTES {
+            return Ok(());
+        }
+        encoded.push(bytes);
+    }
+
+    if encoded.is_empty() {
+        return Ok(());
+    }
+
+    remove_teams_disk_cache_entry(dir, cache_key);
+
+    let pid = std::process::id();
+    for (index, bytes) in encoded.iter().enumerate() {
+        let final_path = dir.join(format!("{cache_key}-{index}.png"));
+        let temp_path = dir.join(format!("{cache_key}-{index}.png.tmp-{pid}"));
+        write_private_cache_file(&temp_path, bytes)?;
+        if final_path.exists() {
+            std::fs::remove_file(&final_path)?;
+        }
+        std::fs::rename(&temp_path, &final_path)?;
+    }
+
+    let meta_path = dir.join(format!("{cache_key}.meta"));
+    let temp_meta = dir.join(format!("{cache_key}.meta.tmp-{pid}"));
+    write_private_cache_file(&temp_meta, format!("{}\n", encoded.len()).as_bytes())?;
+    if meta_path.exists() {
+        std::fs::remove_file(&meta_path)?;
+    }
+    std::fs::rename(&temp_meta, &meta_path)?;
+
+    prune_teams_disk_cache(dir, max_bytes)
+}
+
+fn reference_image_files(message: &ChatMessage) -> Vec<(String, String)> {
+    message
+        .attachments
+        .iter()
+        .filter(|attachment| {
+            attachment
+                .content_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("reference"))
+        })
+        .filter_map(|attachment| {
+            let name = attachment.name.as_deref()?;
+            if !is_supported_teams_image_name(name) {
+                return None;
+            }
+
+            Some((name.to_string(), attachment.content_url.clone()?))
+        })
+        .take(MAX_TEAMS_IMAGES)
+        .collect()
+}
+
+fn hosted_content_ids(message: &ChatMessage) -> Vec<String> {
+    fn collect(text: &str, ids: &mut Vec<String>) {
+        const MARKER: &str = "hostedContents/";
+        let mut rest = text;
+
+        while let Some(pos) = rest.find(MARKER) {
+            let after = &rest[pos + MARKER.len()..];
+            let end = after
+                .find(|c: char| {
+                    c == '/' || c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace()
+                })
+                .unwrap_or(after.len());
+
+            if end > 0 {
+                let id = &after[..end];
+                if !ids.iter().any(|known| known == id) {
+                    ids.push(id.to_string());
+                }
+            }
+
+            rest = &after[end..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let mut ids = Vec::new();
+
+    if let Some(body) = message
+        .body
+        .as_ref()
+        .and_then(|body| body.content.as_deref())
+    {
+        collect(body, &mut ids);
+    }
+
+    for attachment in &message.attachments {
+        if let Some(content) = attachment.content.as_deref() {
+            collect(content, &mut ids);
+        }
+        if let Some(url) = attachment.content_url.as_deref() {
+            collect(url, &mut ids);
+        }
+    }
+
+    ids.truncate(MAX_TEAMS_IMAGES);
+    ids
 }
 
 impl App {
@@ -1304,6 +1707,360 @@ impl App {
         });
     }
 
+    fn teams_image_key_for_index(&self, index: usize) -> Option<TeamsImageKey> {
+        let message_id = self.teams.messages.get(index)?.id.clone();
+        let source = match self.teams.mode {
+            TeamsMode::Chats => TeamsImageSource::Chat(self.teams.open_chat_id.clone()?),
+            TeamsMode::Channels => {
+                let (team_id, channel_id) = self.teams.open_channel.clone()?;
+                TeamsImageSource::Channel {
+                    team_id,
+                    channel_id,
+                }
+            }
+        };
+
+        Some(TeamsImageKey { source, message_id })
+    }
+
+    fn selected_teams_image_key(&self) -> Option<TeamsImageKey> {
+        self.teams_image_key_for_index(self.teams.msg_sel)
+    }
+
+    fn apply_cached_teams_images(&mut self, key: &TeamsImageKey) -> bool {
+        let Some(images) = self.teams.image_cache.get(key).cloned() else {
+            return false;
+        };
+        let Some(picker) = self.image_picker.as_ref() else {
+            return false;
+        };
+
+        self.teams.selected_images = images
+            .into_iter()
+            .map(|image| MailImage {
+                state: std::cell::RefCell::new(picker.new_resize_protocol(image)),
+            })
+            .collect();
+
+        true
+    }
+
+    fn refresh_selected_teams_images(&mut self) {
+        if self.image_picker.is_none() {
+            self.teams.selected_images.clear();
+            self.teams.selected_image_key = None;
+            return;
+        }
+
+        let Some(key) = self.selected_teams_image_key() else {
+            self.teams.selected_images.clear();
+            self.teams.selected_image_key = None;
+            return;
+        };
+
+        if self.teams.selected_image_key.as_ref() != Some(&key) {
+            self.teams.selected_images.clear();
+            self.teams.selected_image_key = Some(key.clone());
+            let _ = self.apply_cached_teams_images(&key);
+        }
+
+        self.prefetch_teams_images();
+    }
+
+    fn prefetch_teams_images(&mut self) {
+        const PREFETCH_RADIUS: usize = 4;
+
+        if self.image_picker.is_none() || self.teams.messages.is_empty() {
+            return;
+        }
+
+        let center = self
+            .teams
+            .msg_sel
+            .min(self.teams.messages.len().saturating_sub(1));
+        let mut indices = Vec::with_capacity(PREFETCH_RADIUS * 2 + 1);
+        indices.push(center);
+        for offset in 1..=PREFETCH_RADIUS {
+            if let Some(index) = center.checked_sub(offset) {
+                indices.push(index);
+            }
+            let index = center + offset;
+            if index < self.teams.messages.len() {
+                indices.push(index);
+            }
+        }
+
+        for index in indices {
+            let Some(key) = self.teams_image_key_for_index(index) else {
+                continue;
+            };
+
+            if self.teams.image_cache.contains_key(&key)
+                || self.teams.image_in_flight.contains(&key)
+            {
+                continue;
+            }
+
+            let (mut hosted_ids, mut reference_files, reference_owner_user_id) = {
+                let Some(message) = self.teams.messages.get(index) else {
+                    continue;
+                };
+                let hosted_ids = hosted_content_ids(message);
+                let reference_files = reference_image_files(message);
+                let owner = message
+                    .from
+                    .as_ref()
+                    .and_then(|from| from.user.as_ref())
+                    .and_then(|user| user.id.clone());
+                (hosted_ids, reference_files, owner)
+            };
+
+            hosted_ids.truncate(MAX_TEAMS_IMAGES);
+
+            if !self.session.config.teams_file_images {
+                reference_files.clear();
+            } else if !self.session.config.can_read_files() {
+                if index == center && !reference_files.is_empty() {
+                    self.status =
+                        "M365_TEAMS_FILE_IMAGES=1 requires Files.Read.All in M365_SCOPES".into();
+                }
+                reference_files.clear();
+            }
+
+            let remaining = MAX_TEAMS_IMAGES.saturating_sub(hosted_ids.len());
+            reference_files.truncate(remaining);
+
+            if hosted_ids.is_empty() && reference_files.is_empty() {
+                self.teams.image_cache.insert(key, Vec::new());
+                continue;
+            }
+
+            self.teams.image_in_flight.insert(key.clone());
+            tracing::debug!(
+                "Teams image prefetch queued for {:?}: hosted={}, reference={}",
+                key,
+                hosted_ids.len(),
+                reference_files.len()
+            );
+
+            let s = self.session.clone();
+            let task_key = key.clone();
+            self.spawn(async move {
+                let disk_cache_dir = s.config.teams_image_cache_dir.clone();
+                let disk_cache_max_bytes = s
+                    .config
+                    .teams_image_cache_max_mb
+                    .saturating_mul(1024 * 1024);
+                let disk_cache_key = teams_disk_cache_key(&task_key);
+
+                if let Some(cache_dir) = disk_cache_dir.as_ref() {
+                    let read_dir = cache_dir.clone();
+                    let read_key = disk_cache_key.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        load_teams_disk_cache(&read_dir, &read_key)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some(images))) => {
+                            tracing::debug!(
+                                "Teams image disk cache hit for {:?}: {} image(s)",
+                                task_key,
+                                images.len()
+                            );
+                            return Ok(AppMessage::TeamsImages {
+                                key: task_key,
+                                images,
+                            });
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                "Teams image disk cache read failed for {:?}: {error}",
+                                task_key
+                            );
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Teams image disk cache reader task failed for {:?}: {error}",
+                                task_key
+                            );
+                        }
+                    }
+                }
+
+                let mut images =
+                    Vec::with_capacity(hosted_ids.len() + reference_files.len());
+
+                for hosted_content_id in hosted_ids {
+                    let result = match &task_key.source {
+                        TeamsImageSource::Chat(chat_id) => {
+                            chats::hosted_content_bytes(
+                                &s.graph,
+                                chat_id,
+                                &task_key.message_id,
+                                &hosted_content_id,
+                            )
+                            .await
+                        }
+                        TeamsImageSource::Channel {
+                            team_id,
+                            channel_id,
+                        } => {
+                            channels::hosted_content_bytes(
+                                &s.graph,
+                                team_id,
+                                channel_id,
+                                &task_key.message_id,
+                                &hosted_content_id,
+                            )
+                            .await
+                        }
+                    };
+
+                    let bytes = match result {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            tracing::debug!(
+                                "Teams hosted image {hosted_content_id} could not be downloaded: {error:#}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    if bytes.len() > MAX_TEAMS_IMAGE_BYTES {
+                        tracing::debug!(
+                            "Teams hosted image {hosted_content_id} exceeds {} bytes; skipping",
+                            MAX_TEAMS_IMAGE_BYTES
+                        );
+                        continue;
+                    }
+
+                    let decoded =
+                        tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await;
+                    match decoded {
+                        Ok(Ok(image)) if image.width() > 1 && image.height() > 1 => {
+                            images.push(
+                                image.thumbnail(
+                                    MAX_TEAMS_IMAGE_WIDTH,
+                                    MAX_TEAMS_IMAGE_HEIGHT,
+                                ),
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            // Ignore tracking-size pixels.
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                "Teams hosted image {hosted_content_id} could not be decoded: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Teams hosted image decoder task failed for {hosted_content_id}: {error}"
+                            );
+                        }
+                    }
+                }
+
+                for (name, content_url) in reference_files {
+                    let bytes = match chats::reference_file_bytes(
+                        &s.graph,
+                        reference_owner_user_id.as_deref(),
+                        &name,
+                        &content_url,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            tracing::debug!(
+                                "Teams image file attachment {name} could not be downloaded: {error:#}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    if bytes.len() > MAX_TEAMS_IMAGE_BYTES {
+                        tracing::debug!(
+                            "Teams image file attachment {name} exceeds {} bytes; skipping",
+                            MAX_TEAMS_IMAGE_BYTES
+                        );
+                        continue;
+                    }
+
+                    let decoded =
+                        tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await;
+                    match decoded {
+                        Ok(Ok(image)) if image.width() > 1 && image.height() > 1 => {
+                            images.push(
+                                image.thumbnail(
+                                    MAX_TEAMS_IMAGE_WIDTH,
+                                    MAX_TEAMS_IMAGE_HEIGHT,
+                                ),
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            // Ignore tracking-size pixels.
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                "Teams image file attachment {name} could not be decoded: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Teams image file decoder task failed for {name}: {error}"
+                            );
+                        }
+                    }
+                }
+
+                if let Some(cache_dir) = disk_cache_dir {
+                    if !images.is_empty() {
+                        let write_images = images.clone();
+                        let write_key = disk_cache_key.clone();
+                        let cache_key_for_log = task_key.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            store_teams_disk_cache(
+                                &cache_dir,
+                                &write_key,
+                                &write_images,
+                                disk_cache_max_bytes,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                tracing::debug!(
+                                    "Teams image disk cache stored for {:?}: {} image(s)",
+                                    cache_key_for_log,
+                                    images.len()
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                tracing::debug!(
+                                    "Teams image disk cache write failed for {:?}: {error}",
+                                    cache_key_for_log
+                                );
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    "Teams image disk cache writer task failed for {:?}: {error}",
+                                    cache_key_for_log
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Ok(AppMessage::TeamsImages {
+                    key: task_key,
+                    images,
+                })
+            });
+        }
+    }
+
     /// Fetch the next page of older messages for the open conversation.
     fn load_more_teams_messages(&mut self) {
         if self.teams.loading_more {
@@ -1587,6 +2344,22 @@ impl App {
             } => {
                 if self.teams.open_channel.as_ref() == Some(&(team_id, channel_id)) {
                     self.set_teams_messages(messages, next, mode);
+                }
+            }
+            AppMessage::TeamsImages { key, images } => {
+                self.teams.image_in_flight.remove(&key);
+                let image_count = images.len();
+                self.teams.image_cache.insert(key.clone(), images);
+
+                tracing::debug!(
+                    "Teams image RAM cache stored for {:?}: {} image(s)",
+                    key,
+                    image_count
+                );
+
+                if self.selected_teams_image_key().as_ref() == Some(&key) {
+                    self.teams.selected_image_key = Some(key.clone());
+                    let _ = self.apply_cached_teams_images(&key);
                 }
             }
             AppMessage::Done(s) => {
@@ -1874,6 +2647,7 @@ impl App {
                 .unwrap_or(self.teams.msg_sel)
                 .min(last),
         };
+        self.refresh_selected_teams_images();
     }
 
     fn refresh_current(&mut self) {
@@ -2215,6 +2989,10 @@ impl App {
         match self.screen {
             Screen::Outlook => self.on_key_outlook(key),
             Screen::Teams => self.on_key_teams(key),
+        }
+
+        if self.screen == Screen::Teams {
+            self.refresh_selected_teams_images();
         }
     }
 

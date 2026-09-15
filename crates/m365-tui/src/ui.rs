@@ -454,6 +454,14 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
+fn is_teams_inline_image_attachment_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+}
+
 /// Lines of the open Teams conversation, plus the starting line index of each
 /// message. `selectable` adds the `▶` cursor and selection highlight (off in
 /// copy mode so the text copies cleanly).
@@ -584,6 +592,17 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
         }
         for att in &m.attachments {
             if let Some(name) = &att.name {
+                // Attachment rows are added here, after the rendered HTML body.
+                // Hide an image attachment only after the selected message has
+                // at least one successfully decoded Kitty image; until then the
+                // normal attachment row remains the fallback.
+                let replaced_by_inline_image = i == app.teams.msg_sel
+                    && !app.teams.selected_images.is_empty()
+                    && is_teams_inline_image_attachment_name(name);
+                if replaced_by_inline_image {
+                    continue;
+                }
+
                 lines.push(Line::from(vec![
                     Span::raw(gutter.clone()),
                     Span::styled(format!("📎 {name}"), Style::default().fg(Color::LightBlue)),
@@ -765,32 +784,6 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
-    let (mut lines, msg_starts) = conversation_lines(app, focused);
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "Select a conversation and press Enter.",
-            Style::default().fg(DIM),
-        ));
-    }
-    // Wrap here rather than letting `Paragraph` do it: scrolling needs the exact
-    // row count, and `Paragraph` won't report one. Estimating it undercounts —
-    // words don't fill a row — which left the newest messages below the edge.
-    let inner_w = right[0].width.saturating_sub(2).max(1) as usize;
-    let pane_h = right[0].height.saturating_sub(3).max(1) as usize; // borders + date header
-    let (rows, row_of_line) = crate::wrap::wrap_all(&lines, inner_w);
-    // Where each message begins, in rendered rows.
-    let msg_rows: Vec<usize> = msg_starts
-        .iter()
-        .map(|&l| row_of_line.get(l).copied().unwrap_or(rows.len()))
-        .collect();
-    let sel_end = msg_rows
-        .get(app.teams.msg_sel + 1)
-        .copied()
-        .unwrap_or(rows.len());
-    let scroll = sel_end
-        .saturating_sub(pane_h)
-        .min(rows.len().saturating_sub(pane_h)) as u16;
-    // Flag messages that arrived while the user was reading further back.
     let title = if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
     } else if focused {
@@ -799,9 +792,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         "Conversation".to_string()
     };
 
-    // The pane is split inside its border: a pinned date header on the first
-    // row, then the scrolling message flow. The header tracks the day of the
-    // topmost visible message, so it updates as you scroll.
+    // Build the final conversation rectangle first. Inline image sizing must use
+    // the exact width available inside the border, not the whole terminal.
     let block = panel_block(&title, focused);
     let inner = block.inner(right[0]);
     f.render_widget(block, right[0]);
@@ -810,11 +802,171 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
+    let inner_w = pane[1].width.max(1) as usize;
+    let teams_image_count = app.teams.selected_images.len().min(4);
+    let teams_image_height = if teams_image_count == 0 || pane[1].height == 0 {
+        0
+    } else {
+        // Use the real source aspect ratio and terminal cell metrics even in a
+        // short pane. Reserve at least one text row and let the image shrink to
+        // whatever height is actually available.
+        let available_height = pane[1].height;
+        let max_image_height = (available_height.saturating_mul(3) / 5)
+            .max(1)
+            .min(available_height.saturating_sub(1).max(1));
+        let image_col_width = (pane[1].width / teams_image_count as u16).max(1);
+        let available = Rect::new(0, 0, image_col_width, max_image_height);
+
+        app.teams
+            .selected_images
+            .iter()
+            .take(teams_image_count)
+            .filter_map(|image| {
+                image
+                    .state
+                    .try_borrow()
+                    .ok()
+                    .map(|state| state.size_for(Resize::Fit(None), available).height)
+            })
+            .max()
+            .unwrap_or(0)
+            .min(max_image_height)
+    };
+
+    let (mut lines, msg_starts) = conversation_lines(app, focused);
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "Select a conversation and press Enter.",
+            Style::default().fg(DIM),
+        ));
+    }
+
+    // Wrap first, then reserve terminal rows immediately after the selected
+    // message. This makes the Kitty image part of the scrolling conversation
+    // instead of a detached gallery stuck to the bottom of the panel.
+    let (mut rows, row_of_line) = crate::wrap::wrap_all(&lines, inner_w);
+    let mut msg_rows: Vec<usize> = msg_starts
+        .iter()
+        .map(|&line| row_of_line.get(line).copied().unwrap_or(rows.len()))
+        .collect();
+
+    let inline_image_row = if teams_image_height > 0 && !msg_rows.is_empty() {
+        let insert_at = msg_rows
+            .get(app.teams.msg_sel + 1)
+            .copied()
+            .unwrap_or(rows.len());
+
+        for _ in 0..teams_image_height {
+            rows.insert(insert_at, Line::raw(""));
+        }
+
+        for row in msg_rows.iter_mut().skip(app.teams.msg_sel + 1) {
+            *row += teams_image_height as usize;
+        }
+
+        Some(insert_at)
+    } else {
+        None
+    };
+
+    let pane_h = pane[1].height.max(1) as usize;
+    let sel_end = inline_image_row
+        .map(|row| row + teams_image_height as usize)
+        .or_else(|| msg_rows.get(app.teams.msg_sel + 1).copied())
+        .unwrap_or(rows.len());
+    let scroll = sel_end
+        .saturating_sub(pane_h)
+        .min(rows.len().saturating_sub(pane_h)) as u16;
+
     if let Some(label) = sticky_day_label(app, &msg_rows, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
-    // Already wrapped, so no `Wrap` here — the rows are exactly what's drawn.
+
+    // Text first; the graphics protocol image is drawn over its reserved blank
+    // rows afterwards.
     f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), pane[1]);
+
+    if let Some(image_row) = inline_image_row {
+        let image_height = teams_image_height as usize;
+        let viewport_top = scroll as usize;
+        let viewport_bottom = viewport_top + pane[1].height as usize;
+
+        // Selection scrolling should keep the whole image visible. If the
+        // terminal is resized mid-frame and it no longer fits, wait for the next
+        // frame rather than rescaling a clipped fragment.
+        if image_row >= viewport_top
+            && image_row + image_height <= viewport_bottom
+            && teams_image_height > 0
+        {
+            let image_area = Rect {
+                x: pane[1].x,
+                y: pane[1].y + (image_row - viewport_top) as u16,
+                width: pane[1].width,
+                height: teams_image_height,
+            };
+            f.render_widget(Clear, image_area);
+
+            let constraints =
+                vec![Constraint::Ratio(1, teams_image_count as u32); teams_image_count];
+            let image_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(constraints)
+                .split(image_area);
+
+            for (teams_image, area) in app
+                .teams
+                .selected_images
+                .iter()
+                .take(teams_image_count)
+                .zip(image_cols.iter().copied())
+            {
+                if let Ok(mut state) = teams_image.state.try_borrow_mut() {
+                    let bounds = Rect::new(0, 0, area.width, area.height);
+                    let fitted = state.size_for(Resize::Fit(None), bounds);
+                    if fitted.width == 0 || fitted.height == 0 {
+                        continue;
+                    }
+
+                    // Small images are easier to follow when they start where
+                    // the message text starts instead of floating in the middle
+                    // of a wide conversation pane. Larger images stay centered.
+                    let small_image =
+                        fitted.width.saturating_mul(5) <= area.width.saturating_mul(3);
+                    let fitted_x = if small_image {
+                        // Selected message gutter: "▶ " + HH:MM + trailing space.
+                        // Apply it for a single inline image so the image aligns
+                        // with the message body rather than the pane border.
+                        let text_indent = if teams_image_count == 1 {
+                            (TIME_WIDTH as u16 + 3)
+                                .min(area.width.saturating_sub(fitted.width))
+                        } else {
+                            0
+                        };
+                        area.x + text_indent
+                    } else {
+                        area.x + area.width.saturating_sub(fitted.width) / 2
+                    };
+                    let fitted_area = Rect::new(
+                        fitted_x,
+                        area.y + area.height.saturating_sub(fitted.height) / 2,
+                        fitted.width.min(area.width),
+                        fitted.height.min(area.height),
+                    );
+                    f.render_stateful_widget(
+                        StatefulImage::new().resize(Resize::Fit(None)),
+                        fitted_area,
+                        &mut *state,
+                    );
+
+                    if let Some(result) = state.last_encoding_result() {
+                        if let Err(error) = result {
+                            tracing::warn!("Teams inline image encoding failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let composing = app.teams.focus == TeamsFocus::Composer;
     let title = if composing {

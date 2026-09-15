@@ -101,7 +101,7 @@ Then two settings on that app:
    offline_access  openid  profile
    ```
 
-   Two capabilities are **opt-in**, because adding a scope later forces everyone
+   Three capabilities are **opt-in**, because adding a scope later forces everyone
    to re-consent. Add these now if you want them, then enable the matching flag
    in `.env`:
 
@@ -109,6 +109,7 @@ Then two settings on that app:
    |---|---|---|
    | `Team.ReadBasic.All` | Teams **channels** (chats work without it) | `M365_TEAMS_CHANNELS=1` |
    | `Presence.ReadWrite` | Setting your own status | `M365_PRESENCE_WRITE=1` |
+  | `Files.Read.All` | Regular Teams image file previews from OneDrive / SharePoint | `M365_TEAMS_FILE_IMAGES=1` |
 
 7. Click **Grant admin consent**.
 
@@ -404,7 +405,7 @@ Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 
 ## Local enhancements
 
-This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, and polling feedback.
+This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, and Kitty image previews.
 
 - Added configurable delayed marking of Outlook messages as read using `M365_READ_MSG_TIMEOUT`.
 - Added the `u` key to toggle the selected Outlook message between read and unread.
@@ -457,6 +458,55 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - `push …`, `push live`, and `push FAILED` keep their original labels and colors.
 - The polling progress indicator has been tested in poll-only mode.
 - The behavior with a fully working push connection has not yet been tested by the maintainer.
+
+### Kitty image previews
+
+- Kitty graphics are enabled only when the terminal reports support for the Kitty graphics protocol. Other terminals keep the normal text-only fallback.
+- Outlook messages can preview JPEG, PNG, and GIF image attachments directly in the reading pane.
+- Teams messages can preview hosted inline images and regular JPEG, JPG, PNG, and GIF file attachments directly in the conversation.
+- GIF files are currently displayed as a static image rather than animated.
+- Up to 4 images are processed per message.
+- Individual images larger than 8 MiB are skipped.
+- Images are reduced to at most 1600x1200 before rendering.
+- Tracking-size images such as 1x1 pixels are ignored.
+- Arbitrary external image URLs from message HTML are not downloaded.
+- Teams images are rendered inline with their message. A successfully loaded regular image attachment replaces the redundant attachment-name row.
+- Image size adapts to the available terminal area. Small images are aligned with the message text; larger images are centered.
+- The selected Teams message and up to 4 neighboring messages on either side are prefetched.
+- Decoded Teams images are cached in memory for the lifetime of the process, and duplicate in-flight downloads are suppressed.
+- Regular Teams file-image previews are opt-in with `M365_TEAMS_FILE_IMAGES=1`. With default scopes this adds `Files.Read.All`; when `M365_SCOPES` is set explicitly, `Files.Read.All` must be included manually.
+
+#### Teams file resolver status
+
+Regular Teams file attachments are resolved through four adaptive strategies. Resolver preferences are learned only for the current process and are not persisted.
+
+- **Sender OneDrive path** - runtime-tested successfully with a regular JPEG attachment in a one-to-one Teams chat.
+- **Accessible-drive search** - implemented and exercised during diagnostics, but a successful file resolution through this fallback has not yet been runtime-tested.
+- **Microsoft Search** - implemented, but a successful file resolution through this fallback has not yet been runtime-tested.
+- **Graph `/shares`** - implemented for genuine OneDrive / SharePoint sharing links. A genuine sharing-link attachment has not yet been successfully runtime-tested. Using `/shares` with a Teams WebDAV URL was tested and confirmed not to be the correct route for that URL type.
+- Regular image file attachments in **Teams channels** use the same resolver infrastructure, but successful channel-file resolution has not yet been runtime-tested.
+- Hosted-content image retrieval is implemented for both chats and channels, but neither hosted-content path has yet been separately runtime-tested in this fork.
+
+#### Optional Teams image disk cache
+
+Teams image caching is memory-only by default. Persistent caching can be enabled explicitly:
+
+```dotenv
+M365_TEAMS_IMAGE_CACHE_DIR=/home/user/.cache/m365-tui/teams-images
+M365_TEAMS_IMAGE_CACHE_MAX_MB=256
+```
+
+- `M365_TEAMS_IMAGE_CACHE_DIR` must be set to enable disk caching. If it is unset or empty, no Teams images are written to disk.
+- The default size limit is 256 MiB.
+- The cache stores resized PNG thumbnails rather than the original downloaded files.
+- Cache filenames use deterministic anonymous keys and do not contain the original attachment filename.
+- On Unix, the cache directory is mode `0700` and cache files are mode `0600`.
+- Cached thumbnails are stored in plaintext and are not encrypted.
+- Corrupt or incomplete cache entries are discarded and fetched again when needed.
+- Cache pruning removes the oldest entries first when the configured size limit is exceeded.
+- Disk-cache reuse across application restarts and oldest-first pruning have both been runtime-tested.
+
+The image-preview implementation adds Rust `ratatui-image` / `image` build dependencies, but does not require any additional external system library, helper binary, service, or other runtime dependency.
 
 ### Primary Teams presence
 
