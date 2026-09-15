@@ -1053,7 +1053,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           f forward · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
-          i type message · r reply to selected · Enter send\n\
+          a/i type message · r reply to selected · Enter send\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\

@@ -3222,7 +3222,7 @@ impl App {
                     TeamsMode::Channels => TeamsMode::Chats,
                 };
             }
-            KeyCode::Char('i') => self.teams.focus = TeamsFocus::Composer,
+            KeyCode::Char('i') | KeyCode::Char('a') => self.teams.focus = TeamsFocus::Composer,
             // Reply to the selected message: same composer, quoted on send.
             KeyCode::Char('r')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
