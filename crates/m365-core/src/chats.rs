@@ -31,6 +31,7 @@ pub async fn list_messages(
 
 /// Mark the signed-in user's chat as read in Teams.
 ///
+/// Graph expects the signed-in user's object id and tenant id.
 pub async fn mark_read(
     graph: &GraphClient,
     chat_id: &str,

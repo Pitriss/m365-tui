@@ -405,6 +405,8 @@ Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 
 ## Local enhancements
 
+- Teams chats are now marked as read on the Microsoft 365 server after the conversation is opened successfully. The read state is therefore synchronized with other Teams clients. Uses the existing `Chat.ReadWrite` permission; no additional runtime dependencies or permissions are required.
+
 This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, and Kitty image previews.
 
 - Added configurable delayed marking of Outlook messages as read using `M365_READ_MSG_TIMEOUT`.
