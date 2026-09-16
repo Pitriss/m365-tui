@@ -29,6 +29,27 @@ pub async fn list_messages(
     graph.get_page_with_next(&path).await
 }
 
+/// Mark the signed-in user's chat as read in Teams.
+///
+pub async fn mark_read(
+    graph: &GraphClient,
+    chat_id: &str,
+    user_id: &str,
+    tenant_id: &str,
+) -> Result<()> {
+    graph
+        .post_action(
+            &format!("chats/{chat_id}/markChatReadForUser"),
+            &json!({
+                "user": {
+                    "id": user_id,
+                    "tenantId": tenant_id
+                }
+            }),
+        )
+        .await
+}
+
 /// List messages newest-first by creation time. Used for unread counting so
 /// paging can stop as soon as the chat viewpoint is reached.
 pub async fn list_messages_created_desc(

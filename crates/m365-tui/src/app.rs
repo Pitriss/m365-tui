@@ -1519,6 +1519,27 @@ impl App {
         self.spawn(async move { Ok(AppMessage::Chats(chats::list_chats(&s.graph, 40).await?)) });
     }
 
+    fn mark_teams_chat_read(&self, chat_id: String) {
+        let s = self.session.clone();
+        let known_user_id = self.me.as_ref().map(|me| me.id.clone());
+        let tenant_id = self.session.config.tenant_id.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let user_id = match known_user_id {
+                    Some(id) => id,
+                    None => people::me(&s.graph).await?.id,
+                };
+                chats::mark_read(&s.graph, &chat_id, &user_id, &tenant_id).await
+            }
+            .await;
+
+            match result {
+                Ok(()) => tracing::debug!("marked Teams chat read on server: {chat_id}"),
+                Err(e) => tracing::warn!("marking Teams chat read failed for {chat_id}: {e:#}"),
+            }
+        });
+    }
+
     fn load_contact_presences(&self, chats: &[Chat]) {
         if !self.session.config.presence_read {
             return;
@@ -2322,6 +2343,7 @@ impl App {
                     self.set_teams_messages(messages, next, mode);
                     if first_load {
                         self.teams.chat_unread_counts.remove(&chat_id);
+                        self.mark_teams_chat_read(chat_id.clone());
                         if let Some(latest_id) = latest_id {
                             self.teams.locally_read_through.insert(chat_id, latest_id);
                         }
