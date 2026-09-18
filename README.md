@@ -408,6 +408,21 @@ Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 
 ## Local enhancements
 
+### Calendar month view
+
+- Calendar now has two views: the existing agenda and a graphical month view. Press `v` to switch between them.
+- Month view renders a Monday-to-Sunday calendar grid and shows 1–4 months side by side depending on terminal width. The leftmost month is the active month; additional months are previews.
+- `Left` / `Right` move to the previous / next month and `n` returns to the current month.
+- `j` / `k` move chronologically between events in the active month. `PageUp` / `PageDown` move by five events and `Home` / `End` select the first / last event in that month.
+- `Enter` / `g` open event detail, `o` opens the online meeting when a join URL is available, and `a` / `d` / `t` keep the existing RSVP actions.
+- Multi-day events are drawn as continuous coloured bars across calendar days and week boundaries. Meeting-capable events retain the `M` marker.
+- The selected event is emphasized with a stronger visual style and marker while retaining its RSVP/status colour.
+- Month view requires at least `68x23` terminal cells. If a saved Month view is restored in a smaller window, Calendar falls back to Agenda and shows a transient internal notice. Trying to switch to Month in a small window does the same.
+- The small-window notice disappears automatically after three seconds or immediately on any key press.
+- The selected Calendar view is persisted in the existing UI state when UI-state persistence is enabled.
+- This feature adds no new Rust runtime dependencies and requires no additional Microsoft Graph permissions.
+
+
 - Teams chats are now marked as read on the Microsoft 365 server after the conversation is opened successfully. The read state is therefore synchronized with other Teams clients. Uses the existing `Chat.ReadWrite` permission; no additional runtime dependencies or permissions are required.
 
 This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, Kitty image previews, and calendar workflows.
