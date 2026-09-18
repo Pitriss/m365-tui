@@ -113,6 +113,7 @@ pub enum AppMessage {
 pub enum Screen {
     Outlook,
     Teams,
+    Calendar,
 }
 
 /// Which kind of reply the user asked for.
@@ -366,7 +367,36 @@ pub struct OutlookState {
     pub reading_images: Vec<MailImage>,
     /// Line scroll offset of the reading pane.
     pub reading_scroll: u16,
-    pub calendar: Vec<CalEvent>,
+}
+
+pub struct CalendarState {
+    pub events: Vec<CalEvent>,
+    pub selected: usize,
+    pub days: i64,
+}
+
+impl Default for CalendarState {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            selected: 0,
+            days: DEFAULT_CALENDAR_DAYS,
+        }
+    }
+}
+
+struct UiState {
+    screen: Screen,
+    calendar_days: i64,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            screen: Screen::Outlook,
+            calendar_days: DEFAULT_CALENDAR_DAYS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -469,6 +499,7 @@ pub struct App {
     image_picker: Option<ratatui_image::picker::Picker>,
     pub outlook_focus: OutlookFocus,
     pub teams: TeamsState,
+    pub calendar: CalendarState,
     pub overlay: Option<Overlay>,
     pub status: String,
     pub me: Option<User>,
@@ -522,8 +553,8 @@ pub struct App {
 const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("outlook", "Switch to Outlook"),
     ("teams", "Switch to Teams"),
+    ("calendar", "Switch to Calendar"),
     ("compose", "Compose new mail"),
-    ("calendar", "Open calendar (today)"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
     ("help", "Show help"),
@@ -533,6 +564,9 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
 const MAX_MAIL_IMAGES: usize = 4;
 const MAX_MAIL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MAIL_IMAGE_WIDTH: u32 = 1600;
+const DEFAULT_CALENDAR_DAYS: i64 = 30;
+const CALENDAR_RANGES: &[i64] = &[7, 14, 30, 60, 90, 180, 365];
+const UI_STATE_FILE: &str = "ui-state";
 const MAX_MAIL_IMAGE_HEIGHT: u32 = 1200;
 const MAX_TEAMS_IMAGES: usize = MAX_MAIL_IMAGES;
 const MAX_TEAMS_IMAGE_BYTES: usize = MAX_MAIL_IMAGE_BYTES;
@@ -675,6 +709,74 @@ fn write_private_cache_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         .open(path)?;
     file.write_all(bytes)?;
     file.flush()
+}
+
+fn load_ui_state(cache_dir: Option<&std::path::Path>) -> UiState {
+    let Some(cache_dir) = cache_dir else {
+        return UiState::default();
+    };
+
+    let path = cache_dir.join(UI_STATE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return UiState::default();
+        }
+        Err(error) => {
+            tracing::warn!("could not read UI state {}: {error}", path.display());
+            return UiState::default();
+        }
+    };
+
+    let mut state = UiState::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "screen" => {
+                state.screen = match value.trim() {
+                    "outlook" => Screen::Outlook,
+                    "teams" => Screen::Teams,
+                    "calendar" => Screen::Calendar,
+                    _ => state.screen,
+                };
+            }
+            "calendar_days" => {
+                if let Ok(days) = value.trim().parse::<i64>() {
+                    if CALENDAR_RANGES.contains(&days) {
+                        state.calendar_days = days;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state
+}
+
+fn store_ui_state(
+    cache_dir: &std::path::Path,
+    screen: Screen,
+    calendar_days: i64,
+) -> std::io::Result<()> {
+    create_private_cache_dir(cache_dir)?;
+
+    let screen = match screen {
+        Screen::Outlook => "outlook",
+        Screen::Teams => "teams",
+        Screen::Calendar => "calendar",
+    };
+    let data = format!("screen={screen}\ncalendar_days={calendar_days}\n");
+    let final_path = cache_dir.join(UI_STATE_FILE);
+    let temp_path = cache_dir.join(format!("{UI_STATE_FILE}.tmp-{}", std::process::id()));
+
+    write_private_cache_file(&temp_path, data.as_bytes())?;
+    if final_path.exists() {
+        std::fs::remove_file(&final_path)?;
+    }
+    std::fs::rename(temp_path, final_path)
 }
 
 fn remove_teams_disk_cache_entry(dir: &std::path::Path, cache_key: &str) {
@@ -942,6 +1044,7 @@ fn hosted_content_ids(message: &ChatMessage) -> Vec<String> {
 
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
+        let ui_state = load_ui_state(session.config.teams_image_cache_dir.as_deref());
         let image_picker = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             match ratatui_image::picker::Picker::from_query_stdio() {
                 Ok(picker)
@@ -973,11 +1076,15 @@ impl App {
         Self {
             session,
             tx,
-            screen: Screen::Outlook,
+            screen: ui_state.screen,
             outlook: OutlookState::default(),
             image_picker,
             outlook_focus: OutlookFocus::Messages,
             teams: TeamsState::default(),
+            calendar: CalendarState {
+                days: ui_state.calendar_days,
+                ..CalendarState::default()
+            },
             overlay: None,
             status: "loading…".into(),
             me: None,
@@ -1012,6 +1119,22 @@ impl App {
         self.start_primary_presence();
         self.load_folders();
         self.load_chats();
+        if self.screen == Screen::Calendar {
+            self.load_calendar();
+        }
+    }
+
+    fn persist_ui_state(&self) {
+        let Some(cache_dir) = self.session.config.teams_image_cache_dir.as_deref() else {
+            return;
+        };
+
+        if let Err(error) = store_ui_state(cache_dir, self.screen, self.calendar.days) {
+            tracing::warn!(
+                "could not persist UI state in {}: {error}",
+                cache_dir.display()
+            );
+        }
     }
 
     // -- background task helpers ------------------------------------------
@@ -1502,9 +1625,8 @@ impl App {
 
     fn load_calendar(&self) {
         let s = self.session.clone();
-        // Today .. +7 days in UTC.
         let start = chrono::Utc::now();
-        let end = start + chrono::Duration::days(7);
+        let end = start + chrono::Duration::days(self.calendar.days);
         let start = start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let end = end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.spawn(async move {
@@ -2298,7 +2420,18 @@ impl App {
                 self.status = format!("marked as {}", if read { "read" } else { "unread" });
                 self.load_folders();
             }
-            AppMessage::Calendar(e) => self.outlook.calendar = e,
+            AppMessage::Calendar(events) => {
+                let selected_id = self
+                    .calendar
+                    .events
+                    .get(self.calendar.selected)
+                    .map(|event| event.id.clone());
+                self.calendar.events = events;
+                self.calendar.selected = selected_id
+                    .and_then(|id| self.calendar.events.iter().position(|event| event.id == id))
+                    .unwrap_or(self.calendar.selected)
+                    .min(self.calendar.events.len().saturating_sub(1));
+            }
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
                 self.load_contact_presences(&c);
@@ -2520,6 +2653,11 @@ impl App {
         if let Some((t, c)) = self.teams.open_channel.clone() {
             self.load_channel_messages(t, c, ListUpdate::Merge);
         }
+        if self.screen == Screen::Calendar
+            || matches!(self.overlay.as_ref(), Some(Overlay::Calendar))
+        {
+            self.load_calendar();
+        }
     }
 
     pub fn on_change(&mut self, change: ChangeEvent) {
@@ -2692,6 +2830,7 @@ impl App {
                     }
                 }
             },
+            Screen::Calendar => self.load_calendar(),
         }
     }
 
@@ -2705,6 +2844,7 @@ impl App {
                 .get(self.teams.msg_sel)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
+            Screen::Calendar => &[],
         }
     }
 
@@ -2861,6 +3001,7 @@ impl App {
                 .messages_rendered
                 .get(self.teams.msg_sel)
                 .map(content::plain),
+            Screen::Calendar => None,
         };
         match text {
             Some(t) if !t.trim().is_empty() => self.copy_to_clipboard(&t, "message"),
@@ -2876,6 +3017,7 @@ impl App {
                 .map(|lines| lines_to_plain(&lines))
                 .unwrap_or_default(),
             Screen::Teams => lines_to_plain(&crate::ui::conversation_lines(self, false).0),
+            Screen::Calendar => String::new(),
         };
         if text.trim().is_empty() {
             self.status = "nothing to copy".into();
@@ -2956,20 +3098,16 @@ impl App {
                 self.yank_all();
                 return;
             }
+            (KeyCode::F(1), _) => {
+                self.switch_screen(Screen::Outlook);
+                return;
+            }
             (KeyCode::F(2), _) => {
-                if self.screen == Screen::Outlook && self.outlook_focus == OutlookFocus::Reading {
-                    self.cancel_read_timer();
-                }
-                self.screen = match self.screen {
-                    Screen::Outlook => Screen::Teams,
-                    Screen::Teams => Screen::Outlook,
-                };
-                if self.screen == Screen::Teams {
-                    self.teams_unread = false;
-                }
-                if self.screen == Screen::Outlook && self.outlook_focus == OutlookFocus::Reading {
-                    self.schedule_current_read_timer();
-                }
+                self.switch_screen(Screen::Teams);
+                return;
+            }
+            (KeyCode::F(3), _) => {
+                self.switch_screen(Screen::Calendar);
                 return;
             }
             (KeyCode::F(5), _) => {
@@ -3016,11 +3154,38 @@ impl App {
         match self.screen {
             Screen::Outlook => self.on_key_outlook(key),
             Screen::Teams => self.on_key_teams(key),
+            Screen::Calendar => self.on_key_calendar(key),
         }
 
         if self.screen == Screen::Teams {
             self.refresh_selected_teams_images();
         }
+    }
+
+    fn switch_screen(&mut self, screen: Screen) {
+        if self.screen == Screen::Outlook
+            && screen != Screen::Outlook
+            && self.outlook_focus == OutlookFocus::Reading
+        {
+            self.cancel_read_timer();
+        }
+
+        self.screen = screen;
+        match screen {
+            Screen::Outlook => {
+                if self.outlook_focus == OutlookFocus::Reading {
+                    self.schedule_current_read_timer();
+                }
+            }
+            Screen::Teams => {
+                self.teams_unread = false;
+                if self.teams.chats.is_empty() {
+                    self.load_chats();
+                }
+            }
+            Screen::Calendar => self.load_calendar(),
+        }
+        self.persist_ui_state();
     }
 
     fn on_key_outlook(&mut self, key: KeyEvent) {
@@ -3078,6 +3243,87 @@ impl App {
     fn load_calendar_and_show(&mut self) {
         self.load_calendar();
         self.overlay = Some(Overlay::Calendar);
+    }
+
+    fn on_key_calendar(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.calendar.selected =
+                    step(self.calendar.selected, -1, self.calendar.events.len());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.calendar.selected =
+                    step(self.calendar.selected, 1, self.calendar.events.len());
+            }
+            KeyCode::PageUp => {
+                self.calendar.selected =
+                    step(self.calendar.selected, -10, self.calendar.events.len());
+            }
+            KeyCode::PageDown => {
+                self.calendar.selected =
+                    step(self.calendar.selected, 10, self.calendar.events.len());
+            }
+            KeyCode::Home => self.calendar.selected = 0,
+            KeyCode::End => {
+                self.calendar.selected = self.calendar.events.len().saturating_sub(1);
+            }
+            KeyCode::Char('a') => self.respond_calendar(calendar::Rsvp::Accept),
+            KeyCode::Char('d') => self.respond_calendar(calendar::Rsvp::Decline),
+            KeyCode::Char('t') => self.respond_calendar(calendar::Rsvp::Tentative),
+            KeyCode::Char('r') => self.load_calendar(),
+            KeyCode::Char('w') => {
+                let next = CALENDAR_RANGES
+                    .iter()
+                    .position(|days| *days == self.calendar.days)
+                    .map(|index| (index + 1) % CALENDAR_RANGES.len())
+                    .unwrap_or(0);
+                self.calendar.days = CALENDAR_RANGES[next];
+                self.calendar.selected = 0;
+                self.persist_ui_state();
+                self.status = format!("calendar range: {} days", self.calendar.days);
+                self.load_calendar();
+            }
+            _ => {}
+        }
+    }
+
+    fn respond_calendar(&mut self, rsvp: calendar::Rsvp) {
+        let Some(event) = self.calendar.events.get(self.calendar.selected) else {
+            self.status = "no calendar event selected".into();
+            return;
+        };
+
+        let response = event
+            .response_status
+            .as_ref()
+            .and_then(|status| status.response.as_deref())
+            .unwrap_or("");
+        if event.is_organizer.unwrap_or(false) || response.eq_ignore_ascii_case("organizer") {
+            self.status = "you are the organizer of this event".into();
+            return;
+        }
+        if event.is_cancelled.unwrap_or(false) {
+            self.status = "this event is cancelled".into();
+            return;
+        }
+        if event.response_requested == Some(false) {
+            self.status = "the organizer did not request a response".into();
+            return;
+        }
+
+        let id = event.id.clone();
+        let (progress, done) = match rsvp {
+            calendar::Rsvp::Accept => ("accepting event...", "event accepted"),
+            calendar::Rsvp::Decline => ("declining event...", "event declined"),
+            calendar::Rsvp::Tentative => ("marking event tentative...", "event marked tentative"),
+        };
+        self.status = progress.into();
+
+        let s = self.session.clone();
+        self.spawn(async move {
+            calendar::respond(&s.graph, &id, rsvp, "").await?;
+            Ok(AppMessage::Done(done.into()))
+        });
     }
 
     fn outlook_move(&mut self, delta: i32) {
@@ -3738,24 +3984,12 @@ impl App {
     fn run_command(&mut self, id: &str) {
         self.overlay = None;
         match id {
-            "outlook" => {
-                self.screen = Screen::Outlook;
-                if self.outlook_focus == OutlookFocus::Reading {
-                    self.schedule_current_read_timer();
-                }
-            }
-            "teams" => {
-                self.cancel_read_timer();
-                self.screen = Screen::Teams;
-                self.teams_unread = false;
-                if self.teams.chats.is_empty() {
-                    self.load_chats();
-                }
-            }
+            "outlook" => self.switch_screen(Screen::Outlook),
+            "teams" => self.switch_screen(Screen::Teams),
+            "calendar" => self.switch_screen(Screen::Calendar),
             "compose" => {
                 self.overlay = Some(Overlay::Compose(empty_compose()));
             }
-            "calendar" => self.load_calendar_and_show(),
             "chat-sender" => {
                 if let Some(addr) = self.current_mail().and_then(|m| m.sender_address()) {
                     self.status = format!("opening chat with {addr}…");

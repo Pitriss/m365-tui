@@ -132,6 +132,15 @@ pub struct Attendee {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ResponseStatus {
+    #[serde(default)]
+    pub response: Option<String>,
+    #[serde(default)]
+    pub time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Event {
     pub id: String,
     #[serde(default)]
@@ -152,6 +161,16 @@ pub struct Event {
     pub online_meeting: Option<OnlineMeetingInfo>,
     #[serde(default)]
     pub body_preview: Option<String>,
+    #[serde(default)]
+    pub response_status: Option<ResponseStatus>,
+    #[serde(default)]
+    pub is_organizer: Option<bool>,
+    #[serde(default)]
+    pub is_cancelled: Option<bool>,
+    #[serde(default)]
+    pub is_all_day: Option<bool>,
+    #[serde(default)]
+    pub response_requested: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
