@@ -155,6 +155,7 @@ pub enum Overlay {
     },
     Compose(Compose),
     Calendar,
+    CalendarEvent,
     /// Emoji reaction picker for the selected Teams message.
     React,
     /// Presence (status) picker for the signed-in user.
@@ -3141,7 +3142,9 @@ impl App {
                 return;
             }
             (KeyCode::Char('o'), KeyModifiers::NONE) if !typing => {
-                if self.focused_links().is_empty() {
+                if self.screen == Screen::Calendar {
+                    self.open_selected_calendar_meeting();
+                } else if self.focused_links().is_empty() {
                     self.status = "no links in this message".into();
                 } else {
                     self.overlay = Some(Overlay::Links);
@@ -3270,6 +3273,14 @@ impl App {
             KeyCode::Char('a') => self.respond_calendar(calendar::Rsvp::Accept),
             KeyCode::Char('d') => self.respond_calendar(calendar::Rsvp::Decline),
             KeyCode::Char('t') => self.respond_calendar(calendar::Rsvp::Tentative),
+            KeyCode::Enter | KeyCode::Char('g') => {
+                if self.calendar.events.is_empty() {
+                    self.status = "no calendar event selected".into();
+                } else {
+                    self.overlay = Some(Overlay::CalendarEvent);
+                }
+            }
+            KeyCode::Char('n') => self.calendar_jump_today(),
             KeyCode::Char('r') => self.load_calendar(),
             KeyCode::Char('w') => {
                 let next = CALENDAR_RANGES
@@ -3284,6 +3295,76 @@ impl App {
                 self.load_calendar();
             }
             _ => {}
+        }
+    }
+
+    fn open_selected_calendar_meeting(&mut self) {
+        let Some(url) = self
+            .calendar
+            .events
+            .get(self.calendar.selected)
+            .and_then(|event| event.online_meeting.as_ref())
+            .and_then(|meeting| meeting.join_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+
+        let result = match self.session.config.meeting_opener.as_deref() {
+            Some(executable) => crate::opener::open_url_with(&url, executable),
+            None => crate::opener::open_url(&url),
+        };
+
+        match result {
+            Ok(()) => self.status = "opening online meeting".into(),
+            Err(error) => self.status = format!("could not open meeting: {error:#}"),
+        }
+    }
+
+    fn calendar_jump_today(&mut self) {
+        let today = chrono::Local::now().date_naive();
+        let selected = self.calendar.events.iter().position(|event| {
+            let Some(start) = event.start.as_ref() else {
+                return false;
+            };
+
+            if let Ok(value) = chrono::DateTime::parse_from_rfc3339(&start.date_time) {
+                return value.with_timezone(&chrono::Local).date_naive() == today;
+            }
+
+            let parsed = chrono::NaiveDateTime::parse_from_str(
+                &start.date_time,
+                "%Y-%m-%dT%H:%M:%S%.f",
+            )
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(
+                    &start.date_time,
+                    "%Y-%m-%dT%H:%M:%S",
+                )
+            });
+
+            let Ok(value) = parsed else {
+                return false;
+            };
+
+            if start.time_zone.as_deref() == Some("UTC") {
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(value, chrono::Utc)
+                    .with_timezone(&chrono::Local)
+                    .date_naive()
+                    == today
+            } else {
+                value.date() == today
+            }
+        });
+
+        if let Some(index) = selected {
+            self.calendar.selected = index;
+            self.status = "jumped to today".into();
+        } else {
+            self.calendar.selected = 0;
+            self.status = "no remaining events today".into();
         }
     }
 
@@ -3707,6 +3788,12 @@ impl App {
         match overlay {
             Some(Overlay::Help) | Some(Overlay::Calendar) => {
                 // any key besides Esc closes
+            }
+            Some(Overlay::CalendarEvent) => {
+                if key.code == KeyCode::Char('o') {
+                    self.open_selected_calendar_meeting();
+                    self.overlay = Some(Overlay::CalendarEvent);
+                }
             }
             Some(Overlay::React) => {
                 if let KeyCode::Char(c @ '1'..='7') = key.code {
