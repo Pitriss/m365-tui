@@ -145,6 +145,7 @@ pub enum TeamsFocus {
 
 /// A transient full-screen/modal overlay.
 pub enum Overlay {
+    Notice(String),
     Help,
     Palette {
         query: String,
@@ -370,10 +371,18 @@ pub struct OutlookState {
     pub reading_scroll: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarView {
+    Agenda,
+    Month,
+}
+
 pub struct CalendarState {
     pub events: Vec<CalEvent>,
     pub selected: usize,
     pub days: i64,
+    pub view: CalendarView,
+    pub month_offset: i32,
 }
 
 impl Default for CalendarState {
@@ -382,6 +391,8 @@ impl Default for CalendarState {
             events: Vec::new(),
             selected: 0,
             days: DEFAULT_CALENDAR_DAYS,
+            view: CalendarView::Agenda,
+            month_offset: 0,
         }
     }
 }
@@ -389,6 +400,7 @@ impl Default for CalendarState {
 struct UiState {
     screen: Screen,
     calendar_days: i64,
+    calendar_view: CalendarView,
 }
 
 impl Default for UiState {
@@ -396,6 +408,7 @@ impl Default for UiState {
         Self {
             screen: Screen::Outlook,
             calendar_days: DEFAULT_CALENDAR_DAYS,
+            calendar_view: CalendarView::Agenda,
         }
     }
 }
@@ -502,6 +515,7 @@ pub struct App {
     pub teams: TeamsState,
     pub calendar: CalendarState,
     pub overlay: Option<Overlay>,
+    notice_until: Option<std::time::Instant>,
     pub status: String,
     pub me: Option<User>,
     /// The user's current presence (shown in the tab bar).
@@ -568,6 +582,8 @@ const MAX_MAIL_IMAGE_WIDTH: u32 = 1600;
 const DEFAULT_CALENDAR_DAYS: i64 = 30;
 const CALENDAR_RANGES: &[i64] = &[7, 14, 30, 60, 90, 180, 365];
 const UI_STATE_FILE: &str = "ui-state";
+const CALENDAR_MONTH_MIN_WIDTH: u16 = 68;
+const CALENDAR_MONTH_MIN_HEIGHT: u16 = 23;
 const MAX_MAIL_IMAGE_HEIGHT: u32 = 1200;
 const MAX_TEAMS_IMAGES: usize = MAX_MAIL_IMAGES;
 const MAX_TEAMS_IMAGE_BYTES: usize = MAX_MAIL_IMAGE_BYTES;
@@ -712,6 +728,14 @@ fn write_private_cache_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
     file.flush()
 }
 
+fn calendar_month_view_available() -> bool {
+    crossterm::terminal::size()
+        .map(|(width, height)| {
+            width >= CALENDAR_MONTH_MIN_WIDTH && height >= CALENDAR_MONTH_MIN_HEIGHT
+        })
+        .unwrap_or(false)
+}
+
 fn load_ui_state(cache_dir: Option<&std::path::Path>) -> UiState {
     let Some(cache_dir) = cache_dir else {
         return UiState::default();
@@ -750,6 +774,13 @@ fn load_ui_state(cache_dir: Option<&std::path::Path>) -> UiState {
                     }
                 }
             }
+            "calendar_view" => {
+                state.calendar_view = match value.trim() {
+                    "agenda" => CalendarView::Agenda,
+                    "month" => CalendarView::Month,
+                    _ => state.calendar_view,
+                };
+            }
             _ => {}
         }
     }
@@ -761,6 +792,7 @@ fn store_ui_state(
     cache_dir: &std::path::Path,
     screen: Screen,
     calendar_days: i64,
+    calendar_view: CalendarView,
 ) -> std::io::Result<()> {
     create_private_cache_dir(cache_dir)?;
 
@@ -769,7 +801,13 @@ fn store_ui_state(
         Screen::Teams => "teams",
         Screen::Calendar => "calendar",
     };
-    let data = format!("screen={screen}\ncalendar_days={calendar_days}\n");
+    let calendar_view = match calendar_view {
+        CalendarView::Agenda => "agenda",
+        CalendarView::Month => "month",
+    };
+    let data = format!(
+        "screen={screen}\ncalendar_days={calendar_days}\ncalendar_view={calendar_view}\n"
+    );
     let final_path = cache_dir.join(UI_STATE_FILE);
     let temp_path = cache_dir.join(format!("{UI_STATE_FILE}.tmp-{}", std::process::id()));
 
@@ -1043,9 +1081,73 @@ fn hosted_content_ids(message: &ChatMessage) -> Vec<String> {
     ids
 }
 
+fn calendar_month_first(offset: i32) -> chrono::NaiveDate {
+    let today = chrono::Local::now().date_naive();
+    let month_index = chrono::Datelike::year(&today) * 12
+        + chrono::Datelike::month0(&today) as i32
+        + offset;
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) as u32 + 1;
+    chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid calendar month")
+}
+
+fn calendar_state_local_datetime(
+    value: &m365_core::models::DateTimeTimeZone,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&value.date_time) {
+        return Some(parsed.with_timezone(&chrono::Local));
+    }
+
+    let naive = chrono::NaiveDateTime::parse_from_str(
+        &value.date_time,
+        "%Y-%m-%dT%H:%M:%S%.f",
+    )
+    .or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S")
+    })
+    .ok()?;
+
+    Some(
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+            .with_timezone(&chrono::Local),
+    )
+}
+
+fn calendar_state_event_dates(event: &CalEvent) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
+    let start = event.start.as_ref().and_then(calendar_state_local_datetime)?;
+    let end = event.end.as_ref().and_then(calendar_state_local_datetime)?;
+    let start_date = start.date_naive();
+    let mut end_date = end.date_naive();
+
+    if end_date > start_date
+        && end.time() == chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("valid midnight")
+    {
+        end_date -= chrono::Duration::days(1);
+    }
+    if end_date < start_date {
+        end_date = start_date;
+    }
+
+    Some((start_date, end_date))
+}
+
+fn calendar_event_intersects_month(event: &CalEvent, month_offset: i32) -> bool {
+    let Some((event_start, event_end)) = calendar_state_event_dates(event) else {
+        return false;
+    };
+    let month_start = calendar_month_first(month_offset);
+    let next_month = calendar_month_first(month_offset + 1);
+    event_start < next_month && event_end >= month_start
+}
+
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
-        let ui_state = load_ui_state(session.config.teams_image_cache_dir.as_deref());
+        let mut ui_state = load_ui_state(session.config.teams_image_cache_dir.as_deref());
+        let month_view_fallback =
+            ui_state.calendar_view == CalendarView::Month && !calendar_month_view_available();
+        if month_view_fallback {
+            ui_state.calendar_view = CalendarView::Agenda;
+        }
         let image_picker = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             match ratatui_image::picker::Picker::from_query_stdio() {
                 Ok(picker)
@@ -1084,9 +1186,18 @@ impl App {
             teams: TeamsState::default(),
             calendar: CalendarState {
                 days: ui_state.calendar_days,
+                view: ui_state.calendar_view,
                 ..CalendarState::default()
             },
-            overlay: None,
+            overlay: month_view_fallback.then(|| {
+                Overlay::Notice(format!(
+                    "Month view requires at least {}x{} characters.\n\nAgenda view was opened instead.",
+                    CALENDAR_MONTH_MIN_WIDTH, CALENDAR_MONTH_MIN_HEIGHT
+                ))
+            }),
+            notice_until: month_view_fallback.then(|| {
+                std::time::Instant::now() + std::time::Duration::from_secs(3)
+            }),
             status: "loading…".into(),
             me: None,
             my_presence: None,
@@ -1130,7 +1241,12 @@ impl App {
             return;
         };
 
-        if let Err(error) = store_ui_state(cache_dir, self.screen, self.calendar.days) {
+        if let Err(error) = store_ui_state(
+            cache_dir,
+            self.screen,
+            self.calendar.days,
+            self.calendar.view,
+        ) {
             tracing::warn!(
                 "could not persist UI state in {}: {error}",
                 cache_dir.display()
@@ -1626,8 +1742,35 @@ impl App {
 
     fn load_calendar(&self) {
         let s = self.session.clone();
-        let start = chrono::Utc::now();
-        let end = start + chrono::Duration::days(self.calendar.days);
+        let (start, end) = match self.calendar.view {
+            CalendarView::Agenda => {
+                let start = chrono::Utc::now();
+                let end = start + chrono::Duration::days(self.calendar.days);
+                (start, end)
+            }
+            CalendarView::Month => {
+                let first = calendar_month_first(self.calendar.month_offset);
+                let leading =
+                    chrono::Datelike::weekday(&first).num_days_from_monday() as i64;
+                let grid_start = first - chrono::Duration::days(leading + 1);
+                let grid_end = calendar_month_first(self.calendar.month_offset + 4)
+                    + chrono::Duration::days(8);
+
+                let start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    grid_start
+                        .and_hms_opt(0, 0, 0)
+                        .expect("valid calendar midnight"),
+                    chrono::Utc,
+                );
+                let end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    grid_end
+                        .and_hms_opt(0, 0, 0)
+                        .expect("valid calendar midnight"),
+                    chrono::Utc,
+                );
+                (start, end)
+            }
+        };
         let start = start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let end = end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.spawn(async move {
@@ -2432,6 +2575,23 @@ impl App {
                     .and_then(|id| self.calendar.events.iter().position(|event| event.id == id))
                     .unwrap_or(self.calendar.selected)
                     .min(self.calendar.events.len().saturating_sub(1));
+
+                if self.calendar.view == CalendarView::Month
+                    && !self.calendar.events.is_empty()
+                    && !calendar_event_intersects_month(
+                        &self.calendar.events[self.calendar.selected],
+                        self.calendar.month_offset,
+                    )
+                {
+                    self.calendar.selected = self
+                        .calendar
+                        .events
+                        .iter()
+                        .position(|event| {
+                            calendar_event_intersects_month(event, self.calendar.month_offset)
+                        })
+                        .unwrap_or(0);
+                }
             }
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
@@ -2611,6 +2771,15 @@ impl App {
                 self.push = state;
             }
             AppMessage::Tick => {
+                if self
+                    .notice_until
+                    .is_some_and(|until| std::time::Instant::now() >= until)
+                {
+                    if matches!(self.overlay.as_ref(), Some(Overlay::Notice(_))) {
+                        self.overlay = None;
+                    }
+                    self.notice_until = None;
+                }
                 self.update_primary_presence_idle();
                 self.rss_kb = read_rss_kb();
                 // Clear a message once it has sat unchanged for a while, so the
@@ -3040,6 +3209,12 @@ impl App {
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if matches!(self.overlay.as_ref(), Some(Overlay::Notice(_))) {
+            self.overlay = None;
+            self.notice_until = None;
+            return;
+        }
+
         self.note_presence_activity();
         // Overlays capture input first.
         if self.overlay.is_some() {
@@ -3251,24 +3426,50 @@ impl App {
     fn on_key_calendar(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.calendar.selected =
-                    step(self.calendar.selected, -1, self.calendar.events.len());
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(-1);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, -1, self.calendar.events.len());
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.calendar.selected =
-                    step(self.calendar.selected, 1, self.calendar.events.len());
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(1);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, 1, self.calendar.events.len());
+                }
             }
             KeyCode::PageUp => {
-                self.calendar.selected =
-                    step(self.calendar.selected, -10, self.calendar.events.len());
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(-5);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, -10, self.calendar.events.len());
+                }
             }
             KeyCode::PageDown => {
-                self.calendar.selected =
-                    step(self.calendar.selected, 10, self.calendar.events.len());
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(5);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, 10, self.calendar.events.len());
+                }
             }
-            KeyCode::Home => self.calendar.selected = 0,
+            KeyCode::Home => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_select_edge(false);
+                } else {
+                    self.calendar.selected = 0;
+                }
+            }
             KeyCode::End => {
-                self.calendar.selected = self.calendar.events.len().saturating_sub(1);
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_select_edge(true);
+                } else {
+                    self.calendar.selected = self.calendar.events.len().saturating_sub(1);
+                }
             }
             KeyCode::Char('a') => self.respond_calendar(calendar::Rsvp::Accept),
             KeyCode::Char('d') => self.respond_calendar(calendar::Rsvp::Decline),
@@ -3280,9 +3481,57 @@ impl App {
                     self.overlay = Some(Overlay::CalendarEvent);
                 }
             }
-            KeyCode::Char('n') => self.calendar_jump_today(),
+            KeyCode::Char('n') => {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar.month_offset = 0;
+                    self.calendar_month_select_edge(false);
+                    self.status = "calendar: current month".into();
+                    self.load_calendar();
+                } else {
+                    self.calendar_jump_today();
+                }
+            }
+            KeyCode::Char('v') => {
+                if self.calendar.view == CalendarView::Agenda
+                    && !calendar_month_view_available()
+                {
+                    self.overlay = Some(Overlay::Notice(format!(
+                        "Month view requires at least {}x{} characters.\n\nAgenda view remains active.",
+                        CALENDAR_MONTH_MIN_WIDTH, CALENDAR_MONTH_MIN_HEIGHT
+                    )));
+                    self.notice_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(3),
+                    );
+                    return;
+                }
+
+                self.calendar.view = match self.calendar.view {
+                    CalendarView::Agenda => CalendarView::Month,
+                    CalendarView::Month => CalendarView::Agenda,
+                };
+                self.calendar.month_offset = 0;
+                self.calendar.selected = 0;
+                self.persist_ui_state();
+                self.status = match self.calendar.view {
+                    CalendarView::Agenda => "calendar view: agenda".into(),
+                    CalendarView::Month => "calendar view: month".into(),
+                };
+                self.load_calendar();
+            }
+            KeyCode::Left if self.calendar.view == CalendarView::Month => {
+                self.calendar.month_offset -= 1;
+                self.calendar_month_select_edge(false);
+                self.status = "calendar: previous month".into();
+                self.load_calendar();
+            }
+            KeyCode::Right if self.calendar.view == CalendarView::Month => {
+                self.calendar.month_offset += 1;
+                self.calendar_month_select_edge(false);
+                self.status = "calendar: next month".into();
+                self.load_calendar();
+            }
             KeyCode::Char('r') => self.load_calendar(),
-            KeyCode::Char('w') => {
+            KeyCode::Char('w') if self.calendar.view == CalendarView::Agenda => {
                 let next = CALENDAR_RANGES
                     .iter()
                     .position(|days| *days == self.calendar.days)
@@ -3320,6 +3569,47 @@ impl App {
         match result {
             Ok(()) => self.status = "opening online meeting".into(),
             Err(error) => self.status = format!("could not open meeting: {error:#}"),
+        }
+    }
+
+    fn calendar_month_indices(&self) -> Vec<usize> {
+        self.calendar
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                calendar_event_intersects_month(event, self.calendar.month_offset)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn calendar_month_move_event(&mut self, delta: i32) {
+        let indices = self.calendar_month_indices();
+        if indices.is_empty() {
+            self.status = "no events in active month".into();
+            return;
+        }
+
+        let next = match indices
+            .iter()
+            .position(|index| *index == self.calendar.selected)
+        {
+            Some(position) => step(position, delta, indices.len()),
+            None if delta < 0 => indices.len().saturating_sub(1),
+            None => 0,
+        };
+        self.calendar.selected = indices[next];
+    }
+
+    fn calendar_month_select_edge(&mut self, last: bool) {
+        let indices = self.calendar_month_indices();
+        if let Some(index) = if last {
+            indices.last()
+        } else {
+            indices.first()
+        } {
+            self.calendar.selected = *index;
         }
     }
 
@@ -3893,6 +4183,7 @@ impl App {
                 }
             }
             Some(Overlay::Compose(mut c)) => self.on_key_compose(key, &mut c),
+            Some(Overlay::Notice(_)) => {},
             None => {}
         }
     }

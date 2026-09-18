@@ -8,7 +8,8 @@ use ratatui::Frame;
 use ratatui_image::{Resize, StatefulImage};
 
 use crate::app::{
-    filter_commands, App, Compose, OutlookFocus, Overlay, PushState, Screen, TeamsFocus, TeamsMode,
+    filter_commands, App, CalendarView, Compose, OutlookFocus, Overlay, PushState, Screen,
+    TeamsFocus, TeamsMode,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -218,6 +219,7 @@ fn line_width(line: &Line) -> u16 {
 fn context_hints(app: &App) -> &'static str {
     if let Some(overlay) = &app.overlay {
         return match overlay {
+            Overlay::Notice(_) => "any key dismisses · auto-closes in 3s",
             Overlay::Compose(_) => "Ctrl+S send · Esc cancel",
             Overlay::Links => "1-9 open · y copy · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
@@ -244,7 +246,10 @@ fn context_hints(app: &App) -> &'static str {
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
-        Screen::Calendar => "j/k move · Enter/g detail · o join · n today · a accept · d decline · t tentative · r refresh · w range",
+        Screen::Calendar => match app.calendar.view {
+            CalendarView::Agenda => "j/k move · Enter/g detail · o join · n today · a/d/t RSVP · r refresh · w range · v month",
+            CalendarView::Month => "j/k event · Enter/g detail · o join · n today · ←/→ month · a/d/t RSVP · v agenda",
+        },
     }
 }
 
@@ -808,7 +813,400 @@ fn calendar_plain_line(event: &m365_core::models::Event, show_day: bool) -> Stri
     format!("{day}  {time:<11}  [{marker}] [{meeting}] {subject}")
 }
 
+fn calendar_month_first_ui(offset: i32) -> chrono::NaiveDate {
+    let today = chrono::Local::now().date_naive();
+    let month_index = chrono::Datelike::year(&today) * 12
+        + chrono::Datelike::month0(&today) as i32
+        + offset;
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) as u32 + 1;
+    chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid calendar month")
+}
+
+fn calendar_month_columns(width: u16) -> usize {
+    match width {
+        272.. => 4,
+        204..=271 => 3,
+        136..=203 => 2,
+        _ => 1,
+    }
+}
+
+fn calendar_month_day_widths(inner_width: usize) -> [usize; 7] {
+    let usable = inner_width.saturating_sub(6);
+    let base = usable / 7;
+    let remainder = usable % 7;
+    let mut widths = [base; 7];
+    for width in widths.iter_mut().take(remainder) {
+        *width += 1;
+    }
+    widths
+}
+
+fn calendar_event_date_range(
+    event: &m365_core::models::Event,
+) -> Option<(
+    chrono::NaiveDate,
+    chrono::NaiveDate,
+    chrono::DateTime<chrono::Local>,
+)> {
+    let start = event.start.as_ref().and_then(calendar_local_datetime)?;
+    let end = event.end.as_ref().and_then(calendar_local_datetime)?;
+    let start_date = start.date_naive();
+    let mut end_date = end.date_naive();
+
+    if end_date > start_date
+        && end.time() == chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("valid midnight")
+    {
+        end_date -= chrono::Duration::days(1);
+    }
+    if end_date < start_date {
+        end_date = start_date;
+    }
+
+    Some((start_date, end_date, start))
+}
+
+fn calendar_month_event_style(
+    event: &m365_core::models::Event,
+    selected: bool,
+) -> Style {
+    let color = if event.is_cancelled.unwrap_or(false) {
+        Color::DarkGray
+    } else if event.is_organizer.unwrap_or(false) {
+        ACCENT
+    } else {
+        let response = event
+            .response_status
+            .as_ref()
+            .and_then(|status| status.response.as_deref())
+            .unwrap_or("");
+
+        if response.eq_ignore_ascii_case("accepted") {
+            Color::Green
+        } else if response.eq_ignore_ascii_case("tentativelyAccepted") {
+            Color::Yellow
+        } else if response.eq_ignore_ascii_case("declined") {
+            Color::Red
+        } else if response.eq_ignore_ascii_case("notResponded")
+            || response.eq_ignore_ascii_case("none")
+        {
+            Color::Yellow
+        } else {
+            Color::Blue
+        }
+    };
+
+    let foreground = if matches!(color, Color::Green | Color::Yellow | Color::Cyan) {
+        Color::Black
+    } else {
+        Color::White
+    };
+
+    let mut style = Style::default().fg(foreground).bg(color);
+    if selected {
+        style = style.add_modifier(
+            Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED,
+        );
+    } else if calendar_needs_response(event) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn calendar_month_separator(widths: &[usize; 7]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (day, width) in widths.iter().enumerate() {
+        if day > 0 {
+            spans.push(Span::styled("┼", Style::default().fg(DIM)));
+        }
+        spans.push(Span::styled("─".repeat(*width), Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+fn calendar_month_center(value: &str, width: usize) -> String {
+    let value = truncate(value, width);
+    let used = value.chars().count();
+    let padding = width.saturating_sub(used);
+    let left = padding / 2;
+    let right = padding - left;
+    format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
+}
+
+fn render_calendar_month_panel(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    month_offset: i32,
+    active: bool,
+) {
+    let first = calendar_month_first_ui(month_offset);
+    let leading = chrono::Datelike::weekday(&first).num_days_from_monday() as i64;
+    let grid_start = first - chrono::Duration::days(leading);
+    let today = chrono::Local::now().date_naive();
+
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let widths = calendar_month_day_widths(inner_width);
+
+    if widths.iter().any(|width| *width < 5) || inner_height < 19 {
+        f.render_widget(
+            Paragraph::new("Window too small for month view.")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(first.format("%B %Y").to_string()),
+                ),
+            area,
+        );
+        return;
+    }
+
+    let event_rows = ((inner_height.saturating_sub(13)) / 6).clamp(1, 4);
+    let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let mut header = Vec::new();
+    for (day, width) in widths.iter().enumerate() {
+        if day > 0 {
+            header.push(Span::styled("│", Style::default().fg(DIM)));
+        }
+        header.push(Span::styled(
+            calendar_month_center(weekdays[day], *width),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(header));
+    lines.push(calendar_month_separator(&widths));
+
+    for week in 0..6usize {
+        let week_start = grid_start + chrono::Duration::days((week * 7) as i64);
+        let week_end = week_start + chrono::Duration::days(6);
+
+        let mut candidates: Vec<(usize, chrono::NaiveDate, chrono::NaiveDate)> = app
+            .calendar
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                let (start, end, _) = calendar_event_date_range(event)?;
+                (start <= week_end && end >= week_start).then_some((index, start, end))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, start, end)| {
+            (
+                *start,
+                std::cmp::Reverse(end.signed_duration_since(*start).num_days()),
+            )
+        });
+
+        let mut lane_masks = vec![0u8; event_rows];
+        let mut segments: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut overflow = [0usize; 7];
+
+        for (event_index, event_start, event_end) in candidates {
+            let visible_start = if event_start > week_start {
+                event_start
+            } else {
+                week_start
+            };
+            let visible_end = if event_end < week_end {
+                event_end
+            } else {
+                week_end
+            };
+            let start_day = visible_start
+                .signed_duration_since(week_start)
+                .num_days() as usize;
+            let end_day = visible_end
+                .signed_duration_since(week_start)
+                .num_days() as usize;
+
+            let mut mask = 0u8;
+            for day in start_day..=end_day {
+                mask |= 1u8 << day;
+            }
+
+            if let Some((lane, occupied)) = lane_masks
+                .iter_mut()
+                .enumerate()
+                .find(|(_, occupied)| (**occupied & mask) == 0)
+            {
+                *occupied |= mask;
+                segments.push((event_index, lane, start_day, end_day));
+            } else {
+                for count in overflow.iter_mut().take(end_day + 1).skip(start_day) {
+                    *count += 1;
+                }
+            }
+        }
+
+        let mut dates = Vec::new();
+        for (day, width) in widths.iter().enumerate() {
+            if day > 0 {
+                dates.push(Span::styled("│", Style::default().fg(DIM)));
+            }
+            let date = week_start + chrono::Duration::days(day as i64);
+            let in_month =
+                chrono::Datelike::month(&date) == chrono::Datelike::month(&first);
+            let label = if overflow[day] > 0 {
+                format!(
+                    "{} +{}",
+                    chrono::Datelike::day(&date),
+                    overflow[day]
+                )
+            } else {
+                chrono::Datelike::day(&date).to_string()
+            };
+            let label = truncate(&label, *width);
+            let text = format!("{:<width$}", label, width = *width);
+
+            let style = if date == today {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else if in_month {
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            dates.push(Span::styled(text, style));
+        }
+        lines.push(Line::from(dates));
+
+        for lane in 0..event_rows {
+            let mut row = Vec::new();
+
+            for (day, width) in widths.iter().enumerate() {
+                if day > 0 {
+                    let bridge = segments.iter().find(|(_, segment_lane, start, end)| {
+                        *segment_lane == lane && day > *start && day <= *end
+                    });
+                    if let Some((event_index, _, _, _)) = bridge {
+                        let event = &app.calendar.events[*event_index];
+                        row.push(Span::styled(
+                            " ",
+                            calendar_month_event_style(
+                                event,
+                                active && *event_index == app.calendar.selected,
+                            ),
+                        ));
+                    } else {
+                        row.push(Span::styled("│", Style::default().fg(DIM)));
+                    }
+                }
+
+                let segment = segments.iter().find(|(_, segment_lane, start, end)| {
+                    *segment_lane == lane && day >= *start && day <= *end
+                });
+
+                if let Some((event_index, _, start_day, end_day)) = segment {
+                    let event = &app.calendar.events[*event_index];
+                    let (event_start, event_end, start_time) =
+                        calendar_event_date_range(event).expect("validated event range");
+                    let date = week_start + chrono::Duration::days(day as i64);
+                    let first_visible_day = day == *start_day;
+                    let last_visible_day = day == *end_day;
+
+                    let mut label = if first_visible_day {
+                        let mut prefix = String::new();
+                        if event_start < week_start {
+                            prefix.push_str("◀ ");
+                        } else if !event.is_all_day.unwrap_or(false) && event_start == date {
+                            prefix.push_str(&start_time.format("%H:%M ").to_string());
+                        }
+                        if calendar_has_join_url(event) {
+                            prefix.push_str("M ");
+                        }
+                        if active && *event_index == app.calendar.selected {
+                            prefix.push_str("▶ ");
+                        }
+                        prefix + event.subject.as_deref().unwrap_or("(no subject)")
+                    } else if active && *event_index == app.calendar.selected {
+                        "═".repeat(*width)
+                    } else {
+                        "━".repeat(*width)
+                    };
+
+                    if last_visible_day && event_end > week_end && *width >= 2 {
+                        label.push_str(" ▶");
+                    }
+
+                    let label = truncate(&label, *width);
+                    row.push(Span::styled(
+                        format!("{:<width$}", label, width = *width),
+                        calendar_month_event_style(
+                            event,
+                            active && *event_index == app.calendar.selected,
+                        ),
+                    ));
+                } else {
+                    row.push(Span::raw(" ".repeat(*width)));
+                }
+            }
+
+            lines.push(Line::from(row));
+        }
+
+        if week < 5 {
+            lines.push(calendar_month_separator(&widths));
+        }
+    }
+
+    let title = if active {
+        format!("{} · active", first.format("%B %Y"))
+    } else {
+        first.format("%B %Y").to_string()
+    };
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_calendar_month(f: &mut Frame, area: Rect, app: &App) {
+    let columns = calendar_month_columns(area.width);
+    let gap = 1u16;
+    let total_gap = gap * columns.saturating_sub(1) as u16;
+    let usable = area.width.saturating_sub(total_gap);
+    let base_width = usable / columns as u16;
+    let remainder = usable % columns as u16;
+
+    let mut x = area.x;
+    for column in 0..columns {
+        let width = base_width + if column < remainder as usize { 1 } else { 0 };
+        let panel = Rect {
+            x,
+            y: area.y,
+            width,
+            height: area.height,
+        };
+        render_calendar_month_panel(
+            f,
+            panel,
+            app,
+            app.calendar.month_offset + column as i32,
+            column == 0,
+        );
+        x = x.saturating_add(width).saturating_add(gap);
+    }
+}
+
 fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
+    if app.calendar.view == CalendarView::Month {
+        render_calendar_month(f, area, app);
+        return;
+    }
+
     let mut previous_day = String::new();
     let items: Vec<ListItem> = app
         .calendar
@@ -1388,6 +1786,17 @@ fn calendar_event_detail(event: &m365_core::models::Event) -> Vec<Line<'static>>
 
 fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
     match overlay {
+        Overlay::Notice(message) => {
+            let area = centered(66, 30, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!("{message}\n\nAny key dismisses · auto-closes in 3s"))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(Color::Yellow))
+                    .block(popup_block("Calendar notice")),
+                area,
+            );
+        }
         Overlay::Help => {
             let area = centered(60, 60, f.area());
             f.render_widget(Clear, area);
@@ -1412,8 +1821,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           a/i type message · r reply to selected · Enter send\n\
  \n\
- Calendar: j/k select · Enter/g detail · o open meeting · n today\n\
-           a accept · d decline · t tentative · r refresh · w range\n\
+ Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
+           a accept · d decline · t tentative · r refresh · w range · v month\n\
+ Calendar month:  j/k event · Enter/g detail · o open meeting · n today\n\
+           ←/→ previous/next month · a/d/t RSVP · v agenda\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
