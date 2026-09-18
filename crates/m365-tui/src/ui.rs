@@ -35,6 +35,7 @@ pub fn render(f: &mut Frame, app: &App) {
     match app.screen {
         Screen::Outlook => render_outlook(f, chunks[1], app),
         Screen::Teams => render_teams(f, chunks[1], app),
+        Screen::Calendar => render_calendar(f, chunks[1], app),
     }
     render_status(f, chunks[2], app);
 
@@ -65,6 +66,7 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
     let lines = match app.screen {
         Screen::Outlook => email_lines(app).unwrap_or_default(),
         Screen::Teams => conversation_lines(app, false).0,
+        Screen::Calendar => Vec::new(),
     };
     let (wrapped, _) = crate::wrap::wrap_all(&lines, rows[1].width as usize);
     let max = (wrapped.len() as u16).saturating_sub(rows[1].height);
@@ -77,18 +79,22 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
 /// Top row: which app is active on the left, live state on the right.
 /// No key hints live here — those belong in the bottom bar.
 fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
-    let tab = |name: &str, active: bool| {
-        if active {
-            Span::styled(
-                format!(" {name} "),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )
+    let tab = |name: &str, active: bool, unread: bool| {
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else if unread {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Span::styled(format!(" {name} "), Style::default().fg(DIM))
-        }
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        };
+        Span::styled(format!(" {name} "), style)
     };
     let outlook_unread = app
         .outlook
@@ -96,9 +102,9 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .any(|folder| folder.unread_item_count.unwrap_or(0) > 0);
     let outlook_tab = if outlook_unread {
-        "Outlook (F2) *"
+        "Outlook (F1) *"
     } else {
-        "Outlook (F2)"
+        "Outlook (F1)  "
     };
     let teams_has_unread = app
         .teams
@@ -110,12 +116,22 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     } else if teams_has_unread {
         "Teams (F2) •"
     } else {
-        "Teams (F2)"
+        "Teams (F2)  "
     };
     let tabs = Line::from(vec![
-        tab(outlook_tab, app.screen == Screen::Outlook),
+        tab(
+            outlook_tab,
+            app.screen == Screen::Outlook,
+            outlook_unread,
+        ),
         Span::raw("  "),
-        tab(teams_tab, app.screen == Screen::Teams),
+        tab(
+            teams_tab,
+            app.screen == Screen::Teams,
+            app.teams_unread || teams_has_unread,
+        ),
+        Span::raw("  "),
+        tab("Calendar (F3)  ", app.screen == Screen::Calendar, false),
     ]);
 
     // Right-hand state: presence · push · memory · last sync.
@@ -227,6 +243,7 @@ fn context_hints(app: &App) -> &'static str {
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
+        Screen::Calendar => "j/k move · a accept · d decline · t tentative · r refresh · w range",
     }
 }
 
@@ -645,6 +662,175 @@ fn continues_run(
 const RUN_GAP_MINUTES: i64 = 15;
 
 // ---------------------------------------------------------------------------
+// Calendar
+// ---------------------------------------------------------------------------
+
+fn calendar_local_datetime(
+    value: &m365_core::models::DateTimeTimeZone,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&value.date_time) {
+        return Some(parsed.with_timezone(&chrono::Local));
+    }
+
+    let naive = chrono::NaiveDateTime::parse_from_str(
+        &value.date_time,
+        "%Y-%m-%dT%H:%M:%S%.f",
+    )
+    .or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S")
+    })
+    .ok()?;
+
+    Some(
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+            .with_timezone(&chrono::Local),
+    )
+}
+
+fn calendar_response_marker(event: &m365_core::models::Event) -> (&'static str, Color) {
+    if event.is_cancelled.unwrap_or(false) {
+        return ("! cancelled", Color::Red);
+    }
+    if event.is_organizer.unwrap_or(false) {
+        return ("O organizer", ACCENT);
+    }
+
+    let response = event
+        .response_status
+        .as_ref()
+        .and_then(|status| status.response.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match response.as_str() {
+        "accepted" => ("✓ accepted", Color::Green),
+        "tentativelyaccepted" => ("~ tentative", Color::Yellow),
+        "declined" => ("× declined", Color::Red),
+        "notresponded" | "none" => ("? waiting", Color::Yellow),
+        "organizer" => ("O organizer", ACCENT),
+        _ => ("  unknown", DIM),
+    }
+}
+
+fn calendar_time_label(event: &m365_core::models::Event) -> String {
+    if event.is_all_day.unwrap_or(false) {
+        return "all day    ".to_string();
+    }
+
+    let start = event
+        .start
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".into());
+    let end = event
+        .end
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".into());
+    format!("{start}-{end}")
+}
+
+fn calendar_day_label(event: &m365_core::models::Event) -> String {
+    event
+        .start
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%d.%m.").to_string())
+        .unwrap_or_else(|| "--.--.".into())
+}
+
+fn calendar_plain_line(event: &m365_core::models::Event, show_day: bool) -> String {
+    let day = if show_day {
+        calendar_day_label(event)
+    } else {
+        "      ".into()
+    };
+    let time = calendar_time_label(event);
+    let marker = calendar_response_marker(event).0;
+    let subject = event.subject.as_deref().unwrap_or("(no subject)");
+    let online = if event.is_online_meeting.unwrap_or(false) {
+        "  Teams"
+    } else {
+        ""
+    };
+    format!("{day}  {time:<11}  [{marker:<11}] {subject}{online}")
+}
+
+fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
+    let mut previous_day = String::new();
+    let items: Vec<ListItem> = app
+        .calendar
+        .events
+        .iter()
+        .map(|event| {
+            let day = calendar_day_label(event);
+            let show_day = day != previous_day;
+            previous_day = day;
+            let (marker, marker_color) = calendar_response_marker(event);
+            let day = if show_day {
+                calendar_day_label(event)
+            } else {
+                "      ".into()
+            };
+            let online = if event.is_online_meeting.unwrap_or(false) {
+                "  Teams"
+            } else {
+                ""
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{day}  "),
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{:<11}  ", calendar_time_label(event))),
+                Span::styled(
+                    format!("[{marker:<11}] "),
+                    Style::default().fg(marker_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(event.subject.as_deref().unwrap_or("(no subject)").to_string()),
+                Span::styled(online, Style::default().fg(ACCENT)),
+            ]))
+        })
+        .collect();
+
+    let items = if items.is_empty() {
+        vec![ListItem::new("No events in the next 7 days (or still loading).")]
+    } else {
+        items
+    };
+
+    let mut state = ListState::default();
+    if !app.calendar.events.is_empty() {
+        state.select(Some(
+            app.calendar
+                .selected
+                .min(app.calendar.events.len().saturating_sub(1)),
+        ));
+    }
+
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Calendar — next {} days", app.calendar.days)),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut state,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Teams
 // ---------------------------------------------------------------------------
 
@@ -1037,7 +1223,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F2 switch app · F5 force poll · Ctrl+P palette · p set presence · ? help · q quit\n\
+ Global:  F1 Outlook · F2 Teams · F3 Calendar · F5 force poll · Ctrl+P palette · p presence · ? help · q quit\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\
@@ -1055,6 +1241,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           a/i type message · r reply to selected · Enter send\n\
  \n\
+ Calendar: j/k select · a accept · d decline · t tentative · r refresh · w range\n\
+ \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
           Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
@@ -1071,23 +1259,16 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         Overlay::Calendar => {
             let area = centered(70, 70, f.area());
             f.render_widget(Clear, area);
+            let mut previous_day = String::new();
             let items: Vec<ListItem> = app
-                .outlook
                 .calendar
+                .events
                 .iter()
-                .map(|e| {
-                    let start = e
-                        .start
-                        .as_ref()
-                        .map(|s| s.date_time.replace('T', " "))
-                        .unwrap_or_default();
-                    let subj = e.subject.clone().unwrap_or_default();
-                    let online = if e.is_online_meeting.unwrap_or(false) {
-                        " 🔗"
-                    } else {
-                        ""
-                    };
-                    ListItem::new(format!("{start}  {subj}{online}"))
+                .map(|event| {
+                    let day = calendar_day_label(event);
+                    let show_day = day != previous_day;
+                    previous_day = day;
+                    ListItem::new(calendar_plain_line(event, show_day))
                 })
                 .collect();
             let list = if items.is_empty() {
@@ -1098,7 +1279,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 List::new(items)
             };
             f.render_widget(
-                list.block(popup_block("Calendar — next 7 days (Esc to close)")),
+                list.block(popup_block(&format!(
+                    "Calendar — next {} days (Esc to close)",
+                    app.calendar.days
+                ))),
                 area,
             );
         }

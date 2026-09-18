@@ -1,13 +1,15 @@
 # m365-tui
 
-A terminal client for **Outlook and Microsoft Teams**, in one app. Switch
-between the two with `F2`.
+A terminal client for **Outlook, Microsoft Teams, and Calendar**, in one app.
+Switch directly with `F1`, `F2`, and `F3`.
 
 ![Reading an HTML email in the terminal, then jumping from its sender straight into a Teams chat with them](demo.gif)
 
 - **Outlook** — read mail with proper HTML rendering, compose / reply /
-  reply-all / forward, send and save attachments, search, and a 7-day calendar
-  with RSVP.
+  reply-all / forward, send and save attachments, search, and quick calendar
+  access with RSVP.
+- **Calendar** — agenda view with selectable ranges up to 365 days and direct
+  accept / decline / tentative responses.
 - **Teams** — chats and channels, emoji reactions, shared files, and your
   presence status.
 - **Live** — refreshes every 20 seconds out of the box; add a tunnel for
@@ -203,11 +205,12 @@ Press `?` in the app for this list at any time.
 
 | Scope | Keys |
 |---|---|
-| **Global** | `F2` switch Outlook/Teams · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
+| **Global** | `F1` Outlook · `F2` Teams · `F3` Calendar · `F5` force poll · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
 | **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
 | **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
 | **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `i` write · `Enter` send |
+| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `a`/`i` write · `Enter` send |
+| **Calendar** | `j`/`k` select · `a` accept · `d` decline · `t` tentative · `r` refresh · `w` range |
 | **Attachments** | `A` list · `1`–`9` save to Downloads |
 | **Links** | `o` list · `1`–`9` open in browser |
 | **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
@@ -407,7 +410,17 @@ Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 
 - Teams chats are now marked as read on the Microsoft 365 server after the conversation is opened successfully. The read state is therefore synchronized with other Teams clients. Uses the existing `Chat.ReadWrite` permission; no additional runtime dependencies or permissions are required.
 
-This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, and Kitty image previews.
+This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, Kitty image previews, and calendar workflows.
+
+### Calendar agenda
+
+- Added a dedicated Calendar screen on `F3`; `F1` opens Outlook and `F2` opens Teams. Outlook keeps `g` as a quick calendar overlay.
+- Added an agenda view with selectable ranges of 7, 14, 30, 60, 90, 180, or 365 days; `w` cycles the range and 30 days is the default.
+- Added meeting response actions from the agenda: `a` accept, `d` decline, and `t` tentatively accept.
+- Calendar entries show visually distinct response states for accepted, tentative, waiting, declined, cancelled, and organizer events.
+- When `M365_TEAMS_IMAGE_CACHE_DIR` is configured, the last selected top-level screen and calendar range are restored from the persistent cache on the next start.
+- Top-level tabs now keep a stable width; inactive tabs remain readable and unread tabs are highlighted without shifting the layout.
+- Uses the existing `Calendars.ReadWrite` delegated permission. No additional runtime dependencies or permissions are required.
 
 - Added configurable delayed marking of Outlook messages as read using `M365_READ_MSG_TIMEOUT`.
 - Added the `u` key to toggle the selected Outlook message between read and unread.
