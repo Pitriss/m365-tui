@@ -92,6 +92,9 @@ pub struct Config {
     pub teams_image_cache_dir: Option<PathBuf>,
     /// Maximum persistent Teams image cache size in MiB.
     pub teams_image_cache_max_mb: u64,
+    /// Optional executable used to open Calendar online-meeting URLs.
+    /// Unset uses the operating system handler (`xdg-open` / `open`).
+    pub meeting_opener: Option<String>,
 }
 
 impl Config {
@@ -107,6 +110,10 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        let meeting_opener = std::env::var("M365_MEETING_OPENER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let teams_image_cache_max_mb =
             match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
                 Ok(value) if !value.trim().is_empty() => {
@@ -197,6 +204,7 @@ impl Config {
             teams_file_images,
             teams_image_cache_dir,
             teams_image_cache_max_mb,
+            meeting_opener,
         })
     }
 
@@ -309,6 +317,7 @@ mod tests {
             teams_file_images: false,
             teams_image_cache_dir: None,
             teams_image_cache_max_mb: 256,
+            meeting_opener: None,
         }
     }
 

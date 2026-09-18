@@ -412,6 +412,16 @@ Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
 
 This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, Kitty image previews, and calendar workflows.
 
+### Calendar refinements (1.4.1)
+
+- `Enter` or `g` opens the selected event's detail: subject, date and time, response status, organizer, location, meeting link, and description preview. `Esc` closes the detail.
+- `n` selects the first loaded event starting today in local time. If none is found, the selection returns to the first agenda item.
+- Invitations waiting for a response are highlighted in yellow and bold; cancelled events and events marked as organizer are excluded.
+- The agenda uses two independent, fixed-width indicators. RSVP: `[A]` accepted, `[T]` tentative, `[D]` declined, `[?]` waiting, `[O]` organizer, `[!]` cancelled, or `[ ]` unknown. Join link: `[M]` when `onlineMeeting.joinUrl` is nonempty, otherwise `[ ]`. The join indicator does not depend on RSVP or the `isOnlineMeeting` flag.
+- `o` opens the selected event's join link from the agenda or event detail. Without a join link, it does nothing. This hands the link to an external application; it does not implement calling inside the TUI.
+- By default, meeting links use the system handler (`xdg-open` on Linux, `open` on macOS). Optional `.env` setting `M365_MEETING_OPENER=/usr/bin/firefox` selects an executable name or path. The URL is passed as one argument without a shell; use an executable wrapper script when additional arguments are needed.
+- No new Rust crates, shared-library dependencies, or Microsoft Graph permissions are added. Opening a link requires the existing system handler or the chosen external application.
+
 ### Calendar agenda
 
 - Added a dedicated Calendar screen on `F3`; `F1` opens Outlook and `F2` opens Teams. Outlook keeps `g` as a quick calendar overlay.

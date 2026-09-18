@@ -225,6 +225,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Presence => "1-6 set · c clear · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
+            Overlay::CalendarEvent => "o open meeting · Esc close",
             Overlay::Calendar | Overlay::Help => "Esc close",
         };
     }
@@ -243,7 +244,7 @@ fn context_hints(app: &App) -> &'static str {
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
-        Screen::Calendar => "j/k move · a accept · d decline · t tentative · r refresh · w range",
+        Screen::Calendar => "j/k move · Enter/g detail · o join · n today · a accept · d decline · t tentative · r refresh · w range",
     }
 }
 
@@ -689,10 +690,10 @@ fn calendar_local_datetime(
 
 fn calendar_response_marker(event: &m365_core::models::Event) -> (&'static str, Color) {
     if event.is_cancelled.unwrap_or(false) {
-        return ("! cancelled", Color::Red);
+        return ("!", Color::Red);
     }
     if event.is_organizer.unwrap_or(false) {
-        return ("O organizer", ACCENT);
+        return ("O", ACCENT);
     }
 
     let response = event
@@ -703,13 +704,66 @@ fn calendar_response_marker(event: &m365_core::models::Event) -> (&'static str, 
         .to_ascii_lowercase();
 
     match response.as_str() {
-        "accepted" => ("✓ accepted", Color::Green),
-        "tentativelyaccepted" => ("~ tentative", Color::Yellow),
-        "declined" => ("× declined", Color::Red),
-        "notresponded" | "none" => ("? waiting", Color::Yellow),
-        "organizer" => ("O organizer", ACCENT),
-        _ => ("  unknown", DIM),
+        "accepted" => ("A", Color::Green),
+        "tentativelyaccepted" => ("T", Color::Yellow),
+        "declined" => ("D", Color::Red),
+        "notresponded" | "none" => ("?", Color::Yellow),
+        "organizer" => ("O", ACCENT),
+        _ => (" ", DIM),
     }
+}
+
+fn calendar_response_label(event: &m365_core::models::Event) -> &'static str {
+    if event.is_cancelled.unwrap_or(false) {
+        return "cancelled";
+    }
+    if event.is_organizer.unwrap_or(false) {
+        return "organizer";
+    }
+
+    let response = event
+        .response_status
+        .as_ref()
+        .and_then(|status| status.response.as_deref())
+        .unwrap_or("");
+
+    if response.eq_ignore_ascii_case("accepted") {
+        "accepted"
+    } else if response.eq_ignore_ascii_case("tentativelyAccepted") {
+        "tentative"
+    } else if response.eq_ignore_ascii_case("declined") {
+        "declined"
+    } else if response.eq_ignore_ascii_case("notResponded")
+        || response.eq_ignore_ascii_case("none")
+    {
+        "waiting"
+    } else if response.eq_ignore_ascii_case("organizer") {
+        "organizer"
+    } else {
+        "unknown"
+    }
+}
+
+// Join availability is independent of RSVP and the isOnlineMeeting flag.
+fn calendar_has_join_url(event: &m365_core::models::Event) -> bool {
+    event
+        .online_meeting
+        .as_ref()
+        .and_then(|meeting| meeting.join_url.as_deref())
+        .is_some_and(|url| !url.trim().is_empty())
+}
+
+fn calendar_needs_response(event: &m365_core::models::Event) -> bool {
+    !event.is_cancelled.unwrap_or(false)
+        && !event.is_organizer.unwrap_or(false)
+        && event
+            .response_status
+            .as_ref()
+            .and_then(|status| status.response.as_deref())
+            .is_some_and(|response| {
+                response.eq_ignore_ascii_case("notResponded")
+                    || response.eq_ignore_ascii_case("none")
+            })
 }
 
 fn calendar_time_label(event: &m365_core::models::Event) -> String {
@@ -749,13 +803,9 @@ fn calendar_plain_line(event: &m365_core::models::Event, show_day: bool) -> Stri
     };
     let time = calendar_time_label(event);
     let marker = calendar_response_marker(event).0;
+    let meeting = if calendar_has_join_url(event) { "M" } else { " " };
     let subject = event.subject.as_deref().unwrap_or("(no subject)");
-    let online = if event.is_online_meeting.unwrap_or(false) {
-        "  Teams"
-    } else {
-        ""
-    };
-    format!("{day}  {time:<11}  [{marker:<11}] {subject}{online}")
+    format!("{day}  {time:<11}  [{marker}] [{meeting}] {subject}")
 }
 
 fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
@@ -774,11 +824,7 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 "      ".into()
             };
-            let online = if event.is_online_meeting.unwrap_or(false) {
-                "  Teams"
-            } else {
-                ""
-            };
+            let meeting = if calendar_has_join_url(event) { "M" } else { " " };
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{day}  "),
@@ -788,11 +834,29 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::raw(format!("{:<11}  ", calendar_time_label(event))),
                 Span::styled(
-                    format!("[{marker:<11}] "),
+                    format!("[{marker}] "),
                     Style::default().fg(marker_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(event.subject.as_deref().unwrap_or("(no subject)").to_string()),
-                Span::styled(online, Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("[{meeting}] "),
+                    if meeting == "M" {
+                        Style::default()
+                            .fg(ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(DIM)
+                    },
+                ),
+                Span::styled(
+                    event.subject.as_deref().unwrap_or("(no subject)").to_string(),
+                    if calendar_needs_response(event) {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
             ]))
         })
         .collect();
@@ -1215,6 +1279,113 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 // Overlays
 // ---------------------------------------------------------------------------
 
+fn calendar_event_detail(event: &m365_core::models::Event) -> Vec<Line<'static>> {
+    let subject = event.subject.as_deref().unwrap_or("(no subject)").to_string();
+    let date = event
+        .start
+        .as_ref()
+        .and_then(calendar_local_datetime)
+        .map(|value| value.format("%A %d.%m.%Y").to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let time = if event.is_all_day.unwrap_or(false) {
+        "all day".to_string()
+    } else {
+        calendar_time_label(event)
+    };
+
+    let organizer = event
+        .organizer
+        .as_ref()
+        .and_then(|recipient| recipient.email_address.as_ref())
+        .map(|address| {
+            address
+                .name
+                .clone()
+                .or_else(|| address.address.clone())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .unwrap_or_else(|| "unknown".into());
+
+    let location = event
+        .location
+        .as_ref()
+        .and_then(|location| location.display_name.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "-".into());
+
+    let (_, response_color) = calendar_response_marker(event);
+    let response = calendar_response_label(event);
+    let online = event
+        .online_meeting
+        .as_ref()
+        .and_then(|meeting| meeting.join_url.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if event.is_online_meeting.unwrap_or(false) {
+                "online meeting".into()
+            } else {
+                "-".into()
+            }
+        });
+
+    let preview = event
+        .body_preview
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            subject,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Date:      ", Style::default().fg(Color::Gray)),
+            Span::raw(date),
+        ]),
+        Line::from(vec![
+            Span::styled("Time:      ", Style::default().fg(Color::Gray)),
+            Span::raw(time),
+        ]),
+        Line::from(vec![
+            Span::styled("Status:    ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                response.to_string(),
+                Style::default()
+                    .fg(response_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Organizer: ", Style::default().fg(Color::Gray)),
+            Span::raw(organizer),
+        ]),
+        Line::from(vec![
+            Span::styled("Location:  ", Style::default().fg(Color::Gray)),
+            Span::raw(location),
+        ]),
+        Line::from(vec![
+            Span::styled("Meeting:   ", Style::default().fg(Color::Gray)),
+            Span::raw(online),
+        ]),
+    ];
+
+    if !preview.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Preview",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(preview));
+    }
+
+    lines
+}
+
 fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
     match overlay {
         Overlay::Help => {
@@ -1241,7 +1412,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Teams:   t chats/channels · j/k select message · g newest · e react\n\
           a/i type message · r reply to selected · Enter send\n\
  \n\
- Calendar: j/k select · a accept · d decline · t tentative · r refresh · w range\n\
+ Calendar: j/k select · Enter/g detail · o open meeting · n today\n\
+           a accept · d decline · t tentative · r refresh · w range\n\
  \n\
  Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
           ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
@@ -1285,6 +1457,25 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 ))),
                 area,
             );
+        }
+        Overlay::CalendarEvent => {
+            let area = centered(76, 76, f.area());
+            f.render_widget(Clear, area);
+
+            if let Some(event) = app.calendar.events.get(app.calendar.selected) {
+                f.render_widget(
+                    Paragraph::new(calendar_event_detail(event))
+                        .block(popup_block("Calendar event — Esc to close"))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            } else {
+                f.render_widget(
+                    Paragraph::new("No calendar event selected.")
+                        .block(popup_block("Calendar event — Esc to close")),
+                    area,
+                );
+            }
         }
         Overlay::Search { query } => {
             let area = centered(60, 20, f.area());
@@ -1857,5 +2048,66 @@ mod tests {
         assert!(local_time(Some("2026-07-27T14:30:00.123Z")).is_some());
         assert!(local_time(Some("not a date")).is_none());
         assert!(local_time(None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod calendar_meeting_indicator_tests {
+    use super::{calendar_has_join_url, calendar_plain_line, calendar_response_marker};
+    use m365_core::models::Event;
+    use serde_json::json;
+
+    #[test]
+    fn rsvp_and_join_indicators_are_independent() {
+        for (response, marker) in [
+            ("accepted", "A"),
+            ("tentativelyAccepted", "T"),
+            ("declined", "D"),
+            ("notResponded", "?"),
+            ("organizer", "O"),
+        ] {
+            for online in [false, true] {
+                for (url, has_join) in [
+                    (None, false),
+                    (Some(""), false),
+                    (Some("   "), false),
+                    (Some("https://example.com/meeting"), true),
+                ] {
+                    let event: Event = serde_json::from_value(json!({
+                        "id": "test",
+                        "subject": "Example",
+                        "responseStatus": {"response": response},
+                        "isOnlineMeeting": online,
+                        "onlineMeeting": {"joinUrl": url}
+                    }))
+                    .unwrap();
+                    assert_eq!(calendar_response_marker(&event).0, marker);
+                    assert_eq!(calendar_has_join_url(&event), has_join);
+                    let join = if has_join { "M" } else { " " };
+                    let line = calendar_plain_line(&event, true);
+                    assert!(line.ends_with(&format!("[{marker}] [{join}] Example")));
+                    assert_eq!(line.chars().count(), 36);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn organizer_and_cancelled_flags_do_not_hide_join_links() {
+        for (organizer, cancelled, marker) in [
+            (true, false, "O"),
+            (false, true, "!"),
+            (true, true, "!"),
+        ] {
+            let event: Event = serde_json::from_value(json!({
+                "id": "test",
+                "isOrganizer": organizer,
+                "isCancelled": cancelled,
+                "onlineMeeting": {"joinUrl": "https://example.com/meeting"}
+            }))
+            .unwrap();
+            assert_eq!(calendar_response_marker(&event).0, marker);
+            assert!(calendar_has_join_url(&event));
+        }
     }
 }
