@@ -1373,18 +1373,45 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let me_id = app.me.as_ref().map(|m| m.id.as_str());
 
     // Left list: chats or channels
-    let (title, items, sel): (&str, Vec<ListItem>, usize) = match app.teams.mode {
+    //
+    // Chat rows render their selection explicitly instead of relying on the
+    // generic List highlight style. The generic style sets one foreground for
+    // the whole selected row, which would overwrite the contact-presence
+    // colour. Explicit row styling keeps the same selection background while
+    // allowing the presence glyph to retain its status colour.
+    match app.teams.mode {
         TeamsMode::Chats => {
-            let items = app
+            let focused = app.teams.focus == TeamsFocus::List;
+            let selected_bg = if focused { ACCENT } else { Color::Gray };
+            let inner_width = cols[0].width.saturating_sub(3) as usize;
+
+            let items: Vec<ListItem> = app
                 .teams
                 .chats
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .map(|(index, c)| {
+                    let selected = index == app.teams.chat_sel;
+                    let selection_style = if selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(selected_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    let marker = if selected { "▏" } else { " " };
                     let label = c.label(me_id);
-                    let inner_width = cols[0].width.saturating_sub(3) as usize;
+
                     let Some(user_id) = c.peer_user_id(me_id) else {
                         // Group/meeting chats deliberately have no presence or count.
-                        return ListItem::new(truncate(&label, inner_width));
+                        let label = truncate(&label, inner_width);
+                        let padding = inner_width.saturating_sub(label.chars().count());
+                        return ListItem::new(Line::from(vec![
+                            Span::styled(marker, selection_style),
+                            Span::styled(label, selection_style),
+                            Span::styled(" ".repeat(padding), selection_style),
+                        ]));
                     };
 
                     let unread = app
@@ -1405,12 +1432,12 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         let label = truncate(&label, label_width);
                         let padding =
                             inner_width.saturating_sub(label.chars().count() + suffix_width);
-                        return ListItem::new(format!(
-                            "{}{}{}",
-                            label,
-                            " ".repeat(padding),
-                            suffix
-                        ));
+                        return ListItem::new(Line::from(vec![
+                            Span::styled(marker, selection_style),
+                            Span::styled(label, selection_style),
+                            Span::styled(" ".repeat(padding), selection_style),
+                            Span::styled(suffix, selection_style),
+                        ]));
                     }
 
                     let presence = app.teams.contact_presences.get(user_id);
@@ -1420,43 +1447,75 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     let label = truncate(&label, label_width);
                     let padding = inner_width
                         .saturating_sub(prefix_width + label.chars().count() + suffix_width);
+                    let presence_style = if selected {
+                        // A one-cell dark badge gives the presence colour strong
+                        // contrast against the cyan/gray selected-row background.
+                        let selected_color = match color {
+                            Color::Red => Color::LightRed,
+                            Color::Yellow => Color::LightYellow,
+                            Color::DarkGray => Color::White,
+                            other => other,
+                        };
+                        Style::default()
+                            .fg(selected_color)
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(color)
+                    };
+
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("{symbol} "), Style::default().fg(color)),
-                        Span::raw(label),
-                        Span::raw(" ".repeat(padding)),
-                        Span::raw(suffix),
+                        Span::styled(marker, selection_style),
+                        Span::styled(symbol, presence_style),
+                        Span::styled(" ", selection_style),
+                        Span::styled(label, selection_style),
+                        Span::styled(" ".repeat(padding), selection_style),
+                        Span::styled(suffix, selection_style),
                     ]))
                 })
                 .collect();
-            ("Chats (t→channels)", items, app.teams.chat_sel)
+
+            let mut state = ListState::default();
+            state.select(Some(app.teams.chat_sel));
+            f.render_stateful_widget(
+                List::new(items).block(panel_block("Chats (t→channels)", focused)),
+                cols[0],
+                &mut state,
+            );
         }
         TeamsMode::Channels => {
-            if app.teams.channels.is_empty() {
-                let items = app
-                    .teams
-                    .teams
-                    .iter()
-                    .map(|t| ListItem::new(truncate(t.display_name.as_deref().unwrap_or(""), 30)))
-                    .collect();
-                ("Teams (Enter→channels)", items, app.teams.team_sel)
-            } else {
-                let items = app
-                    .teams
-                    .channels
-                    .iter()
-                    .map(|c| ListItem::new(truncate(c.display_name.as_deref().unwrap_or(""), 30)))
-                    .collect();
-                ("Channels (t→chats)", items, app.teams.channel_sel)
-            }
+            let (title, items, sel): (&str, Vec<ListItem>, usize) =
+                if app.teams.channels.is_empty() {
+                    let items = app
+                        .teams
+                        .teams
+                        .iter()
+                        .map(|t| {
+                            ListItem::new(truncate(t.display_name.as_deref().unwrap_or(""), 30))
+                        })
+                        .collect();
+                    ("Teams (Enter→channels)", items, app.teams.team_sel)
+                } else {
+                    let items = app
+                        .teams
+                        .channels
+                        .iter()
+                        .map(|c| {
+                            ListItem::new(truncate(c.display_name.as_deref().unwrap_or(""), 30))
+                        })
+                        .collect();
+                    ("Channels (t→chats)", items, app.teams.channel_sel)
+                };
+
+            let mut state = ListState::default();
+            state.select(Some(sel));
+            f.render_stateful_widget(
+                selectable_list(items, title, app.teams.focus == TeamsFocus::List),
+                cols[0],
+                &mut state,
+            );
         }
-    };
-    let mut lstate = ListState::default();
-    lstate.select(Some(sel));
-    f.render_stateful_widget(
-        selectable_list(items, title, app.teams.focus == TeamsFocus::List),
-        cols[0],
-        &mut lstate,
-    );
+    }
 
     // Right: messages + composer. The composer grows with its content (handy for
     // multi-line pastes) up to a cap; Min(5) leaves room for the border, the

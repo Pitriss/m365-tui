@@ -496,6 +496,9 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Group and meeting chats intentionally do not show a presence indicator.
 - Presence lookup failures are non-fatal and do not interrupt Teams chat functionality.
 - Status indicators: `●` Available, `●` Busy / In a call / In a meeting, `◐` Away / Be right back, `×` Do not disturb / Presenting, `○` Offline / unknown.
+- The presence marker on the selected Teams chat keeps its status colour instead of inheriting the generic selected-row foreground.
+- Selected presence markers use a high-contrast dark badge so Available, Busy/Away, Do not disturb/Presenting, and offline/unknown states remain distinguishable on the highlighted row.
+- This is a display-only change and adds no runtime dependencies or Microsoft Graph permissions.
 
 ### Teams unread counts
 
