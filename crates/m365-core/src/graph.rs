@@ -68,6 +68,12 @@ impl GraphClient {
                 .request(method.clone(), url)
                 .bearer_auth(&token)
                 .header(reqwest::header::ACCEPT, "application/json");
+            if method == reqwest::Method::GET {
+                // `systemEventMessage` is an evolvable Graph enum member.
+                // Without this preference Graph may surface it as
+                // `unknownFutureValue`.
+                req = req.header("Prefer", "include-unknown-enum-members");
+            }
             if let Some(b) = body {
                 req = req.json(b);
             }

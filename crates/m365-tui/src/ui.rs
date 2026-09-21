@@ -7,6 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use ratatui_image::{Resize, StatefulImage};
 
+use m365_core::models::SystemEventClass;
+
 use crate::app::{
     filter_commands, App, CalendarView, Compose, OutlookFocus, Overlay, PushState, Screen,
     TeamsFocus, TeamsMode,
@@ -66,7 +68,9 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
 
     let lines = match app.screen {
         Screen::Outlook => email_lines(app).unwrap_or_default(),
-        Screen::Teams => conversation_lines(app, false).0,
+        // Copy mode has no sticky date row, so keep the first inline day
+        // separator there.
+        Screen::Teams => conversation_lines(app, false, true).0,
         Screen::Calendar => Vec::new(),
     };
     let (wrapped, _) = crate::wrap::wrap_all(&lines, rows[1].width as usize);
@@ -488,7 +492,11 @@ fn is_teams_inline_image_attachment_name(name: &str) -> bool {
 /// Lines of the open Teams conversation, plus the starting line index of each
 /// message. `selectable` adds the `▶` cursor and selection highlight (off in
 /// copy mode so the text copies cleanly).
-pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, Vec<usize>) {
+pub fn conversation_lines(
+    app: &App,
+    selectable: bool,
+    show_first_day_separator: bool,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut starts: Vec<usize> = Vec::with_capacity(app.teams.messages.len());
     // Emit a "Today"/"Yesterday"/date separator whenever the day changes.
@@ -498,15 +506,27 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
     let mut prev: Option<(String, Option<chrono::DateTime<chrono::Local>>)> = None;
 
     for (i, m) in app.teams.messages.iter().enumerate() {
+        if !app.teams_message_visible(m) {
+            starts.push(lines.len());
+            continue;
+        }
+
         let when = local_time(m.created_date_time.as_deref());
         let mut day_changed = false;
         if let Some(when) = when {
             let day = when.date_naive();
             if last_day != Some(day) {
-                if last_day.is_some() {
+                let first_day = last_day.is_none();
+                if !first_day {
                     lines.push(Line::from(""));
                 }
-                lines.push(day_separator(&day_label(day)));
+                // The normal Teams pane already has a pinned/sticky date row.
+                // Suppress only the first inline separator there so a freshly
+                // opened conversation does not show the same date twice.
+                // Copy mode has no sticky row and asks to keep it.
+                if show_first_day_separator || !first_day {
+                    lines.push(day_separator(&day_label(day)));
+                }
                 last_day = Some(day);
                 day_changed = true;
             }
@@ -531,21 +551,40 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
             .map(|w| w.format("%H:%M").to_string())
             .unwrap_or_else(|| " ".repeat(TIME_WIDTH));
         let gutter = " ".repeat(marker.chars().count() + TIME_WIDTH + 1);
-        let lead = |extra: Vec<Span<'static>>| {
+        let lead = |time_style: Style, extra: Vec<Span<'static>>| {
             let mut spans = vec![
                 Span::styled(marker.to_string(), Style::default().fg(ACCENT)),
-                Span::styled(format!("{ts} "), Style::default().fg(DIM)),
+                Span::styled(format!("{ts} "), time_style),
             ];
             spans.extend(extra);
             Line::from(spans)
         };
+        let normal_time_style = Style::default().fg(Color::Gray);
 
         if m.deleted_date_time.is_some() {
-            lines.push(lead(vec![Span::styled(
-                "(message deleted)",
-                Style::default().fg(DIM),
-            )]));
+            lines.push(lead(
+                normal_time_style,
+                vec![Span::styled(
+                    "(message deleted)",
+                    Style::default().fg(DIM),
+                )],
+            ));
             prev = None; // a deletion breaks the run
+            continue;
+        }
+
+        if let Some(event) = m.system_event_display() {
+            let style = match event.class {
+                SystemEventClass::Useful => Style::default().fg(Color::LightRed),
+                SystemEventClass::Noise | SystemEventClass::Unknown => Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            };
+            lines.push(lead(
+                style,
+                vec![Span::styled(format!("── {}", event.text), style)],
+            ));
+            prev = None; // system events deliberately break an author run
             continue;
         }
 
@@ -578,7 +617,7 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
 
         match (grouped, quote) {
             // Grouped reply: the quote takes the lead line, the text follows.
-            (true, Some(quote)) => lines.push(lead(quote)),
+            (true, Some(quote)) => lines.push(lead(normal_time_style, quote)),
             // Grouped message: the text starts right after the time.
             (true, None) => {
                 let first = if body.is_empty() {
@@ -586,20 +625,23 @@ pub fn conversation_lines(app: &App, selectable: bool) -> (Vec<Line<'static>>, V
                 } else {
                     body.remove(0).spans
                 };
-                lines.push(lead(first));
+                lines.push(lead(normal_time_style, first));
             }
             // New author: name on the lead line, then the quote if there is one.
             (false, quote) => {
-                lines.push(lead(vec![Span::styled(
-                    author.clone(),
-                    Style::default()
-                        .fg(if selected {
-                            Color::Cyan
-                        } else {
-                            Color::LightGreen
-                        })
-                        .add_modifier(Modifier::BOLD),
-                )]));
+                lines.push(lead(
+                    normal_time_style,
+                    vec![Span::styled(
+                        author.clone(),
+                        Style::default()
+                            .fg(if selected {
+                                Color::Cyan
+                            } else {
+                                Color::LightGreen
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    )],
+                ));
                 if let Some(quote) = quote {
                     let mut spans = vec![Span::raw(gutter.clone())];
                     spans.extend(quote);
@@ -1485,10 +1527,14 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             .min(max_image_height)
     };
 
-    let (mut lines, msg_starts) = conversation_lines(app, focused);
+    // The dedicated pinned row above the conversation already carries the
+    // first visible day. Keep later inline separators for day boundaries.
+    let (mut lines, msg_starts) = conversation_lines(app, focused, false);
     if lines.is_empty() {
-        let empty = if previewing {
+        let empty = if previewing && app.teams.messages.is_empty() {
             "No cached conversation for the selected chat."
+        } else if !app.teams.messages.is_empty() {
+            "No visible messages with the current Teams system-event filter."
         } else {
             "Select a conversation and press Enter."
         };

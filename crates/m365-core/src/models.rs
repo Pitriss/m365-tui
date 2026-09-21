@@ -337,6 +337,13 @@ pub struct ChatMessage {
     pub body: Option<ItemBody>,
     #[serde(default)]
     pub message_type: Option<String>,
+    /// Raw Microsoft Graph details for a `systemEventMessage`.
+    ///
+    /// Keep this data-form representation in the model/cache and derive the
+    /// human-readable UI text at render time so presentation changes never
+    /// require a cache migration.
+    #[serde(default)]
+    pub event_detail: Option<serde_json::Value>,
     #[serde(default)]
     pub deleted_date_time: Option<String>,
     #[serde(default)]
@@ -352,6 +359,101 @@ pub struct ChatMessage {
 pub struct MessageReaction {
     #[serde(default)]
     pub reaction_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemEventClass {
+    Useful,
+    Noise,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemEventDisplay {
+    pub class: SystemEventClass,
+    pub text: String,
+    pub url: Option<String>,
+}
+
+fn event_kind(detail: &serde_json::Value) -> Option<&str> {
+    detail
+        .get("@odata.type")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.rsplit('.').next())
+        .map(|value| value.trim_start_matches('#'))
+}
+
+fn identity_display_name(value: &serde_json::Value) -> Option<String> {
+    for kind in ["user", "application", "device"] {
+        if let Some(name) = value
+            .get(kind)
+            .and_then(|identity| identity.get("displayName"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(name.to_string());
+        }
+    }
+
+    value
+        .get("displayName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn event_initiator(detail: &serde_json::Value) -> Option<String> {
+    detail.get("initiator").and_then(identity_display_name)
+}
+
+fn event_members(detail: &serde_json::Value) -> Vec<String> {
+    detail
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(identity_display_name)
+        .collect()
+}
+
+fn names_label(names: &[String], singular: &str, plural: &str) -> String {
+    match names {
+        [] => singular.to_string(),
+        [one] => one.clone(),
+        [one, two] => format!("{one} and {two}"),
+        _ => format!("{} {plural}", names.len()),
+    }
+}
+
+fn with_initiator(text: String, detail: &serde_json::Value) -> String {
+    match event_initiator(detail) {
+        Some(name) => format!("{text} (by {name})"),
+        None => text,
+    }
+}
+
+fn system_event_label(kind: &str) -> String {
+    let value = kind
+        .trim_end_matches("EventMessageDetail")
+        .trim_end_matches("MessageDetail");
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index > 0 && ch.is_uppercase() {
+            out.push(' ');
+        }
+        if index == 0 {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "System event".to_string()
+    } else {
+        out
+    }
 }
 
 impl ChatMessage {
@@ -373,6 +475,188 @@ impl ChatMessage {
             .as_ref()
             .and_then(|b| b.content.clone())
             .unwrap_or_default()
+    }
+
+    pub fn is_system_event(&self) -> bool {
+        if self
+            .message_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("systemEventMessage"))
+        {
+            return true;
+        }
+
+        // eventDetail is specific to Teams system-event messages and also
+        // covers Graph responses where messageType arrived as unknownFutureValue.
+        if self.event_detail.is_some() {
+            return true;
+        }
+
+        // Old persistent-cache entries written before eventDetail was stored
+        // still carry the Teams marker in the message body.
+        self.body
+            .as_ref()
+            .and_then(|body| body.content.as_deref())
+            .is_some_and(|content| {
+                content
+                    .to_ascii_lowercase()
+                    .contains("<systemeventmessage")
+            })
+    }
+
+    /// Classify and humanize a Teams system event without changing the raw
+    /// Graph payload stored in this message.
+    pub fn system_event_display(&self) -> Option<SystemEventDisplay> {
+        if !self.is_system_event() {
+            return None;
+        }
+
+        let Some(detail) = self.event_detail.as_ref() else {
+            return Some(SystemEventDisplay {
+                class: SystemEventClass::Unknown,
+                text: "System event (details not cached)".to_string(),
+                url: None,
+            });
+        };
+
+        let Some(kind) = event_kind(detail) else {
+            return Some(SystemEventDisplay {
+                class: SystemEventClass::Unknown,
+                text: "System event (unknown type)".to_string(),
+                url: None,
+            });
+        };
+
+        let members = event_members(detail);
+        let (class, text, url) = match kind {
+            "callRecordingEventMessageDetail" => {
+                let name = detail
+                    .get("callRecordingDisplayName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let text = match name {
+                    Some(name) => format!("🎥 Recording available: {name}"),
+                    None => "🎥 Meeting recording available".to_string(),
+                };
+                let url = detail
+                    .get("callRecordingUrl")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                (SystemEventClass::Useful, text, url)
+            }
+            "callTranscriptEventMessageDetail" => (
+                SystemEventClass::Useful,
+                "📝 Meeting transcript available".to_string(),
+                None,
+            ),
+            "chatRenamedEventMessageDetail" => {
+                let name = detail
+                    .get("chatDisplayName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("(unnamed)");
+                (
+                    SystemEventClass::Useful,
+                    with_initiator(format!("Chat renamed to \"{name}\""), detail),
+                    None,
+                )
+            }
+            "membersAddedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator(
+                    format!(
+                        "{} added to the chat",
+                        names_label(&members, "A member was", "members were")
+                    ),
+                    detail,
+                ),
+                None,
+            ),
+            "membersDeletedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator(
+                    format!(
+                        "{} removed from the chat",
+                        names_label(&members, "A member was", "members were")
+                    ),
+                    detail,
+                ),
+                None,
+            ),
+            "messagePinnedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator("📌 A message was pinned".to_string(), detail),
+                None,
+            ),
+            "messageUnpinnedEventMessageDetail" => (
+                SystemEventClass::Useful,
+                with_initiator("A message was unpinned".to_string(), detail),
+                None,
+            ),
+
+            "callStartedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                with_initiator("Call started".to_string(), detail),
+                None,
+            ),
+            "callEndedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Call ended".to_string(),
+                None,
+            ),
+            "membersJoinedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                format!(
+                    "{} joined the chat",
+                    names_label(&members, "A member", "members")
+                ),
+                None,
+            ),
+            "membersLeftEventMessageDetail" => (
+                SystemEventClass::Noise,
+                format!(
+                    "{} left the chat",
+                    names_label(&members, "A member", "members")
+                ),
+                None,
+            ),
+            "meetingPolicyUpdatedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Meeting policy updated".to_string(),
+                None,
+            ),
+            "tabUpdatedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams tab updated".to_string(),
+                None,
+            ),
+            "teamsAppInstalledEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams app installed".to_string(),
+                None,
+            ),
+            "teamsAppRemovedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams app removed".to_string(),
+                None,
+            ),
+            "teamsAppUpgradedEventMessageDetail" => (
+                SystemEventClass::Noise,
+                "Teams app upgraded".to_string(),
+                None,
+            ),
+            _ => (
+                SystemEventClass::Unknown,
+                format!("System event: {}", system_event_label(kind)),
+                None,
+            ),
+        };
+
+        Some(SystemEventDisplay { class, text, url })
     }
 
     /// A short plain-text excerpt of the body, for quoting.
@@ -609,6 +893,95 @@ mod tests {
         }))
         .unwrap();
         assert!(plain.quoted().is_none());
+    }
+
+    #[test]
+    fn humanizes_useful_system_events() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-1",
+            "messageType": "systemEventMessage",
+            "body": { "contentType": "html", "content": "<systemEventMessage/>" },
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.callRecordingEventMessageDetail",
+                "callRecordingDisplayName": "Weekly sync.mp4",
+                "callRecordingUrl": "https://example.invalid/recording"
+            }
+        }))
+        .unwrap();
+
+        let display = message.system_event_display().unwrap();
+        assert_eq!(display.class, SystemEventClass::Useful);
+        assert!(display.text.contains("Weekly sync.mp4"));
+        assert_eq!(
+            display.url.as_deref(),
+            Some("https://example.invalid/recording")
+        );
+    }
+
+    #[test]
+    fn classifies_known_noise_and_unknown_system_events() {
+        let noise: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-2",
+            "messageType": "systemEventMessage",
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.callStartedEventMessageDetail"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            noise.system_event_display().unwrap().class,
+            SystemEventClass::Noise
+        );
+
+        let unknown: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-3",
+            "messageType": "systemEventMessage",
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.futureImportantEventMessageDetail"
+            }
+        }))
+        .unwrap();
+        let display = unknown.system_event_display().unwrap();
+        assert_eq!(display.class, SystemEventClass::Unknown);
+        assert!(display.text.contains("Future Important"));
+    }
+
+    #[test]
+    fn old_cached_system_event_without_detail_is_unknown() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-old",
+            "messageType": "unknownFutureValue",
+            "body": {
+                "contentType": "html",
+                "content": "<systemEventMessage/>"
+            }
+        }))
+        .unwrap();
+
+        assert!(message.is_system_event());
+        assert_eq!(
+            message.system_event_display().unwrap().class,
+            SystemEventClass::Unknown
+        );
+    }
+
+    #[test]
+    fn event_detail_identifies_system_event_even_with_unknown_message_type() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-future",
+            "messageType": "unknownFutureValue",
+            "body": { "contentType": "html", "content": "" },
+            "eventDetail": {
+                "@odata.type": "#microsoft.graph.callStartedEventMessageDetail"
+            }
+        }))
+        .unwrap();
+
+        assert!(message.is_system_event());
+        assert_eq!(
+            message.system_event_display().unwrap().class,
+            SystemEventClass::Noise
+        );
     }
 
     #[test]

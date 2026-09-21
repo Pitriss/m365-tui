@@ -55,6 +55,13 @@ pub const TEAMS_READ_SCOPE: &str = "Team.ReadBasic.All";
 /// Opt in with `M365_TEAMS_FILE_IMAGES=1`.
 pub const FILES_READ_SCOPE: &str = "Files.Read.All";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamsSystemEvents {
+    Useful,
+    All,
+    None,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -95,6 +102,9 @@ pub struct Config {
     /// Automatically prefill persistent Teams conversation caches in the background.
     /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
     pub teams_cache_warmup: bool,
+    /// Which Teams system events are visible in conversations.
+    /// Defaults to Useful; accepts useful, all, or none.
+    pub teams_system_events: TeamsSystemEvents,
     /// Optional executable used to open Calendar online-meeting URLs.
     /// Unset uses the operating system handler (`xdg-open` / `open`).
     pub meeting_opener: Option<String>,
@@ -118,6 +128,9 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let teams_cache_warmup = env_flag_default_on("M365_TEAMS_CACHE_WARMUP");
+        let teams_system_events = parse_teams_system_events(
+            std::env::var("M365_TEAMS_SYSTEM_EVENTS").ok().as_deref(),
+        )?;
         let teams_image_cache_max_mb =
             match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
                 Ok(value) if !value.trim().is_empty() => {
@@ -209,6 +222,7 @@ impl Config {
             teams_image_cache_dir,
             teams_image_cache_max_mb,
             teams_cache_warmup,
+            teams_system_events,
             meeting_opener,
         })
     }
@@ -267,6 +281,18 @@ impl Config {
         self.tunnel_base_url
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
+    }
+}
+
+fn parse_teams_system_events(value: Option<&str>) -> Result<TeamsSystemEvents> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(TeamsSystemEvents::Useful),
+        Some(value) if value.eq_ignore_ascii_case("useful") => Ok(TeamsSystemEvents::Useful),
+        Some(value) if value.eq_ignore_ascii_case("all") => Ok(TeamsSystemEvents::All),
+        Some(value) if value.eq_ignore_ascii_case("none") => Ok(TeamsSystemEvents::None),
+        Some(value) => anyhow::bail!(
+            "M365_TEAMS_SYSTEM_EVENTS must be one of: useful, all, none (got {value:?})"
+        ),
     }
 }
 
@@ -336,8 +362,30 @@ mod tests {
             teams_image_cache_dir: None,
             teams_image_cache_max_mb: 256,
             teams_cache_warmup: true,
+            teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn parses_teams_system_event_visibility() {
+        assert_eq!(
+            parse_teams_system_events(None).unwrap(),
+            TeamsSystemEvents::Useful
+        );
+        assert_eq!(
+            parse_teams_system_events(Some(" useful ")).unwrap(),
+            TeamsSystemEvents::Useful
+        );
+        assert_eq!(
+            parse_teams_system_events(Some("ALL")).unwrap(),
+            TeamsSystemEvents::All
+        );
+        assert_eq!(
+            parse_teams_system_events(Some("none")).unwrap(),
+            TeamsSystemEvents::None
+        );
+        assert!(parse_teams_system_events(Some("usefull")).is_err());
     }
 
     #[test]

@@ -10,9 +10,11 @@ use std::io::IsTerminal;
 use anyhow::Context;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use m365_core::config::TeamsSystemEvents;
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence, Team, User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence,
+    SystemEventClass, Team, User,
 };
 use m365_core::{calendar, channels, chats, mail, people, Session};
 use ratatui::text::Text;
@@ -1319,18 +1321,17 @@ impl App {
         };
 
         let last_chat_id = ui_state.teams_chat_id.clone();
-        let open_chat_id = if ui_state.screen == Screen::Teams {
+        let preview_chat_id = if ui_state.screen == Screen::Teams {
             last_chat_id.clone()
         } else {
             None
         };
         let teams = TeamsState {
-            focus: if open_chat_id.is_some() {
-                TeamsFocus::Messages
-            } else {
-                TeamsFocus::List
-            },
-            open_chat_id,
+            // Persisted state restores context, not input focus. Keep the cursor
+            // in the chat list and show the previous conversation as a local
+            // cache preview until the user explicitly opens it.
+            focus: TeamsFocus::List,
+            preview_chat_id,
             last_chat_id,
             ..TeamsState::default()
         };
@@ -1384,7 +1385,7 @@ impl App {
         };
 
         if app.screen == Screen::Teams {
-            if let Some(chat_id) = app.teams.open_chat_id.clone() {
+            if let Some(chat_id) = app.teams.preview_chat_id.clone() {
                 let _ = app.restore_teams_conversation_cache(&chat_id);
             }
         }
@@ -2460,7 +2461,17 @@ impl App {
     fn teams_image_key_for_index(&self, index: usize) -> Option<TeamsImageKey> {
         let message_id = self.teams.messages.get(index)?.id.clone();
         let source = match self.teams.mode {
-            TeamsMode::Chats => TeamsImageSource::Chat(self.teams.open_chat_id.clone()?),
+            TeamsMode::Chats => {
+                // Cached chat previews are intentionally not "open", but their
+                // already-cached inline images use the same deterministic key.
+                // Prefer the real open chat; otherwise use the local preview.
+                let chat_id = self
+                    .teams
+                    .open_chat_id
+                    .clone()
+                    .or_else(|| self.teams.preview_chat_id.clone())?;
+                TeamsImageSource::Chat(chat_id)
+            }
             TeamsMode::Channels => {
                 let (team_id, channel_id) = self.teams.open_channel.clone()?;
                 TeamsImageSource::Channel {
@@ -2495,6 +2506,53 @@ impl App {
         true
     }
 
+    /// Load an image for a cached chat preview from the disk cache only.
+    ///
+    /// This path must never fall through to Graph: moving through the chat list
+    /// is a local-only preview and must not download hosted content or files.
+    fn load_preview_teams_images_from_disk(&self, key: TeamsImageKey) {
+        let Some(cache_dir) = self.session.config.teams_image_cache_dir.clone() else {
+            return;
+        };
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let disk_cache_key = teams_disk_cache_key(&key);
+            let read_dir = cache_dir;
+            let read_key = disk_cache_key;
+
+            match tokio::task::spawn_blocking(move || {
+                load_teams_disk_cache(&read_dir, &read_key)
+            })
+            .await
+            {
+                Ok(Ok(Some(images))) => {
+                    tracing::debug!(
+                        "Teams image preview disk cache hit for {:?}: {} image(s)",
+                        key,
+                        images.len()
+                    );
+                    let _ = tx.send(AppMessage::TeamsImages { key, images }).await;
+                }
+                Ok(Ok(None)) => {
+                    tracing::debug!("Teams image preview disk cache miss for {:?}", key);
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        "Teams image preview disk cache read failed for {:?}: {error}",
+                        key
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "Teams image preview disk cache reader task failed for {:?}: {error}",
+                        key
+                    );
+                }
+            }
+        });
+    }
+
     fn refresh_selected_teams_images(&mut self) {
         if self.image_picker.is_none() {
             self.teams.selected_images.clear();
@@ -2508,13 +2566,26 @@ impl App {
             return;
         };
 
+        let preview_cache_only = self.teams.mode == TeamsMode::Chats
+            && self.teams.open_chat_id.is_none()
+            && self.teams.preview_chat_id.is_some();
+
         if self.teams.selected_image_key.as_ref() != Some(&key) {
             self.teams.selected_images.clear();
             self.teams.selected_image_key = Some(key.clone());
-            let _ = self.apply_cached_teams_images(&key);
+
+            let ram_hit = self.apply_cached_teams_images(&key);
+            if preview_cache_only && !ram_hit {
+                // Preview may read what is already on disk, but must not trigger
+                // a Graph or Files.Read.All request on a cache miss.
+                self.load_preview_teams_images_from_disk(key.clone());
+            }
         }
 
-        self.prefetch_teams_images();
+        if !preview_cache_only {
+            // Open chats/channels retain the normal RAM -> disk -> Graph path.
+            self.prefetch_teams_images();
+        }
     }
 
     fn prefetch_teams_images(&mut self) {
@@ -3366,6 +3437,60 @@ impl App {
         }
     }
 
+    pub fn teams_message_visible(&self, message: &ChatMessage) -> bool {
+        if !message.is_system_event() {
+            return true;
+        }
+
+        let class = message
+            .system_event_display()
+            .map(|display| display.class)
+            .unwrap_or(SystemEventClass::Unknown);
+
+        match self.session.config.teams_system_events {
+            TeamsSystemEvents::None => false,
+            TeamsSystemEvents::All => true,
+            TeamsSystemEvents::Useful => class != SystemEventClass::Noise,
+        }
+    }
+
+    fn teams_message_selectable(&self, message: &ChatMessage) -> bool {
+        message.deleted_date_time.is_none() && self.teams_message_visible(message)
+    }
+
+    fn first_selectable_teams_message(&self) -> Option<usize> {
+        self.teams
+            .messages
+            .iter()
+            .position(|message| self.teams_message_selectable(message))
+    }
+
+    fn last_selectable_teams_message(&self) -> Option<usize> {
+        self.teams
+            .messages
+            .iter()
+            .rposition(|message| self.teams_message_selectable(message))
+    }
+
+    fn nearest_selectable_teams_message(&self, preferred: usize) -> Option<usize> {
+        if self
+            .teams
+            .messages
+            .get(preferred)
+            .is_some_and(|message| self.teams_message_selectable(message))
+        {
+            return Some(preferred);
+        }
+
+        let before = (0..preferred.min(self.teams.messages.len()))
+            .rev()
+            .find(|index| self.teams_message_selectable(&self.teams.messages[*index]));
+        before.or_else(|| {
+            ((preferred + 1).min(self.teams.messages.len())..self.teams.messages.len())
+                .find(|index| self.teams_message_selectable(&self.teams.messages[*index]))
+        })
+    }
+
     /// Set the Teams conversation messages and pre-render their Markdown once
     /// (HTML→md is the expensive part; keep it off the render path).
     fn set_teams_messages(
@@ -3422,12 +3547,15 @@ impl App {
                 // Chat convention: if the user is sitting on the newest message,
                 // follow new arrivals; if they've scrolled back to read history,
                 // hold their place and just count what came in.
-                follow_newest = self.teams.msg_sel + 1 >= self.teams.messages.len();
+                follow_newest =
+                    self.last_selectable_teams_message() == Some(self.teams.msg_sel);
                 let known: std::collections::HashSet<&str> =
                     self.teams.messages.iter().map(|m| m.id.as_str()).collect();
                 let arrived = page
                     .iter()
-                    .filter(|m| !known.contains(m.id.as_str()))
+                    .filter(|m| {
+                        !known.contains(m.id.as_str()) && self.teams_message_selectable(m)
+                    })
                     .count();
                 if !follow_newest {
                     self.teams.unseen += arrived;
@@ -3478,25 +3606,37 @@ impl App {
                         }
                     }
                 }
+                if let Some(url) = m
+                    .system_event_display()
+                    .and_then(|display| display.url)
+                    .filter(|url| !url.is_empty())
+                {
+                    if !links.contains(&url) {
+                        links.push(url);
+                    }
+                }
                 links
             })
             .collect();
         self.teams.messages_rendered = rendered.into_iter().map(|r| r.text).collect();
 
-        let last = self.teams.messages.len().saturating_sub(1);
-        self.teams.msg_sel = match mode {
-            // Opening a conversation lands on the newest message, at the bottom.
-            ListUpdate::Replace => last,
+        let raw_last = self.teams.messages.len().saturating_sub(1);
+        let preferred = match mode {
+            // Opening a conversation lands on the newest visible message.
+            ListUpdate::Replace => self.last_selectable_teams_message().unwrap_or(0),
             _ if follow_newest => {
                 self.teams.unseen = 0;
-                last
+                self.last_selectable_teams_message().unwrap_or(0)
             }
-            // Otherwise stay on the same message, wherever it moved to.
+            // Otherwise stay on the same raw message, wherever it moved to.
             _ => selected_id
                 .and_then(|id| self.teams.messages.iter().position(|m| m.id == id))
                 .unwrap_or(self.teams.msg_sel)
-                .min(last),
+                .min(raw_last),
         };
+        self.teams.msg_sel = self
+            .nearest_selectable_teams_message(preferred)
+            .unwrap_or(0);
         self.refresh_selected_teams_images();
     }
 
@@ -3706,7 +3846,7 @@ impl App {
             Screen::Outlook => crate::ui::email_lines(self)
                 .map(|lines| lines_to_plain(&lines))
                 .unwrap_or_default(),
-            Screen::Teams => lines_to_plain(&crate::ui::conversation_lines(self, false).0),
+            Screen::Teams => lines_to_plain(&crate::ui::conversation_lines(self, false, true).0),
             Screen::Calendar => String::new(),
         };
         if text.trim().is_empty() {
@@ -4425,21 +4565,43 @@ impl App {
             KeyCode::Char('r')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
             {
-                self.teams.replying_to = Some(self.teams.msg_sel);
-                self.teams.focus = TeamsFocus::Composer;
+                if self
+                    .teams
+                    .messages
+                    .get(self.teams.msg_sel)
+                    .is_some_and(ChatMessage::is_system_event)
+                {
+                    self.status = "system events cannot be replied to".into();
+                } else {
+                    self.teams.replying_to = Some(self.teams.msg_sel);
+                    self.teams.focus = TeamsFocus::Composer;
+                }
             }
             KeyCode::Char('e')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
             {
-                self.overlay = Some(Overlay::React);
+                if self
+                    .teams
+                    .messages
+                    .get(self.teams.msg_sel)
+                    .is_some_and(ChatMessage::is_system_event)
+                {
+                    self.status = "system events cannot be reacted to".into();
+                } else {
+                    self.overlay = Some(Overlay::React);
+                }
             }
-            // Jump back to the newest message and resume following it.
+            // Jump back to the newest visible message and resume following it.
             KeyCode::End | KeyCode::Char('g') if self.teams.focus == TeamsFocus::Messages => {
-                self.teams.msg_sel = self.teams.messages.len().saturating_sub(1);
+                if let Some(index) = self.last_selectable_teams_message() {
+                    self.teams.msg_sel = index;
+                }
                 self.teams.unseen = 0;
             }
             KeyCode::Home if self.teams.focus == TeamsFocus::Messages => {
-                self.teams.msg_sel = 0;
+                if let Some(index) = self.first_selectable_teams_message() {
+                    self.teams.msg_sel = index;
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => self.teams_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.teams_move(1),
@@ -4467,15 +4629,17 @@ impl App {
                 if i >= n {
                     return; // already on the newest
                 }
-                if self.teams.messages[i as usize].deleted_date_time.is_none() {
+                if self.teams_message_selectable(&self.teams.messages[i as usize]) {
                     self.teams.msg_sel = i as usize;
-                    if self.teams.msg_sel + 1 >= self.teams.messages.len() {
+                    if self.last_selectable_teams_message() == Some(self.teams.msg_sel) {
                         self.teams.unseen = 0;
                         self.teams.replying_to = None; // caught up with the newest
                     }
-                    // Prefetch when landing on the oldest, so scrolling further
-                    // back doesn't stall.
-                    if delta < 0 && self.teams.msg_sel == 0 {
+                    // Prefetch when there are no more visible messages above.
+                    if delta < 0
+                        && !(0..self.teams.msg_sel)
+                            .any(|index| self.teams_message_selectable(&self.teams.messages[index]))
+                    {
                         self.load_more_teams_messages();
                     }
                     return;
@@ -4598,6 +4762,10 @@ impl App {
         let Some(msg) = self.teams.messages.get(self.teams.msg_sel) else {
             return;
         };
+        if msg.is_system_event() {
+            self.status = "system events cannot be reacted to".into();
+            return;
+        }
         let message_id = msg.id.clone();
         let emoji = emoji.to_string();
         let s = self.session.clone();

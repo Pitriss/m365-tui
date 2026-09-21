@@ -466,7 +466,8 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - When `M365_TEAMS_IMAGE_CACHE_DIR` is configured, the same private cache root now also stores persistent chat-conversation data and the last opened Teams chat alongside the existing image cache and UI state. The variable name is intentionally retained for backward compatibility.
 - Cached chat filenames use deterministic anonymous keys. Conversation payloads are stored as plaintext JSON with private Unix permissions (`0700` directories and `0600` files); they are not encrypted.
 - The conversation cache keeps up to the newest 2000 loaded messages per chat. When more history has been loaded, the persisted cache is updated with the newest 2000 messages rather than discarded. Corrupt or invalid cache entries are removed safely without preventing normal Graph loading.
-- Moving through the Teams chat list with `j` / `k` shows a cache-only conversation preview immediately when data is available. Previewing does not open the chat, perform a chat Graph fetch, download new inline images, or mark the chat as read.
+- Moving through the Teams chat list with `j` / `k` shows a cache-only conversation preview immediately when data is available. Already-cached inline images are restored from the persistent image cache as part of the preview. Previewing does not open the chat, perform a chat Graph fetch, download new inline images, or mark the chat as read.
+- When Teams is restored as the saved top-level screen, the previous conversation is shown as a local cached preview while keyboard focus starts in the chat list. It is not treated as an opened conversation until the user explicitly opens it.
 - `Enter`, `l`, or `Tab` opens the previewed chat. The cached history remains visible while Microsoft Graph refreshes it, and fresh messages are merged by message ID to avoid duplicates.
 - A chat is marked read only after a successful Graph result for the actually opened conversation; showing cached preview data alone never changes server read state.
 - By default, persistent chat caches are warmed automatically after the chat list loads. The selected / last-opened chat is prioritized and remaining chats are fetched sequentially rather than in a parallel burst.
@@ -474,6 +475,17 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Background warm-up applies to chats only; Teams channel-message history is not persistently conversation-cached by this feature.
 - The persistent Graph pagination continuation (`@odata.nextLink`) is intentionally not reused across application restarts. A fresh continuation is obtained from the current Graph response.
 - This feature uses the existing `Chat.ReadWrite` delegated permission and adds no Microsoft Graph permission. `serde_json` becomes a direct runtime dependency of the `m365-tui` crate, but it was already present in the workspace dependency graph; no new external runtime library or helper program is required.
+
+### Teams system events (1.4.4)
+
+- Teams system events are rendered as readable timeline entries instead of generic `(system)` messages.
+- `M365_TEAMS_SYSTEM_EVENTS=useful|all|none` controls visibility. The default is `useful`.
+- `useful` shows useful and unknown system events while hiding known low-value noise; `all` shows all known and unknown system events; `none` hides all system events.
+- Useful system events use a stronger timeline colour; known noise and unknown event types use a dimmed style. Message timestamps follow the same style as their system event.
+- Unknown event types remain visible in the default `useful` mode so new Microsoft event kinds are not silently discarded.
+- System events remain in chronological order and are not valid reply/reaction targets.
+- Microsoft Graph GET requests include `Prefer: include-unknown-enum-members` so evolvable system-event enum values are returned when available.
+- This feature uses the existing `Chat.ReadWrite` delegated permission and adds no new Microsoft Graph permission or external runtime dependency.
 
 ### Teams contact presence
 
