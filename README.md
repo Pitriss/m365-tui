@@ -1,49 +1,120 @@
 # m365-tui
 
-A terminal client for **Outlook, Microsoft Teams, and Calendar**, in one app.
-Switch directly with `F1`, `F2`, and `F3`.
+A terminal Microsoft 365 client for **Outlook, Microsoft Teams, and Calendar**.
+
+Switch directly between Outlook, Teams, and Calendar with `F1`, `F2`, and `F3`.
+m365-tui uses Microsoft Graph and combines mail, chat, presence, calendar,
+notifications, persistent conversation caching, and terminal-native image
+previews in a single TUI.
 
 ![Reading an HTML email in the terminal, then jumping from its sender straight into a Teams chat with them](demo.gif)
 
-- **Outlook** — read mail with proper HTML rendering, compose / reply /
-  reply-all / forward, send and save attachments, search, and quick calendar
-  access with RSVP.
-- **Calendar** — agenda view with selectable ranges up to 365 days and direct
-  accept / decline / tentative responses.
-- **Teams** — chats and channels, emoji reactions, shared files, and your
-  presence status.
-- **Live** — refreshes every 20 seconds out of the box; add a tunnel for
-  instant push notifications.
+> **Note:** This is a very old preview of m365-tui and no longer reflects the
+> current interface or feature set. It is kept only to give a general idea of
+> how the application can look and behave in a terminal.
 
-Built on the Microsoft Graph API in Rust. For how it works internally, see
-[ARCHITECTURE.md](ARCHITECTURE.md).
+Built in Rust on top of the Microsoft Graph API. For implementation details and
+design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+## Features
+
+### Outlook
+
+- Read plain-text and HTML mail directly in the terminal.
+- Browse nested Outlook folders as a compact tree.
+- Folder and application-level unread indicators.
+- Compose, reply, reply-all, and forward.
+- Send and download attachments.
+- Large outgoing attachments are uploaded through Graph upload sessions.
+- Search mail.
+- Open links through the system browser or copy them to the clipboard.
+- Toggle a selected message read/unread with `u`.
+- Automatically mark an opened unread message as read after a configurable
+  delay.
+- Preview JPEG, PNG, and GIF image attachments in terminals supporting the
+  Kitty graphics protocol.
+- Desktop notifications for new inbox mail.
+- Quick access to Calendar with `g`.
+
+### Teams
+
+- One-to-one, group, and meeting chats.
+- Optional Teams/channel browsing.
+- Server-side read-state synchronization with other Teams clients.
+- Per-chat unread counts.
+- Replies and emoji reactions.
+- Presence indicators for contacts in one-to-one chats.
+- Optional control of your own Teams presence.
+- Configurable automatic Available → Away behavior.
+- Teams system events such as recording, transcript, membership, pin, and chat
+  rename events.
+- Configurable filtering of low-value system events.
+- Inline hosted-image previews.
+- Optional previews for regular OneDrive / SharePoint image attachments.
+- Persistent conversation and image cache.
+- Cache-only conversation previews while moving through the chat list.
+- Cached images can also be displayed during those previews.
+- Cached previous conversation can be restored without immediately marking it
+  read.
+- Selected presence markers retain their status colour and use a high-contrast
+  dark badge on the highlighted row.
+- Desktop notifications for direct messages and relevant mentions.
+
+### Calendar
+
+- Dedicated Calendar screen on `F3`.
+- Agenda view with selectable ranges from 7 to 365 days.
+- Graphical month view with one to four months depending on terminal width.
+- Navigate calendar events chronologically.
+- Accept, decline, or tentatively accept invitations.
+- Open event details.
+- Open online meeting links using the system handler or a configured
+  application.
+- Visual RSVP and online-meeting indicators.
+- Multi-day events rendered across calendar days.
+- Persistent Calendar view selection when persistent UI state is enabled.
 
 ---
 
 ## Requirements
 
-### To run it
+### Microsoft 365 account
 
-| | |
-|---|---|
-| **A work or school Microsoft 365 account** | Personal accounts can't use the Teams messaging APIs |
-| **An Entra app registration** | See [step 1](#1-register-an-app-in-entra) — you need a client ID |
-| **Linux on x86_64 or aarch64** | The release binaries are statically linked against musl: no libc, no shared libraries, runs on any distribution including NixOS |
+A work or school Microsoft 365 account is required for the Teams messaging APIs.
 
-Nothing else. The binary has no runtime library dependencies.
+### Entra application registration
 
-### Optional helpers
+m365-tui authenticates as a public client through Microsoft device-code login.
+You need an Entra application registration and its Application (client) ID.
 
-These are external commands the app calls when present. Each has a fallback, so
-nothing breaks if one is missing.
+See [Microsoft Entra setup](#microsoft-entra-setup).
 
-| Feature | Command | Package | Without it |
+### Platform
+
+Prebuilt releases are provided for:
+
+- Linux x86_64
+- Linux aarch64
+
+The release binaries are statically linked against musl and do not require
+system OpenSSL or other shared runtime libraries.
+
+### Optional external commands
+
+Some desktop integrations use external commands when available.
+
+| Feature | Command | Typical package | Fallback |
 |---|---|---|---|
-| Open links (`o`) | `xdg-open` | `xdg-utils` | Links can still be copied |
-| Copy (`y`, `Y`) | `wl-copy` (Wayland), or `xclip` / `xsel` (X11) | `wl-clipboard`, `xclip`, `xsel` | Falls back to the OSC 52 escape, which most modern terminals accept |
-| Notifications | `notify-send` | `libnotify` (Debian/Ubuntu: `libnotify-bin`) | Falls back to the terminal bell |
+| Open links | `xdg-open` | `xdg-utils` | URL can still be copied |
+| Clipboard on Wayland | `wl-copy` | `wl-clipboard` | OSC 52 |
+| Clipboard on X11 | `xclip` or `xsel` | `xclip`, `xsel` | OSC 52 |
+| Desktop notifications | `notify-send` | `libnotify-bin` | Terminal bell |
 
-Check what you have:
+Only one clipboard utility is needed.
+
+To check which helpers are installed:
 
 ```sh
 for c in xdg-open wl-copy xclip xsel notify-send; do
@@ -51,542 +122,1250 @@ for c in xdg-open wl-copy xclip xsel notify-send; do
 done
 ```
 
-You only need **one** clipboard tool — `wl-copy` on Wayland, `xclip` or `xsel` on X11.
+### Kitty image previews
 
-### For instant push (optional)
+Image previews require a terminal capable of displaying the image protocol used
+by m365-tui. Kitty is the primary supported terminal for this functionality.
 
-Only if you want ~1-second updates instead of the 20-second refresh:
+Mail and Teams image previews support:
 
-- **Docker** and **Docker Compose** — they run the webhook, Redis and the tunnel;
-  you don't install `cloudflared` or Redis yourself.
-- **Nothing else.** A separate release asset contains the whole stack and a
-  `./up.sh` that sets it up — see [instant push](#instant-push-optional). A
-  Cloudflare account with a domain gets you a permanent hostname; without one you
-  get a working throwaway `trycloudflare.com` URL instead.
+- JPEG
+- PNG
+- GIF
 
-### To build from source
+GIF previews are displayed as static images.
 
-Not needed if you use the release binary or the Nix flake.
+The rest of the application works normally without image support.
 
-- **Rust**, recent stable (developed against 1.96). Cargo fetches the crate
-  dependencies itself; `Cargo.lock` is committed.
-- **or Nix**, which supplies the toolchain via `nix develop`.
+---
 
-No system libraries are required: TLS is handled by rustls, so there's no
-OpenSSL dependency.
+## Microsoft Entra setup
 
-## 1. Register an app in Entra
+Open the Microsoft Entra admin center and create a new application registration.
 
-You need an app registration to get a client ID. Sign in at
-[entra.microsoft.com](https://entra.microsoft.com) → *Applications* →
-*App registrations* → **New registration**.
+Recommended registration settings:
 
-1. **Name**: anything, e.g. `m365-tui`.
-2. **Supported account types**: *Accounts in this organizational directory only*.
-3. **Redirect URI**: leave blank.
-4. Click **Register**, then copy the **Application (client) ID** and
-   **Directory (tenant) ID** from the Overview page.
+1. Choose any application name, for example `m365-tui`.
+2. Use accounts from your organizational directory.
+3. Leave the redirect URI empty.
+4. Copy the **Application (client) ID**.
+5. Copy the **Directory (tenant) ID** if you want to restrict sign-in to that
+   tenant.
+6. Under **Authentication**, enable **Allow public client flows**.
 
-Then two settings on that app:
+### Default delegated permissions
 
-5. **Authentication** → *Advanced settings* → **Allow public client flows** →
-   **Yes**. Sign-in fails without this.
-6. **API permissions** → *Add a permission* → *Microsoft Graph* →
-   **Delegated permissions**, and add:
+The default configuration requests:
 
-   ```
-   User.Read  People.Read
-   Mail.ReadWrite  Mail.Send
-   Calendars.ReadWrite
-   Chat.ReadWrite  ChannelMessage.Send  ChannelMessage.Read.All
-   Presence.Read.All
-   offline_access  openid  profile
-   ```
+```text
+openid
+profile
+offline_access
+User.Read
+People.Read
+Mail.ReadWrite
+Mail.Send
+Calendars.ReadWrite
+Chat.ReadWrite
+ChannelMessage.Send
+ChannelMessage.Read.All
+Presence.Read.All
+```
 
-   Three capabilities are **opt-in**, because adding a scope later forces everyone
-   to re-consent. Add these now if you want them, then enable the matching flag
-   in `.env`:
+Depending on tenant policy, some permissions may require administrator consent.
 
-   | Permission | Enables | Flag |
-   |---|---|---|
-   | `Team.ReadBasic.All` | Teams **channels** (chats work without it) | `M365_TEAMS_CHANNELS=1` |
-   | `Presence.ReadWrite` | Setting your own status | `M365_PRESENCE_WRITE=1` |
-  | `Files.Read.All` | Regular Teams image file previews from OneDrive / SharePoint | `M365_TEAMS_FILE_IMAGES=1` |
+### Optional delegated permissions
 
-7. Click **Grant admin consent**.
+Additional capabilities are deliberately opt-in so enabling a new feature does
+not unexpectedly change the consent request for every user.
 
-> **If you're not an admin**, that button is greyed out. `ChannelMessage.Read.All`
-> and `Presence.Read.All` need an administrator — ask them to register the app
-> and grant consent, then use the client ID they give you. You sign in as
-> yourself; the app acts on your behalf.
->
-> To start without an admin, use Outlook-only scopes by setting `M365_SCOPES` in
-> `.env` (see [.env.example](.env.example)).
+| Permission | Feature | Configuration |
+|---|---|---|
+| `Team.ReadBasic.All` | Teams and channel enumeration | `M365_TEAMS_CHANNELS=1` |
+| `Presence.ReadWrite` | Set or publish your own presence | `M365_PRESENCE_WRITE=1` or `M365_PRESENCE_PRIMARY=1` |
+| `Files.Read.All` | Regular Teams image files from OneDrive / SharePoint | `M365_TEAMS_FILE_IMAGES=1` |
 
-## 2. Configure
+If `M365_SCOPES` is set explicitly, optional permissions are **not**
+automatically added. Include every required scope yourself.
+
+After changing the requested scopes, an existing cached token may no longer have
+the required consent. Remove the token cache and sign in again when necessary.
+
+---
+
+## Installation
+
+### Release binary
+
+Download the latest release for the current architecture:
+
+```sh
+curl -fsSL -o m365-tui.tar.gz "https://github.com/Pitriss/m365-tui/releases/latest/download/m365-tui-$(uname -m)-linux-musl.tar.gz"
+tar xzf m365-tui.tar.gz
+sudo install m365-tui-*/m365 /usr/local/bin/
+```
+
+The release archive also contains:
+
+```text
+m365-webhook
+realtime/
+README.md
+ARCHITECTURE.md
+LICENSE
+```
+
+`m365-webhook` and `realtime/` are needed only for optional real-time push
+notifications.
+
+A SHA-256 checksum is published alongside each release archive.
+
+### Nix
+
+The repository contains a Nix flake and can also be built or run through Nix.
+
+For example:
+
+```sh
+nix run github:Pitriss/m365-tui
+```
+
+or:
+
+```sh
+nix profile install github:Pitriss/m365-tui
+```
+
+### Build from source
+
+A recent stable Rust toolchain is required.
+
+```sh
+cargo build --release --locked
+```
+
+The resulting binary is:
+
+```text
+target/release/m365
+```
+
+With the supplied Nix development environment:
+
+```sh
+nix develop -c cargo build --release --locked
+```
+
+---
+
+## Configuration
+
+Configuration can come from environment variables or a `.env` file.
+
+The application uses `dotenvy`, so a `.env` file in the current directory or a
+parent directory is loaded automatically.
+
+Start with:
 
 ```sh
 cp .env.example .env
 ```
 
-Set at minimum:
+At minimum configure:
 
 ```dotenv
-M365_CLIENT_ID=<Application (client) ID>
-M365_TENANT_ID=<Directory (tenant) ID>
+M365_CLIENT_ID=00000000-0000-0000-0000-000000000000
 ```
 
-Leave `M365_TUNNEL_BASE_URL` empty for now — the app works fully without it,
-just polling instead of instant push.
+### General
 
-## 3. Install
+| Variable | Default | Description |
+|---|---|---|
+| `M365_CLIENT_ID` | required | Entra Application (client) ID |
+| `M365_TENANT_ID` | `organizations` | Tenant GUID, `organizations`, or `common` |
+| `M365_SCOPES` | built-in defaults | Space-separated delegated Graph scopes |
+| `M365_TOKEN_CACHE` | OS configuration directory | Token cache location |
+| `M365_GRAPH_BASE` | Microsoft Graph | Alternate Graph endpoint, mainly for testing |
+| `M365_NOTIFY` | enabled | Set to `0`, `false`, `no`, or `off` to disable desktop notifications |
 
-**One download, nothing else required:**
+### Outlook
 
-```sh
-curl -fsSL -o m365-tui.tar.gz \
-  "https://github.com/rootHytx/m365-tui/releases/latest/download/m365-tui-$(uname -m)-linux-musl.tar.gz"
-tar xzf m365-tui.tar.gz
-sudo install m365-tui-*/m365 /usr/local/bin/
+#### Delayed read marking
+
+`M365_READ_MSG_TIMEOUT` controls how long an unread message must remain opened
+before m365-tui marks it as read.
+
+```dotenv
+M365_READ_MSG_TIMEOUT=0
 ```
 
-`uname -m` picks the right build — `x86_64` and `aarch64` are both published, one
-tarball each. That's the whole release; there's nothing else to fetch.
+The value is in seconds.
 
-Inside you get:
+`0` means the message is marked read immediately after its body is displayed.
 
-| | |
+Regardless of the automatic timer, press `u` to toggle the selected/open message
+between read and unread.
+
+### Teams
+
+#### Channels
+
+Chats work without extra configuration.
+
+To enable Teams/channel enumeration:
+
+```dotenv
+M365_TEAMS_CHANNELS=1
+```
+
+This requires:
+
+```text
+Team.ReadBasic.All
+```
+
+#### Regular Teams image files
+
+Hosted images embedded directly in Teams messages do not require this option.
+
+For regular image files stored in OneDrive or SharePoint:
+
+```dotenv
+M365_TEAMS_FILE_IMAGES=1
+```
+
+This requires:
+
+```text
+Files.Read.All
+```
+
+When enabled, m365-tui resolves supported JPEG, PNG, and GIF attachments and can
+display them through the terminal image renderer.
+
+#### Teams system events
+
+Control which system events appear in conversations:
+
+```dotenv
+M365_TEAMS_SYSTEM_EVENTS=useful
+```
+
+Accepted values:
+
+| Value | Behaviour |
 |---|---|
-| `m365` | **the app** — this is the one you install |
-| `realtime/` | optional add-on for [instant push](#instant-push-optional); ignore it unless you want that |
-| `m365-webhook` | used by `realtime/`; you never run it directly |
-| `README.md` `ARCHITECTURE.md` `LICENSE` | the docs you're reading |
+| `useful` | Show useful and unknown events; hide known low-value noise |
+| `all` | Show all known and unknown system events |
+| `none` | Hide all system events |
 
-Each release also publishes a `.sha256` next to the tarball if you want to
-verify it.
+Default:
 
-<details>
-<summary>Other ways to install</summary>
-
-**Nix** — run it without installing, or add it to a system/home-manager flake
-(`m365-tui.packages.${system}.default`):
-
-```sh
-nix run github:rootHytx/m365-tui
-nix profile install github:rootHytx/m365-tui
+```text
+useful
 ```
 
-**From source** — needs a Rust toolchain:
+Useful events include, among others:
 
-```sh
-cargo build --release            # binary at target/release/m365
-nix develop -c cargo build --release    # or via the bundled dev shell
+- recording events
+- transcript events
+- chat rename
+- members added or removed
+- message pinned or unpinned
+
+Known low-value events such as call start/end and some policy/application update
+events are hidden in `useful` mode.
+
+Unknown future event types remain visible in `useful` mode so new Microsoft
+event types are not silently discarded.
+
+System-event rows are selectable for reading but cannot be replied to or reacted
+to.
+
+### Presence
+
+#### Show contact presence
+
+Enable status indicators for contacts in one-to-one Teams chats:
+
+```dotenv
+M365_PRESENCE_READ=1
 ```
 
-</details>
+This uses the default:
 
-## 4. Run
-
-```sh
-m365 --help     # usage; needs no configuration
-m365 whoami     # sign in and print your identity — a good first check
-m365            # launch
+```text
+Presence.Read.All
 ```
 
-The first run prints a URL and a code: open the URL, enter the code, sign in.
-The token is cached at `~/.config/m365-tui/token-cache.json` and refreshed
-automatically, so you only do this once.
+Presence is deliberately omitted for group and meeting chats.
+
+The indicators are:
+
+| Marker | Meaning |
+|---|---|
+| `●` | Available |
+| `●` | Busy / In a call / In a meeting |
+| `◐` | Away / Be right back |
+| `×` | Do not disturb / Presenting |
+| `○` | Offline / unknown |
+
+The marker on the selected chat remains colour-coded and is rendered on a small
+dark badge so the status remains visible against the selected-row background.
+
+#### Set your own presence
+
+Enable the presence picker:
+
+```dotenv
+M365_PRESENCE_WRITE=1
+```
+
+This adds:
+
+```text
+Presence.ReadWrite
+```
+
+Press `p` in the application to select a status.
+
+#### Primary application presence
+
+m365-tui can also maintain its own active presence session:
+
+```dotenv
+M365_PRESENCE_PRIMARY=1
+```
+
+This also requires `Presence.ReadWrite`.
+
+The application refreshes the session while running and clears it when exiting.
+
+A running Microsoft Teams client can still override or outrank the status
+published by m365-tui.
+
+#### Automatic Away
+
+When primary presence is enabled:
+
+```dotenv
+M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=5
+```
+
+controls the number of minutes of local m365-tui inactivity before the
+application changes its own session from Available to Away.
+
+Any keypress or bracketed paste makes it Available again.
+
+Set:
+
+```dotenv
+M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=0
+```
+
+to disable the automatic Away transition.
+
+### Calendar
+
+Online meeting links normally use the operating-system URL handler.
+
+To force a specific executable:
+
+```dotenv
+M365_MEETING_OPENER=/usr/bin/firefox
+```
+
+The URL is passed directly as one argument. No shell is involved.
+
+If additional command-line arguments are required, use a wrapper script.
+
+### Persistent Teams cache
+
+Persistent Teams state is enabled by configuring:
+
+```dotenv
+M365_TEAMS_IMAGE_CACHE_DIR=/home/user/.cache/m365-tui/teams
+```
+
+The variable name is historical and is retained for backward compatibility.
+
+The directory is now the common root for:
+
+- Teams image cache
+- cached chat conversations
+- persistent UI state
+
+Without this variable:
+
+- Teams images are cached only in RAM,
+- persistent chat conversation cache is disabled,
+- persistent UI state is disabled.
+
+On Unix, cache directories and files are created with restrictive permissions.
+
+Cached conversation JSON is stored as plaintext and may contain message content,
+participant information, links, reactions, attachments, and chat identifiers.
+Protect the cache directory accordingly.
+
+#### Cache size
+
+```dotenv
+M365_TEAMS_IMAGE_CACHE_MAX_MB=256
+```
+
+controls the persistent image-cache size.
+
+The default is 256 MiB.
+
+#### Conversation cache warm-up
+
+When persistent caching is configured, m365-tui can prefill chat caches in the
+background.
+
+Enabled by default.
+
+Disable it with:
+
+```dotenv
+M365_TEAMS_CACHE_WARMUP=0
+```
+
+Disabling warm-up does not disable caching itself. Chats are still cached when
+opened, and existing cached conversations can still be previewed locally.
+
+### Real-time push
+
+Polling is always available and refreshes the application every 20 seconds.
+
+Real-time push is optional.
+
+The main variables are:
+
+```dotenv
+M365_TUNNEL_BASE_URL=
+M365_CLIENT_STATE=
+M365_REDIS_URL=redis://127.0.0.1:6379
+CLOUDFLARE_TUNNEL_TOKEN=
+```
+
+For normal poll-only operation, leave `M365_TUNNEL_BASE_URL` empty.
+
+See [Real-time updates](#real-time-updates) for the complete setup.
 
 ---
 
-## Keys
+## Keyboard controls
 
-Press `?` in the app for this list at any time.
+Press `?` at any time outside the Teams composer to display the built-in help.
 
-| Scope | Keys |
+### Global
+
+| Key | Action |
 |---|---|
-| **Global** | `F1` Outlook · `F2` Teams · `F3` Calendar · `F5` force poll · `Ctrl+P` command palette · `p` presence · `?` help · `q` quit |
-| **Moving** | `h`/`l` out of and into a pane · `j`/`k` move within it · arrows work the same · `Tab` cycles |
-| **Outlook** | `Enter` open · `c` compose · `r` reply · `a` reply-all · `f` forward · `/` search · `g` calendar |
-| **Reading a mail** | `j`/`k` scroll · `Home`/`End` · `h` back to the list |
-| **Teams** | `t` chats↔channels (needs `M365_TEAMS_CHANNELS=1`) · `j`/`k` select message · `g` newest · `e` react · `r` reply · `a`/`i` write · `Enter` send |
-| **Calendar** | `j`/`k` select · `a` accept · `d` decline · `t` tentative · `r` refresh · `w` range |
-| **Attachments** | `A` list · `1`–`9` save to Downloads |
-| **Links** | `o` list · `1`–`9` open in browser |
-| **Copying** | `y` copy message · `Y` copy everything · `z` copy mode |
-| **Writing** | `←→↑↓` move · `Ctrl+←→` by word · `Home`/`End` · `Ctrl+W`/`Ctrl+U`/`Ctrl+K` delete · `Ctrl+S` send · `Esc` cancel |
+| `F1` | Outlook |
+| `F2` | Teams |
+| `F3` | Calendar |
+| `F5` | Force an immediate poll |
+| `Ctrl+P` | Command palette |
+| `p` | Presence picker |
+| `?` | Help |
+| `y` | Copy focused message |
+| `Y` | Copy complete current view |
+| `z` | Copy mode |
+| `q` | Quit |
+| `Ctrl+C` | Quit |
 
-`h` and `l` work like a file manager: `l` moves right into the pane beside you,
-opening whatever is selected, and `h` moves back out. `j`/`k` stay inside the
-focused pane — in a reading pane or conversation they scroll the text, since
-there's nothing below to move to.
+### Navigation
 
-Scrolling to the end of a message list or conversation loads the next 50 items.
+The UI follows a left-to-right pane model.
 
-The **top-right** shows live state — your presence, push health, memory use and
-the last sync time. The **bottom-right** shows the keys available right now,
-changing with whatever has focus. The bottom-left carries the most recent
-message, which clears itself after a few seconds.
-
-## Things worth knowing
-
-**Sending attachments.** In the compose window, `Tab` to the `Attach:` field,
-type a file path (`~` works) and press `Enter` to stage it. `Ctrl+X` removes the
-last one. Files over 3 MB upload in chunks automatically; Graph's own ceiling is
-150 MB per message.
-
-**Saving attachments.** Messages with attachments show 📎. Press `A`, then a
-number, to save to your Downloads folder. Files are never overwritten.
-
-**Links.** Long URLs are kept out of the text — a link shows as its text plus
-`[1]`. Press `o` to list them and a number to open. Microsoft "Safelinks"
-tracking wrappers are unwrapped back to the real destination.
-
-**Copying text.** Press `y` to copy a message straight to the clipboard, or `z`
-for copy mode — a borderless full-width view where a normal mouse drag selects
-only the message text, with no side panes in the way.
-
-**Notifications.** You're told about things actually addressed to you:
-
-| | Notifies |
+| Key | Action |
 |---|---|
-| New inbox mail | Always, unless already read elsewhere |
-| Direct messages | Always |
-| Group chats, meeting chats | Only when someone `@mentions` you |
+| `h` / `Left` / `Esc` | Move out to the pane on the left |
+| `l` / `Right` | Enter/open the selected item to the right |
+| `j` / `Down` | Move or scroll down |
+| `k` / `Up` | Move or scroll up |
+| `Tab` | Cycle focus where supported |
+| `PageUp` / `PageDown` | Move by larger increments |
+| `Home` / `End` | First/last or beginning/end depending on context |
 
-Mail is announced even while you're reading another folder. Uses `notify-send`
-if installed, otherwise the terminal bell. Turn it off with `M365_NOTIFY=0` in
-`.env`.
+### Outlook
 
-**Replying.** Select a message and press `r`: the composer opens with a banner
-showing what you're replying to, and `Enter` sends it as a quoted reply. In a
-channel it threads properly; in a chat it quotes the original the same way Teams
-does. Incoming replies show the quoted text marked with `┃`.
+| Key | Action |
+|---|---|
+| `Enter` / `l` | Open selected folder/message |
+| `u` | Toggle selected/open mail read/unread |
+| `c` | Compose |
+| `r` | Reply |
+| `a` | Reply all |
+| `f` | Forward |
+| `/` | Search |
+| `g` | Quick Calendar view |
+| `A` | Attachment list for opened mail |
+| `o` | Link list for opened mail |
 
-**Conversations read like a chat.** Oldest at the top, newest at the bottom just
-above the composer. Consecutive messages from the same person are grouped under
-one name, each with its own timestamp down the left, and a `Today`/`Yesterday`
-header stays pinned at the top of the pane as you scroll.
+In the reading pane, `j`/`k` scroll rather than changing the selected message.
 
-**Open chats update themselves.** New messages appear in the conversation you're
-reading — within a second with push enabled, otherwise on the 20-second refresh.
-If you're on the newest message the view follows along; if you've scrolled back
-to read history it stays put and the title shows `▲ 2 new`. Press `g` to jump
-back to the newest.
+### Teams
 
-**Your status.** `p` sets Available / Busy / DND / Be right back / Away / Appear
-offline, and it works **without Teams running** — the app publishes its own
-presence session, so colleagues see the status you pick. Quitting the app clears
-it, and the session is renewed automatically while the app is open.
+#### Chat list
 
-Needs one extra permission (`Presence.ReadWrite`) plus `M365_PRESENCE_WRITE=1` in
-`.env`; without them the picker is read-only.
+| Key | Action |
+|---|---|
+| `j` / `k` | Move through chats and show local cached preview |
+| `Enter` / `l` | Open selected conversation |
+| `t` | Toggle chats / Teams channels |
+| `i` / `a` | Open selected chat and start writing |
 
-Two quirks worth knowing:
+Moving with `j`/`k` in the chat list does not open the conversation on the
+server. When a persistent cache exists, m365-tui displays the cached conversation
+and cached images locally.
 
-- A **signed-in Teams client outranks the app.** If Teams is running and goes
-  idle, it can pull `Available` down to `Away`. With no Teams client, what you
-  pick is what shows.
-- The session API's vocabulary is narrower than the picker's, so **Busy** shows
-  as "In a call" and **Do not disturb** as "Presenting". The colour and the
-  do-not-disturb behaviour are right; the sub-label is Microsoft's, not ours.
+Opening the conversation performs normal Graph refresh and read-state handling.
 
-## Instant push (optional)
+#### Conversation
 
-Polling every 20 seconds is the default and needs nothing. For ~1-second updates,
-Graph needs a public HTTPS URL to push notifications to — which a laptop behind
-NAT doesn't have. A Cloudflare tunnel provides one without opening any inbound
-port.
+| Key | Action |
+|---|---|
+| `j` / `k` | Select previous/next visible message |
+| `Home` | Oldest loaded selectable message |
+| `End` / `g` | Newest selectable message |
+| `r` | Reply to selected message |
+| `e` | React |
+| `i` / `a` | Enter composer |
+| `h` / `Esc` | Return to chat list |
 
-**You already have everything** — it's the `realtime/` folder in the tarball you
-downloaded in [step 3](#3-install). Nothing more to fetch:
+Deleted and filtered system-event rows are skipped during message navigation.
 
-```sh
-cd m365-tui-*/realtime && ./up.sh
+#### Composer
+
+| Key | Action |
+|---|---|
+| `Enter` | Send |
+| `Shift+Enter` / `Alt+Enter` | Insert newline |
+| `Esc` | Return to conversation |
+| `Tab` | Return to chat list |
+| `Ctrl+W` | Delete previous word |
+| `Ctrl+U` | Delete to start of line |
+| `Ctrl+K` | Delete to end of line |
+| `Ctrl+Left` / `Ctrl+Right` | Move by word |
+| `Home` / `End` | Start/end of line |
+| `Ctrl+Home` / `Ctrl+End` | Start/end of text |
+
+### Calendar agenda
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Select event |
+| `PageUp` / `PageDown` | Move by ten events |
+| `Home` / `End` | First / last event |
+| `Enter` / `g` | Event details |
+| `o` | Open online meeting |
+| `n` | Jump to today |
+| `a` | Accept |
+| `d` | Decline |
+| `t` | Tentative |
+| `r` | Refresh |
+| `w` | Cycle agenda range |
+| `v` | Month view |
+
+### Calendar month
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Previous / next event in active month |
+| `PageUp` / `PageDown` | Move by five events |
+| `Home` / `End` | First / last event in active month |
+| `Left` / `Right` | Previous / next month |
+| `Enter` / `g` | Event details |
+| `o` | Open online meeting |
+| `n` | Current month |
+| `a` / `d` / `t` | RSVP |
+| `v` | Agenda view |
+
+### Copy mode
+
+Press `z` to enter a borderless full-width representation intended for clean
+terminal mouse selection.
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Scroll |
+| `PageUp` / `PageDown` | Scroll by 20 rows |
+| `g` | Top |
+| `y` | Copy complete view |
+| `z` / `Esc` / `q` | Leave copy mode |
+| `Ctrl+C` | Quit application |
+
+---
+
+## Outlook behaviour
+
+### Read state
+
+Opening an unread message starts the read timer.
+
+The timer applies only to the selected/displayed message and is cancelled when
+the user leaves it before the configured timeout.
+
+`M365_READ_MSG_TIMEOUT=0` marks the message read immediately after its content
+has been displayed.
+
+Press `u` to explicitly toggle read/unread state at any time.
+
+### Nested folders and unread counts
+
+Outlook folders are displayed as a compact tree using characters such as:
+
+```text
+├
+└
+│
 ```
 
-It checks Docker, generates the shared secret, starts the webhook, Redis and the
-tunnel, verifies the tunnel end to end, and prints the two lines to paste into
-your `.env`:
+Unread counts are aligned on the right.
+
+The application tab also indicates when unread mail exists.
+
+### Attachments
+
+Incoming messages containing attachments show an attachment indicator.
+
+Press `A` and select an item with `1`–`9` to save it to the Downloads
+directory.
+
+Existing files are not overwritten.
+
+While composing mail, use the attachment field to stage files before sending.
+
+Small files are sent directly through Graph. Larger files use a Graph upload
+session.
+
+### Links
+
+Links are rendered as text with numbered references rather than long raw URLs.
+
+Press `o` to display the link list and `1`–`9` to open a link.
+
+Microsoft Safelinks wrappers are reduced back to their actual destination when
+possible.
+
+### Image previews
+
+JPEG, PNG, and GIF mail attachments can be previewed directly in a compatible
+terminal.
+
+The normal attachment-saving workflow remains available regardless of image
+support.
+
+---
+
+## Teams behaviour
+
+### Chats, channels, and unread state
+
+Chats are available using the default Graph scopes.
+
+Teams/channel browsing is optional and requires:
 
 ```dotenv
-M365_TUNNEL_BASE_URL=https://<hostname>
-M365_CLIENT_STATE=<generated secret>
+M365_TEAMS_CHANNELS=1
 ```
 
-Restart the app and the top-right should read `push live`. `./down.sh` stops it;
-the app carries on with the 20-second refresh.
+plus `Team.ReadBasic.All`.
 
-With no configuration you get a **throwaway** `trycloudflare.com` hostname — no
-account, no domain, but it changes on every restart. For a permanent one, put a
-Cloudflare tunnel token in `realtime/.env` and re-run `./up.sh`; full
-instructions are in `realtime/README.md`, which is also
-[deploy/README.md](deploy/README.md) here.
+One-to-one chats display unread counts.
 
-<details>
-<summary>From a source checkout instead</summary>
+When a chat is actually opened, m365-tui marks it read on the Microsoft 365
+server so read state is synchronized with other Teams clients.
 
-The repo-root [docker-compose.yml](docker-compose.yml) is the same stack built
-from source, configured through the root `.env`:
+Simply moving over a chat in the list and displaying a cached preview does
+**not** mark it read.
+
+### Cached conversation preview
+
+With persistent Teams caching enabled, moving through chat rows with `j` and `k`
+can immediately show a locally cached conversation without performing a Graph
+request.
+
+Preview lookup order for images is:
+
+```text
+RAM cache
+    ↓
+persistent disk cache
+    ↓
+stop
+```
+
+A cache-only preview never downloads a missing image from Graph.
+
+When the user actually opens the chat, the normal path becomes:
+
+```text
+RAM cache
+    ↓
+persistent disk cache
+    ↓
+Microsoft Graph
+```
+
+This keeps list navigation fast and prevents simply browsing cached chats from
+causing network activity or read-state changes.
+
+### Conversation history
+
+Chat conversations are stored chronologically, oldest at the top and newest at
+the bottom.
+
+Messages from the same sender are visually grouped where appropriate.
+
+A pinned date row shows the day associated with the current scroll position.
+
+If new messages arrive while the user has moved away from the newest message,
+the application keeps the current reading position and displays a new-message
+count.
+
+Press `g` to jump back to the newest message.
+
+### Replies and reactions
+
+Select a message and press:
+
+```text
+r    reply
+e    react
+```
+
+Chat replies preserve the Teams message-reference information where available.
+
+System-event messages are intentionally not replyable or reactable.
+
+### Presence
+
+One-to-one chats can show contact presence when:
+
+```dotenv
+M365_PRESENCE_READ=1
+```
+
+The selected chat keeps the presence colour rather than allowing the generic
+row-selection foreground to hide it.
+
+A dark one-cell badge gives the marker additional contrast on highlighted rows.
+
+### System events
+
+Teams uses special messages for events that are not ordinary user-authored
+messages.
+
+m365-tui recognizes useful events such as:
+
+- recording availability
+- transcript availability
+- chat rename
+- members added or removed
+- messages pinned or unpinned
+
+Low-value system noise can be filtered through
+`M365_TEAMS_SYSTEM_EVENTS`.
+
+Unknown event types are retained in the default `useful` mode so future Graph
+event kinds remain visible instead of silently disappearing.
+
+### Images
+
+m365-tui supports two Teams image sources.
+
+#### Hosted inline images
+
+Images hosted directly as Teams message content are handled without
+`Files.Read.All`.
+
+#### Regular file attachments
+
+Images stored as normal OneDrive / SharePoint files require:
+
+```dotenv
+M365_TEAMS_FILE_IMAGES=1
+```
+
+and:
+
+```text
+Files.Read.All
+```
+
+Supported preview formats are JPEG, PNG, and GIF.
+
+Persistent image caching is available when `M365_TEAMS_IMAGE_CACHE_DIR` is
+configured.
+
+---
+
+## Calendar behaviour
+
+### Agenda view
+
+Agenda is the default Calendar view.
+
+Available ranges:
+
+```text
+7
+14
+30
+60
+90
+180
+365 days
+```
+
+The default range is 30 days.
+
+Press `w` to cycle through ranges.
+
+The list displays independent RSVP and online-meeting indicators.
+
+Typical RSVP markers include:
+
+```text
+[A] accepted
+[T] tentative
+[D] declined
+[?] awaiting response
+[O] organizer
+[!] cancelled
+```
+
+A separate meeting indicator shows when a usable online-meeting join URL is
+available.
+
+### Event details
+
+Press `Enter` or `g` to display details for the selected event.
+
+The detail includes information such as:
+
+- subject
+- start/end time
+- response status
+- organizer
+- location
+- online-meeting information
+- description preview
+
+### RSVP
+
+From Agenda, Month, or the selected event workflow:
+
+```text
+a    accept
+d    decline
+t    tentative
+```
+
+### Online meetings
+
+Press `o` to open the join URL of the selected event.
+
+m365-tui delegates actual meeting participation to an external application. It
+does not implement Teams audio or video itself.
+
+### Month view
+
+Press `v` to switch between Agenda and Month.
+
+The month view:
+
+- uses a Monday-to-Sunday grid,
+- displays between one and four months depending on available width,
+- treats the leftmost displayed month as the active month,
+- renders multi-day events across date and week boundaries,
+- preserves RSVP/status styling,
+- highlights the selected event.
+
+Minimum terminal size:
+
+```text
+68 x 23
+```
+
+If Month view cannot fit, m365-tui stays in or falls back to Agenda and displays
+a short notice.
+
+---
+
+## Persistent data and cache
+
+### Authentication token
+
+The authentication token cache defaults to the operating system configuration
+directory and can be overridden with:
+
+```dotenv
+M365_TOKEN_CACHE=/path/to/token-cache.json
+```
+
+Delete the token cache when a changed set of Graph permissions requires a new
+consent flow.
+
+### Teams persistent root
+
+Persistent Teams data uses:
+
+```dotenv
+M365_TEAMS_IMAGE_CACHE_DIR=/path/to/cache
+```
+
+Despite the historical name, this is the common persistence root for several
+Teams-related features.
+
+It contains data such as:
+
+```text
+image cache
+conversation cache
+UI state
+```
+
+### Conversation cache
+
+Conversation caching currently applies to Teams chats, not channel
+conversations.
+
+Cached data is based on the original Graph message objects so replies,
+reactions, links, attachment metadata, and system-event information can be
+restored.
+
+Up to the newest 2000 loaded messages are retained per chat.
+
+Invalid, corrupt, or oversized cache files are discarded safely and the
+application falls back to Graph when the chat is opened.
+
+### UI state
+
+Persistent UI state remembers information such as the previous screen,
+Calendar view, and last Teams conversation.
+
+Restoring cached content does not by itself have to perform the same operations
+as actively opening a conversation.
+
+### Privacy
+
+Teams conversation cache content is stored locally as plaintext JSON.
+
+Anyone able to read that cache may be able to read cached message content and
+metadata.
+
+Use normal filesystem protections and do not place the cache in a publicly
+accessible directory.
+
+---
+
+## Notifications
+
+Notifications are enabled by default.
+
+Disable them with:
+
+```dotenv
+M365_NOTIFY=0
+```
+
+m365-tui notifies for:
+
+- new unread inbox mail,
+- direct Teams messages,
+- group/meeting chat messages relevant to you, such as mentions.
+
+Where supported, `notify-send` is used.
+
+Without a desktop notification helper, m365-tui falls back to a terminal bell.
+
+The initial synchronization establishes a baseline instead of generating
+notifications for existing history.
+
+---
+
+## Real-time updates
+
+m365-tui always supports polling.
+
+The normal poll interval is:
+
+```text
+20 seconds
+```
+
+Press `F5` to request an immediate refresh.
+
+### Optional push notifications
+
+For lower latency, Microsoft Graph can send change notifications through a
+public HTTPS webhook.
+
+A desktop computer is normally behind NAT and has no directly reachable HTTPS
+endpoint, so the release contains an optional real-time stack under:
+
+```text
+realtime/
+```
+
+It contains the webhook service, Redis integration, Cloudflare tunnel setup, and
+helper scripts.
+
+From an extracted release:
 
 ```sh
-docker compose up -d --build
-curl https://<your-hostname>/healthz     # expect: ok
+cd m365-tui-*/realtime
+./up.sh
 ```
 
-Both use the same project and container names, so bringing one up replaces the
-other.
+The helper can use either:
 
-</details>
+- a temporary `trycloudflare.com` tunnel, or
+- a named Cloudflare tunnel.
 
-### Is it actually working?
+It prints the values that need to be used by m365-tui.
 
-**The top-right corner tells you**, alongside your presence, memory use and last
-sync time:
+Typical configuration:
 
-| | Meaning |
-|---|---|
-| `push live` (green) | Subscriptions are live — changes arrive in seconds |
-| `push …` (yellow) | Still subscribing |
-| `push FAILED` (red) | Graph rejected it; the reason appears in the status bar, and it falls back to polling |
-| `push off` (grey) | No tunnel configured — normal poll-only mode |
+```dotenv
+M365_TUNNEL_BASE_URL=https://example
+M365_CLIENT_STATE=shared-secret
+M365_REDIS_URL=redis://127.0.0.1:6379
+```
 
-To confirm end-to-end, send yourself an email from your phone: it should appear
-within a second or two, well before the `⟳ synced` clock changes.
+The webhook does not hold the user's Microsoft Graph access token.
 
-If it says failed, the usual cause is `M365_TUNNEL_BASE_URL` not exactly matching
-your tunnel hostname — Graph reports `Failed to resolve domain ...`. Check
-`docker compose logs webhook` to see requests arriving.
+It validates incoming notifications and publishes a small change signal through
+Redis. The TUI then performs the actual Graph fetch using its own delegated
+token.
+
+If push setup fails, the application continues operating through normal polling.
+
+### Push status
+
+The top status area indicates states such as:
+
+```text
+push live
+push …
+push FAILED
+push off
+```
+
+A failed push configuration does not disable ordinary 20-second polling.
+
+---
 
 ## Troubleshooting
 
-**Pressing `t` says channels need a permission.** Listing your teams requires
-`Team.ReadBasic.All`, which isn't requested by default. Add it to the app
-registration, set `M365_TEAMS_CHANNELS=1` in `.env`, delete
-`~/.config/m365-tui/token-cache.json` and sign in again. Chats need none of this.
+### Sign-in asks for administrator approval
 
-**Sign-in asks for admin approval.** The requested scopes no longer match what
-was consented. Either have an admin approve the new set, or pin the old one with
-`M365_SCOPES` in `.env` and sign in again.
+The requested scopes may differ from those already consented.
 
-**Nothing arrives instantly.** Look at the push indicator in the tab bar — see
-[Is it actually working?](#is-it-actually-working). Subscription errors are also
-recorded in `$TMPDIR/m365-tui.log`.
+If permissions were intentionally changed:
 
-**Anything else.** Logs go to `$TMPDIR/m365-tui.log`; run with `RUST_LOG=debug`
-for detail.
+1. update the Entra application permissions,
+2. grant the required consent,
+3. delete the old token cache,
+4. sign in again.
+
+If `M365_SCOPES` is set manually, verify that it contains every permission
+required by the enabled features.
+
+### Teams channels are unavailable
+
+Channels require:
+
+```text
+Team.ReadBasic.All
+```
+
+and:
+
+```dotenv
+M365_TEAMS_CHANNELS=1
+```
+
+Chats do not require this option.
+
+### Teams regular image attachments are unavailable
+
+Regular OneDrive / SharePoint image attachments require:
+
+```text
+Files.Read.All
+```
+
+and:
+
+```dotenv
+M365_TEAMS_FILE_IMAGES=1
+```
+
+Hosted inline Teams images are handled separately.
+
+### Presence can be viewed but not changed
+
+Reading presence and writing presence use different permissions.
+
+Contact presence uses:
+
+```text
+Presence.Read.All
+```
+
+Changing your own presence requires:
+
+```text
+Presence.ReadWrite
+```
+
+plus either:
+
+```dotenv
+M365_PRESENCE_WRITE=1
+```
+
+or:
+
+```dotenv
+M365_PRESENCE_PRIMARY=1
+```
+
+### Push is not working
+
+Check the push indicator in the application.
+
+Also inspect:
+
+```text
+$TMPDIR/m365-tui.log
+```
+
+For detailed logs:
+
+```sh
+RUST_LOG=debug m365
+```
+
+Common causes include:
+
+- tunnel URL does not match the actual public hostname,
+- `M365_CLIENT_STATE` differs between components,
+- webhook or Redis is unavailable,
+- Graph rejected subscription creation.
+
+The application continues polling even when push is unavailable.
+
+### Month view does not open
+
+Month view requires at least:
+
+```text
+68 x 23
+```
+
+terminal cells.
+
+Use Agenda view in smaller terminal windows.
+
+---
 
 ## Development
 
-Only needed if you're changing the code — running it doesn't require any of this.
+Build the complete workspace:
 
 ```sh
-cargo test --workspace
+cargo build --workspace --locked
+```
+
+Run tests:
+
+```sh
+cargo test --workspace --locked
+```
+
+Run Clippy:
+
+```sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Both run in CI on every push and pull request, along with `shellcheck` over the
-`deploy/` scripts, since those ship to users untouched.
+CI also validates the deployment shell scripts and Docker Compose configuration.
 
-Pushing a `v*.*` tag builds static musl binaries for x86_64 and aarch64 and
-publishes one tarball per architecture, with [`deploy/`](deploy/) packaged inside
-it as `realtime/`. That's what the install step above downloads. Design notes and
-internals live in [ARCHITECTURE.md](ARCHITECTURE.md).
+### Architecture
 
-## Not supported
+Implementation notes are maintained separately in:
 
-Joining Teams calls or meetings (audio/video isn't a terminal thing — you can
-still list and schedule them), and bulk chat export, which needs separately
-approved Graph permissions.
+[ARCHITECTURE.md](ARCHITECTURE.md)
+
+The TUI keeps network work off the rendering thread. Graph operations run
+asynchronously and return state updates to the application loop.
+
+### Releases
+
+The current CI workflow runs build, lint, tests, deployment-script checks, and
+Compose validation for changes pushed to `main`.
+
+After successful CI on `main`, the release workflow builds static musl binaries
+for:
+
+```text
+x86_64
+aarch64
+```
+
+and publishes architecture-specific archives plus SHA-256 checksums.
+
+Release asset names are stable so the GitHub `releases/latest/download/...`
+installation URL can be used without embedding a version number.
+
+---
+
+## Relationship to upstream
+
+This repository is a downstream fork of:
+
+[github.com/rootHytx/m365-tui](https://github.com/rootHytx/m365-tui)
+
+It retains the original project's Microsoft Graph and terminal-client
+foundations but now contains substantial additional Outlook, Teams, Calendar,
+presence, caching, image, navigation, and workflow functionality.
+
+The fork is maintained and released independently.
+
+The historical development of those changes is available through Git history
+and release history rather than being duplicated as a separate
+"Local enhancements" section in this README.
+
+---
+
+## Known limitations
+
+- Teams audio/video calls are not implemented inside the terminal.
+- Opening an online Calendar meeting delegates to an external application.
+- Persistent Teams conversation caching currently covers chats, not channels.
+- GIF image previews are static.
+- Month view requires a sufficiently large terminal.
+- Calendar events close to local date boundaries or daylight-saving transitions
+  may expose timezone edge cases; month-boundary handling should not be assumed
+  to be DST-perfect.
+- A running Microsoft Teams client can override presence published by m365-tui.
+- Full bulk Teams chat export is not implemented.
+- OSC 8 terminal hyperlinks are intentionally not used; numbered links avoid
+  terminal rendering problems and keep long tracked URLs out of message text.
+
+---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-Not affiliated with or endorsed by Microsoft. "Microsoft 365", "Outlook" and
-"Teams" are trademarks of Microsoft Corporation.
+m365-tui is not affiliated with or endorsed by Microsoft.
 
-## Local enhancements
-
-### Calendar month view
-
-- Calendar now has two views: the existing agenda and a graphical month view. Press `v` to switch between them.
-- Month view renders a Monday-to-Sunday calendar grid and shows 1–4 months side by side depending on terminal width. The leftmost month is the active month; additional months are previews.
-- `Left` / `Right` move to the previous / next month and `n` returns to the current month.
-- `j` / `k` move chronologically between events in the active month. `PageUp` / `PageDown` move by five events and `Home` / `End` select the first / last event in that month.
-- `Enter` / `g` open event detail, `o` opens the online meeting when a join URL is available, and `a` / `d` / `t` keep the existing RSVP actions.
-- Multi-day events are drawn as continuous coloured bars across calendar days and week boundaries. Meeting-capable events retain the `M` marker.
-- The selected event is emphasized with a stronger visual style and marker while retaining its RSVP/status colour.
-- Month view requires at least `68x23` terminal cells. If a saved Month view is restored in a smaller window, Calendar falls back to Agenda and shows a transient internal notice. Trying to switch to Month in a small window does the same.
-- The small-window notice disappears automatically after three seconds or immediately on any key press.
-- The selected Calendar view is persisted in the existing UI state when UI-state persistence is enabled.
-- This feature adds no new Rust runtime dependencies and requires no additional Microsoft Graph permissions.
-
-
-- Teams chats are now marked as read on the Microsoft 365 server after the conversation is opened successfully. The read state is therefore synchronized with other Teams clients. Uses the existing `Chat.ReadWrite` permission; no additional runtime dependencies or permissions are required.
-
-This fork includes a small set of usability improvements focused on Outlook mail handling, Teams status visibility, unread indicators, polling feedback, Kitty image previews, and calendar workflows.
-
-### Calendar refinements (1.4.1)
-
-- `Enter` or `g` opens the selected event's detail: subject, date and time, response status, organizer, location, meeting link, and description preview. `Esc` closes the detail.
-- `n` selects the first loaded event starting today in local time. If none is found, the selection returns to the first agenda item.
-- Invitations waiting for a response are highlighted in yellow and bold; cancelled events and events marked as organizer are excluded.
-- The agenda uses two independent, fixed-width indicators. RSVP: `[A]` accepted, `[T]` tentative, `[D]` declined, `[?]` waiting, `[O]` organizer, `[!]` cancelled, or `[ ]` unknown. Join link: `[M]` when `onlineMeeting.joinUrl` is nonempty, otherwise `[ ]`. The join indicator does not depend on RSVP or the `isOnlineMeeting` flag.
-- `o` opens the selected event's join link from the agenda or event detail. Without a join link, it does nothing. This hands the link to an external application; it does not implement calling inside the TUI.
-- By default, meeting links use the system handler (`xdg-open` on Linux, `open` on macOS). Optional `.env` setting `M365_MEETING_OPENER=/usr/bin/firefox` selects an executable name or path. The URL is passed as one argument without a shell; use an executable wrapper script when additional arguments are needed.
-- No new Rust crates, shared-library dependencies, or Microsoft Graph permissions are added. Opening a link requires the existing system handler or the chosen external application.
-
-### Calendar agenda
-
-- Added a dedicated Calendar screen on `F3`; `F1` opens Outlook and `F2` opens Teams. Outlook keeps `g` as a quick calendar overlay.
-- Added an agenda view with selectable ranges of 7, 14, 30, 60, 90, 180, or 365 days; `w` cycles the range and 30 days is the default.
-- Added meeting response actions from the agenda: `a` accept, `d` decline, and `t` tentatively accept.
-- Calendar entries show visually distinct response states for accepted, tentative, waiting, declined, cancelled, and organizer events.
-- When `M365_TEAMS_IMAGE_CACHE_DIR` is configured, the last selected top-level screen and calendar range are restored from the persistent cache on the next start.
-- Top-level tabs now keep a stable width; inactive tabs remain readable and unread tabs are highlighted without shifting the layout.
-- Uses the existing `Calendars.ReadWrite` delegated permission. No additional runtime dependencies or permissions are required.
-
-- Added configurable delayed marking of Outlook messages as read using `M365_READ_MSG_TIMEOUT`.
-- Added the `u` key to toggle the selected Outlook message between read and unread.
-- Added protection so the automatic read timer only applies to the message that is currently selected and displayed.
-- Added unread message counts to Outlook folders:
-  - `[1]`–`[99]` for unread counts up to 99.
-  - `[+]` for counts greater than 99.
-- Added an `*` indicator to the Outlook application tab when unread mail exists.
-- Added Teams application-tab unread states for one-to-one chats:
-  - `Teams (F2) *` means a new chat message arrived since Teams was last opened.
-  - `Teams (F2) •` means Teams has been opened, but one or more one-to-one chats are still unread.
-  - `Teams (F2)` means there are no known unread one-to-one chats.
-- Opening a one-to-one chat clears its local unread count after the conversation loads successfully.
-- A locally opened chat stays treated as read while Microsoft Graph temporarily reports a stale chat `viewpoint`; a genuinely new message with a new `lastMessagePreview.id` makes it unread again.
-
-### Teams conversation cache (1.4.3)
-
-- When `M365_TEAMS_IMAGE_CACHE_DIR` is configured, the same private cache root now also stores persistent chat-conversation data and the last opened Teams chat alongside the existing image cache and UI state. The variable name is intentionally retained for backward compatibility.
-- Cached chat filenames use deterministic anonymous keys. Conversation payloads are stored as plaintext JSON with private Unix permissions (`0700` directories and `0600` files); they are not encrypted.
-- The conversation cache keeps up to the newest 2000 loaded messages per chat. When more history has been loaded, the persisted cache is updated with the newest 2000 messages rather than discarded. Corrupt or invalid cache entries are removed safely without preventing normal Graph loading.
-- Moving through the Teams chat list with `j` / `k` shows a cache-only conversation preview immediately when data is available. Already-cached inline images are restored from the persistent image cache as part of the preview. Previewing does not open the chat, perform a chat Graph fetch, download new inline images, or mark the chat as read.
-- When Teams is restored as the saved top-level screen, the previous conversation is shown as a local cached preview while keyboard focus starts in the chat list. It is not treated as an opened conversation until the user explicitly opens it.
-- `Enter`, `l`, or `Tab` opens the previewed chat. The cached history remains visible while Microsoft Graph refreshes it, and fresh messages are merged by message ID to avoid duplicates.
-- A chat is marked read only after a successful Graph result for the actually opened conversation; showing cached preview data alone never changes server read state.
-- By default, persistent chat caches are warmed automatically after the chat list loads. The selected / last-opened chat is prioritized and remaining chats are fetched sequentially rather than in a parallel burst.
-- Set `M365_TEAMS_CACHE_WARMUP=0` to disable automatic background warming. Existing cache entries are still used for previews, and opening a chat still refreshes and stores that individual conversation.
-- Background warm-up applies to chats only; Teams channel-message history is not persistently conversation-cached by this feature.
-- The persistent Graph pagination continuation (`@odata.nextLink`) is intentionally not reused across application restarts. A fresh continuation is obtained from the current Graph response.
-- This feature uses the existing `Chat.ReadWrite` delegated permission and adds no Microsoft Graph permission. `serde_json` becomes a direct runtime dependency of the `m365-tui` crate, but it was already present in the workspace dependency graph; no new external runtime library or helper program is required.
-
-### Teams system events (1.4.4)
-
-- Teams system events are rendered as readable timeline entries instead of generic `(system)` messages.
-- `M365_TEAMS_SYSTEM_EVENTS=useful|all|none` controls visibility. The default is `useful`.
-- `useful` shows useful and unknown system events while hiding known low-value noise; `all` shows all known and unknown system events; `none` hides all system events.
-- Useful system events use a stronger timeline colour; known noise and unknown event types use a dimmed style. Message timestamps follow the same style as their system event.
-- Unknown event types remain visible in the default `useful` mode so new Microsoft event kinds are not silently discarded.
-- System events remain in chronological order and are not valid reply/reaction targets.
-- Microsoft Graph GET requests include `Prefer: include-unknown-enum-members` so evolvable system-event enum values are returned when available.
-- This feature uses the existing `Chat.ReadWrite` delegated permission and adds no new Microsoft Graph permission or external runtime dependency.
-
-### Teams contact presence
-
-- Optional Teams presence indicators for contacts in one-to-one chats.
-- Enable with `M365_PRESENCE_READ=1`.
-- Uses the existing `Presence.Read.All` delegated permission and fetches contact presence in batches.
-- Presence is refreshed together with the regular Teams polling cycle.
-- Group and meeting chats intentionally do not show a presence indicator.
-- Presence lookup failures are non-fatal and do not interrupt Teams chat functionality.
-- Status indicators: `●` Available, `●` Busy / In a call / In a meeting, `◐` Away / Be right back, `×` Do not disturb / Presenting, `○` Offline / unknown.
-- The presence marker on the selected Teams chat keeps its status colour instead of inheriting the generic selected-row foreground.
-- Selected presence markers use a high-contrast dark badge so Available, Busy/Away, Do not disturb/Presenting, and offline/unknown states remain distinguishable on the highlighted row.
-- This is a display-only change and adds no runtime dependencies or Microsoft Graph permissions.
-
-### Teams unread counts
-
-- One-to-one Teams chats show the number of unread messages.
-- `[1]`–`[99]` show the exact unread count; `[+]` means 100 or more unread messages.
-- The unread indicator is right-aligned in the chat list.
-- Counts are derived from the server-side Teams read state, so reading a chat in another Teams client is reflected after the next refresh.
-- Messages sent by the signed-in user, deleted messages, and system event messages are not counted as unread.
-- Group and meeting chats do not show unread counts.
-- Presence indicators and unread counts are independent; unread counts remain visible even when contact presence is disabled.
-
-### Outlook folder tree
-
-- Nested Outlook folders are rendered as a compact tree using `├`, `└`, and `│`.
-- Tree guide characters use the same dimmed colour as the polling progress indicator.
-- Top-level folders remain unprefixed.
-- Existing unread counts (`[1]`–`[99]`, `[+]`) are preserved unchanged.
-- Outlook folder unread counts are right-aligned for a cleaner and more consistent layout.
-- Folder loading and unread-count logic are unchanged; this is a visual-only improvement.
-
-### Polling progress indicator
-
-- When push notifications are off, the `push off` label is replaced by a 10-segment polling progress bar.
-- Each segment represents approximately 2 seconds of the 20-second polling interval.
-- The bar resets when the periodic poll runs.
-- `push …`, `push live`, and `push FAILED` keep their original labels and colors.
-- The polling progress indicator has been tested in poll-only mode.
-- The behavior with a fully working push connection has not yet been tested by the maintainer.
-
-### Kitty image previews
-
-- Kitty graphics are enabled only when the terminal reports support for the Kitty graphics protocol. Other terminals keep the normal text-only fallback.
-- Outlook messages can preview JPEG, PNG, and GIF image attachments directly in the reading pane.
-- Teams messages can preview hosted inline images and regular JPEG, JPG, PNG, and GIF file attachments directly in the conversation.
-- GIF files are currently displayed as a static image rather than animated.
-- Up to 4 images are processed per message.
-- Individual images larger than 8 MiB are skipped.
-- Images are reduced to at most 1600x1200 before rendering.
-- Tracking-size images such as 1x1 pixels are ignored.
-- Arbitrary external image URLs from message HTML are not downloaded.
-- Teams images are rendered inline with their message. A successfully loaded regular image attachment replaces the redundant attachment-name row.
-- Image size adapts to the available terminal area. Small images are aligned with the message text; larger images are centered.
-- The selected Teams message and up to 4 neighboring messages on either side are prefetched.
-- Decoded Teams images are cached in memory for the lifetime of the process, and duplicate in-flight downloads are suppressed.
-- Regular Teams file-image previews are opt-in with `M365_TEAMS_FILE_IMAGES=1`. With default scopes this adds `Files.Read.All`; when `M365_SCOPES` is set explicitly, `Files.Read.All` must be included manually.
-
-#### Teams file resolver status
-
-Regular Teams file attachments are resolved through four adaptive strategies. Resolver preferences are learned only for the current process and are not persisted.
-
-- **Sender OneDrive path** - runtime-tested successfully with a regular JPEG attachment in a one-to-one Teams chat.
-- **Accessible-drive search** - implemented and exercised during diagnostics, but a successful file resolution through this fallback has not yet been runtime-tested.
-- **Microsoft Search** - implemented, but a successful file resolution through this fallback has not yet been runtime-tested.
-- **Graph `/shares`** - implemented for genuine OneDrive / SharePoint sharing links. A genuine sharing-link attachment has not yet been successfully runtime-tested. Using `/shares` with a Teams WebDAV URL was tested and confirmed not to be the correct route for that URL type.
-- Regular image file attachments in **Teams channels** use the same resolver infrastructure, but successful channel-file resolution has not yet been runtime-tested.
-- Hosted-content image retrieval is implemented for both chats and channels, but neither hosted-content path has yet been separately runtime-tested in this fork.
-
-#### Optional Teams image disk cache
-
-Teams image caching is memory-only by default. Persistent caching can be enabled explicitly.
-`M365_TEAMS_IMAGE_CACHE_DIR` keeps its historical name for backward compatibility, but the configured directory now acts as the shared persistent Teams cache root. Conversation-cache behavior is documented in [Teams conversation cache (1.4.3)](#teams-conversation-cache-143).
-
-```dotenv
-M365_TEAMS_IMAGE_CACHE_DIR=/home/user/.cache/m365-tui/teams-images
-M365_TEAMS_IMAGE_CACHE_MAX_MB=256
-```
-
-- `M365_TEAMS_IMAGE_CACHE_DIR` must be set to enable disk caching. If it is unset or empty, no Teams images are written to disk.
-- The default size limit is 256 MiB.
-- The cache stores resized PNG thumbnails rather than the original downloaded files.
-- Cache filenames use deterministic anonymous keys and do not contain the original attachment filename.
-- On Unix, the cache directory is mode `0700` and cache files are mode `0600`.
-- Cached thumbnails are stored in plaintext and are not encrypted.
-- Corrupt or incomplete cache entries are discarded and fetched again when needed.
-- Cache pruning removes the oldest entries first when the configured size limit is exceeded.
-- Disk-cache reuse across application restarts and oldest-first pruning have both been runtime-tested.
-
-The image-preview implementation adds Rust `ratatui-image` / `image` build dependencies, but does not require any additional external system library, helper binary, service, or other runtime dependency.
-
-### Primary Teams presence
-
-- `M365_PRESENCE_PRIMARY=1` makes m365-tui publish its own Teams application presence session while it is running.
-- The automatic session starts as `Available` without setting a sticky user-preferred presence, so higher-priority states such as `Busy` or `DoNotDisturb` from other Teams clients can still take precedence.
-- When default scopes are used, primary presence automatically enables the required `Presence.ReadWrite` scope. If `M365_SCOPES` is set explicitly, it must include `Presence.ReadWrite`.
-- `M365_PRESENCE_AVAILABLE_TIMEOUT_MIN` controls how long the TUI remains `Available` without local activity. The default is 5 minutes.
-- After the timeout the automatic session changes to `Away`; any keypress or terminal paste changes it back to `Available`.
-- Set `M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=0` to disable the automatic `Available` -> `Away` transition.
-- Manually selecting a presence status disables the idle automation so it cannot overwrite `Busy`, `DoNotDisturb`, or another explicitly selected state.
-- `Clear / revert to automatic` returns control to the automatic `Available` / `Away` mode when `M365_PRESENCE_PRIMARY=1`.
-
-These changes were developed and tested with assistance from ChatGPT by OpenAI.
+"Microsoft 365", "Outlook", and "Teams" are trademarks of Microsoft
+Corporation.

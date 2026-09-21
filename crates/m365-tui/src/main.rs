@@ -71,7 +71,7 @@ OPTIONS:
     -V, --version  print the version
 
 Configuration is read from the environment or a .env file; M365_CLIENT_ID is
-the only required value. See https://github.com/rootHytx/m365-tui for setup.";
+the only required value. See https://github.com/Pitriss/m365-tui for setup.";
 
 fn parse_args() -> Command {
     match std::env::args().nth(1).as_deref() {
