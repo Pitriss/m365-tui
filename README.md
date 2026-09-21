@@ -461,6 +461,20 @@ This fork includes a small set of usability improvements focused on Outlook mail
 - Opening a one-to-one chat clears its local unread count after the conversation loads successfully.
 - A locally opened chat stays treated as read while Microsoft Graph temporarily reports a stale chat `viewpoint`; a genuinely new message with a new `lastMessagePreview.id` makes it unread again.
 
+### Teams conversation cache (1.4.3)
+
+- When `M365_TEAMS_IMAGE_CACHE_DIR` is configured, the same private cache root now also stores persistent chat-conversation data and the last opened Teams chat alongside the existing image cache and UI state. The variable name is intentionally retained for backward compatibility.
+- Cached chat filenames use deterministic anonymous keys. Conversation payloads are stored as plaintext JSON with private Unix permissions (`0700` directories and `0600` files); they are not encrypted.
+- The conversation cache keeps up to the newest 2000 loaded messages per chat. When more history has been loaded, the persisted cache is updated with the newest 2000 messages rather than discarded. Corrupt or invalid cache entries are removed safely without preventing normal Graph loading.
+- Moving through the Teams chat list with `j` / `k` shows a cache-only conversation preview immediately when data is available. Previewing does not open the chat, perform a chat Graph fetch, download new inline images, or mark the chat as read.
+- `Enter`, `l`, or `Tab` opens the previewed chat. The cached history remains visible while Microsoft Graph refreshes it, and fresh messages are merged by message ID to avoid duplicates.
+- A chat is marked read only after a successful Graph result for the actually opened conversation; showing cached preview data alone never changes server read state.
+- By default, persistent chat caches are warmed automatically after the chat list loads. The selected / last-opened chat is prioritized and remaining chats are fetched sequentially rather than in a parallel burst.
+- Set `M365_TEAMS_CACHE_WARMUP=0` to disable automatic background warming. Existing cache entries are still used for previews, and opening a chat still refreshes and stores that individual conversation.
+- Background warm-up applies to chats only; Teams channel-message history is not persistently conversation-cached by this feature.
+- The persistent Graph pagination continuation (`@odata.nextLink`) is intentionally not reused across application restarts. A fresh continuation is obtained from the current Graph response.
+- This feature uses the existing `Chat.ReadWrite` delegated permission and adds no Microsoft Graph permission. `serde_json` becomes a direct runtime dependency of the `m365-tui` crate, but it was already present in the workspace dependency graph; no new external runtime library or helper program is required.
+
 ### Teams contact presence
 
 - Optional Teams presence indicators for contacts in one-to-one chats.
@@ -529,7 +543,8 @@ Regular Teams file attachments are resolved through four adaptive strategies. Re
 
 #### Optional Teams image disk cache
 
-Teams image caching is memory-only by default. Persistent caching can be enabled explicitly:
+Teams image caching is memory-only by default. Persistent caching can be enabled explicitly.
+`M365_TEAMS_IMAGE_CACHE_DIR` keeps its historical name for backward compatibility, but the configured directory now acts as the shared persistent Teams cache root. Conversation-cache behavior is documented in [Teams conversation cache (1.4.3)](#teams-conversation-cache-143).
 
 ```dotenv
 M365_TEAMS_IMAGE_CACHE_DIR=/home/user/.cache/m365-tui/teams-images

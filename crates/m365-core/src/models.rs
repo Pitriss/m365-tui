@@ -42,7 +42,7 @@ pub struct Recipient {
     pub email_address: Option<EmailAddress>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemBody {
     #[serde(default)]
@@ -279,7 +279,7 @@ pub struct LastMessagePreview {
 }
 
 /// An `@mention` inside a Teams message.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageMention {
     #[serde(default)]
@@ -306,7 +306,7 @@ pub struct Channel {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentitySet {
     #[serde(default)]
@@ -315,7 +315,7 @@ pub struct IdentitySet {
     pub application: Option<Identity>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
     #[serde(default)]
@@ -325,7 +325,7 @@ pub struct Identity {
 }
 
 /// A Teams `chatMessage` (channel or chat).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
@@ -347,7 +347,7 @@ pub struct ChatMessage {
     pub mentions: Vec<ChatMessageMention>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageReaction {
     #[serde(default)]
@@ -528,7 +528,7 @@ impl Attachment {
 
 /// Something attached to a Teams message: a shared file, or — for a reply —
 /// a `messageReference` pointing at the message being answered.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageAttachment {
     #[serde(default)]
@@ -609,6 +609,21 @@ mod tests {
         }))
         .unwrap();
         assert!(plain.quoted().is_none());
+    }
+
+    #[test]
+    fn chat_message_round_trips_for_persistent_cache() {
+        let original = reply_message();
+        let encoded = serde_json::to_vec(&original).expect("serialize chat message");
+        let restored: ChatMessage =
+            serde_json::from_slice(&encoded).expect("deserialize chat message");
+
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.text(), original.text());
+        assert_eq!(
+            restored.quoted().map(|quote| quote.message_id),
+            original.quoted().map(|quote| quote.message_id)
+        );
     }
 
     #[test]

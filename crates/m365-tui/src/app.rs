@@ -56,6 +56,10 @@ pub enum AppMessage {
         next: Option<String>,
         mode: ListUpdate,
     },
+    ChatCacheWarmed {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+    },
     Teams(Vec<Team>),
     Channels {
         team_id: String,
@@ -401,6 +405,7 @@ struct UiState {
     screen: Screen,
     calendar_days: i64,
     calendar_view: CalendarView,
+    teams_chat_id: Option<String>,
 }
 
 impl Default for UiState {
@@ -409,6 +414,7 @@ impl Default for UiState {
             screen: Screen::Outlook,
             calendar_days: DEFAULT_CALENDAR_DAYS,
             calendar_view: CalendarView::Agenda,
+            teams_chat_id: None,
         }
     }
 }
@@ -466,6 +472,9 @@ pub struct TeamsState {
     /// Index of the message being replied to, while composing a reply.
     pub replying_to: Option<usize>,
     pub open_chat_id: Option<String>,
+    pub preview_chat_id: Option<String>,
+    last_chat_id: Option<String>,
+    chat_open_pending_read: Option<String>,
     pub open_channel: Option<(String, String)>,
     pub composer: TextInput,
     pub focus: TeamsFocus,
@@ -497,6 +506,9 @@ impl Default for TeamsState {
             unseen: 0,
             replying_to: None,
             open_chat_id: None,
+            preview_chat_id: None,
+            last_chat_id: None,
+            chat_open_pending_read: None,
             open_channel: None,
             composer: TextInput::new(),
             focus: TeamsFocus::List,
@@ -558,6 +570,8 @@ pub struct App {
     read_timer_generation: u64,
     /// A new Teams chat message arrived since Teams was last opened.
     pub teams_unread: bool,
+    /// Whether the automatic Teams conversation-cache warm-up has been queued.
+    chat_cache_warmup_started: bool,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -635,6 +649,124 @@ fn is_supported_teams_image_name(name: &str) -> bool {
 }
 
 const TEAMS_DISK_CACHE_KEY_HEX_LEN: usize = 32;
+const TEAMS_CONVERSATION_CACHE_DIR: &str = "conversations";
+const TEAMS_CONVERSATION_CACHE_VERSION: u64 = 1;
+const MAX_TEAMS_CONVERSATION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TEAMS_CACHED_MESSAGES: usize = 2000;
+
+fn teams_conversation_cache_key(chat_id: &str) -> String {
+    fn update(mut hash: u64, bytes: &[u8]) -> u64 {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+
+    let first = update(0xcbf2_9ce4_8422_2325, chat_id.as_bytes());
+    let second = update(0x8422_2325_cbf2_9ce4, chat_id.as_bytes());
+    format!("{first:016x}{second:016x}")
+}
+
+fn teams_conversation_cache_path(
+    cache_root: &std::path::Path,
+    chat_id: &str,
+) -> std::path::PathBuf {
+    cache_root
+        .join(TEAMS_CONVERSATION_CACHE_DIR)
+        .join(format!("{}.json", teams_conversation_cache_key(chat_id)))
+}
+
+fn load_teams_conversation_cache(
+    cache_root: &std::path::Path,
+    chat_id: &str,
+) -> std::io::Result<Option<(Vec<ChatMessage>, Option<String>)>> {
+    let path = teams_conversation_cache_path(cache_root, chat_id);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    if !metadata.is_file() || metadata.len() > MAX_TEAMS_CONVERSATION_CACHE_BYTES {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+
+    let bytes = std::fs::read(&path)?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
+
+    if value.get("version").and_then(serde_json::Value::as_u64)
+        != Some(TEAMS_CONVERSATION_CACHE_VERSION)
+        || value.get("chat_id").and_then(serde_json::Value::as_str) != Some(chat_id)
+    {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+
+    // Graph continuation links are intentionally not restored from disk.
+    let next = None;
+
+    let Some(messages_value) = value.get("messages").cloned() else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    };
+    let messages: Vec<ChatMessage> = match serde_json::from_value::<Vec<ChatMessage>>(messages_value) {
+        Ok(messages) if messages.len() <= MAX_TEAMS_CACHED_MESSAGES => messages,
+        _ => {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
+
+    Ok(Some((messages, next)))
+}
+
+fn store_teams_conversation_cache(
+    cache_root: &std::path::Path,
+    chat_id: &str,
+    messages: &[ChatMessage],
+) -> std::io::Result<()> {
+    let cache_dir = cache_root.join(TEAMS_CONVERSATION_CACHE_DIR);
+    create_private_cache_dir(&cache_dir)?;
+
+    let final_path = teams_conversation_cache_path(cache_root, chat_id);
+
+    // Keep the newest bounded slice instead of dropping the cache completely
+    // after a user has paged far back in a long-running conversation.
+    let start = messages.len().saturating_sub(MAX_TEAMS_CACHED_MESSAGES);
+    let newest_first: Vec<&ChatMessage> = messages[start..].iter().rev().collect();
+    let value = serde_json::json!({
+        "version": TEAMS_CONVERSATION_CACHE_VERSION,
+        "chat_id": chat_id,
+        "messages": newest_first,
+    });
+    let bytes = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
+
+    if bytes.len() as u64 > MAX_TEAMS_CONVERSATION_CACHE_BYTES {
+        let _ = std::fs::remove_file(final_path);
+        return Ok(());
+    }
+
+    let temp_path = cache_dir.join(format!(
+        "{}.json.tmp-{}",
+        teams_conversation_cache_key(chat_id),
+        std::process::id()
+    ));
+    write_private_cache_file(&temp_path, &bytes)?;
+
+    if final_path.exists() {
+        std::fs::remove_file(&final_path)?;
+    }
+    std::fs::rename(temp_path, final_path)
+}
 
 fn teams_disk_cache_key(key: &TeamsImageKey) -> String {
     fn update(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -781,6 +913,10 @@ fn load_ui_state(cache_dir: Option<&std::path::Path>) -> UiState {
                     _ => state.calendar_view,
                 };
             }
+            "teams_chat_id" => {
+                let value = value.trim();
+                state.teams_chat_id = (!value.is_empty()).then(|| value.to_string());
+            }
             _ => {}
         }
     }
@@ -793,6 +929,7 @@ fn store_ui_state(
     screen: Screen,
     calendar_days: i64,
     calendar_view: CalendarView,
+    teams_chat_id: Option<&str>,
 ) -> std::io::Result<()> {
     create_private_cache_dir(cache_dir)?;
 
@@ -805,9 +942,14 @@ fn store_ui_state(
         CalendarView::Agenda => "agenda",
         CalendarView::Month => "month",
     };
-    let data = format!(
+    let mut data = format!(
         "screen={screen}\ncalendar_days={calendar_days}\ncalendar_view={calendar_view}\n"
     );
+    if let Some(chat_id) = teams_chat_id.filter(|value| !value.is_empty()) {
+        data.push_str("teams_chat_id=");
+        data.push_str(chat_id);
+        data.push('\n');
+    }
     let final_path = cache_dir.join(UI_STATE_FILE);
     let temp_path = cache_dir.join(format!("{UI_STATE_FILE}.tmp-{}", std::process::id()));
 
@@ -1176,14 +1318,31 @@ impl App {
             None
         };
 
-        Self {
+        let last_chat_id = ui_state.teams_chat_id.clone();
+        let open_chat_id = if ui_state.screen == Screen::Teams {
+            last_chat_id.clone()
+        } else {
+            None
+        };
+        let teams = TeamsState {
+            focus: if open_chat_id.is_some() {
+                TeamsFocus::Messages
+            } else {
+                TeamsFocus::List
+            },
+            open_chat_id,
+            last_chat_id,
+            ..TeamsState::default()
+        };
+
+        let mut app = Self {
             session,
             tx,
             screen: ui_state.screen,
             outlook: OutlookState::default(),
             image_picker,
             outlook_focus: OutlookFocus::Messages,
-            teams: TeamsState::default(),
+            teams,
             calendar: CalendarState {
                 days: ui_state.calendar_days,
                 view: ui_state.calendar_view,
@@ -1218,10 +1377,19 @@ impl App {
             reading_max_scroll: std::cell::Cell::new(0),
             read_timer_generation: 0,
             teams_unread: false,
+            chat_cache_warmup_started: false,
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
+        };
+
+        if app.screen == Screen::Teams {
+            if let Some(chat_id) = app.teams.open_chat_id.clone() {
+                let _ = app.restore_teams_conversation_cache(&chat_id);
+            }
         }
+
+        app
     }
 
     /// Kick off the initial data loads.
@@ -1231,6 +1399,17 @@ impl App {
         self.start_primary_presence();
         self.load_folders();
         self.load_chats();
+        if self.screen == Screen::Teams {
+            if let Some(chat_id) = self.teams.open_chat_id.clone() {
+                self.teams.chat_open_pending_read = Some(chat_id.clone());
+                let mode = if self.teams.messages.is_empty() {
+                    ListUpdate::Replace
+                } else {
+                    ListUpdate::Merge
+                };
+                self.load_chat_messages(chat_id, mode);
+            }
+        }
         if self.screen == Screen::Calendar {
             self.load_calendar();
         }
@@ -1246,6 +1425,7 @@ impl App {
             self.screen,
             self.calendar.days,
             self.calendar.view,
+            self.teams.last_chat_id.as_deref(),
         ) {
             tracing::warn!(
                 "could not persist UI state in {}: {error}",
@@ -1785,6 +1965,149 @@ impl App {
         self.spawn(async move { Ok(AppMessage::Chats(chats::list_chats(&s.graph, 40).await?)) });
     }
 
+    fn warm_teams_conversation_caches(&mut self, chats_list: &[Chat]) {
+        if self.chat_cache_warmup_started || !self.session.config.teams_cache_warmup {
+            return;
+        }
+        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+            return;
+        };
+
+        let selected_id = chats_list
+            .get(self.teams.chat_sel)
+            .map(|chat| chat.id.clone());
+        let last_chat_id = self.teams.last_chat_id.clone();
+
+        let mut ordered: Vec<(String, Option<String>)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let mut push_chat = |chat: &Chat| {
+            if seen.insert(chat.id.clone()) {
+                ordered.push((
+                    chat.id.clone(),
+                    chat.last_message_preview
+                        .as_ref()
+                        .and_then(|preview| preview.id.clone()),
+                ));
+            }
+        };
+
+        if let Some(selected_id) = selected_id.as_deref() {
+            if let Some(chat) = chats_list.iter().find(|chat| chat.id == selected_id) {
+                push_chat(chat);
+            }
+        }
+        if let Some(last_chat_id) = last_chat_id.as_deref() {
+            if let Some(chat) = chats_list.iter().find(|chat| chat.id == last_chat_id) {
+                push_chat(chat);
+            }
+        }
+        for chat in chats_list {
+            push_chat(chat);
+        }
+
+        self.chat_cache_warmup_started = true;
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            for (chat_id, latest_id) in ordered {
+                let read_root = cache_root.clone();
+                let read_chat_id = chat_id.clone();
+                let cached = match tokio::task::spawn_blocking(move || {
+                    load_teams_conversation_cache(&read_root, &read_chat_id)
+                })
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            "Teams conversation cache warm-up read failed for {chat_id}: {error}"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "Teams conversation cache warm-up reader failed for {chat_id}: {error}"
+                        );
+                        None
+                    }
+                };
+
+                let cache_is_current = cached.as_ref().is_some_and(|(messages, _)| {
+                    match latest_id.as_deref() {
+                        Some(latest_id) => {
+                            messages.first().map(|message| message.id.as_str()) == Some(latest_id)
+                        }
+                        None => true,
+                    }
+                });
+                if cache_is_current {
+                    continue;
+                }
+
+                let (messages, _) =
+                    match chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Teams conversation cache warm-up failed for {chat_id}: {error:#}"
+                            );
+                            // Keep this deliberately gentle on Graph even when
+                            // one conversation repeatedly fails.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+
+                // Graph returns newest-first; persistent storage expects the
+                // app's oldest-first ordering and reverses it for JSON.
+                let mut oldest_first = messages.clone();
+                oldest_first.reverse();
+
+                let write_root = cache_root.clone();
+                let write_chat_id = chat_id.clone();
+                let write_messages = oldest_first;
+                match tokio::task::spawn_blocking(move || {
+                    store_teams_conversation_cache(
+                        &write_root,
+                        &write_chat_id,
+                        &write_messages,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tracing::debug!(
+                            "Teams conversation cache automatically warmed for {chat_id}"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "Teams conversation cache warm-up write failed for {chat_id}: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Teams conversation cache warm-up writer failed for {chat_id}: {error}"
+                        );
+                    }
+                }
+
+                let _ = tx
+                    .send(AppMessage::ChatCacheWarmed {
+                        chat_id,
+                        messages,
+                    })
+                    .await;
+
+                // Sequential fetching already limits concurrency; this tiny gap
+                // additionally avoids hammering Graph on a completely cold cache.
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            }
+        });
+    }
+
     fn mark_teams_chat_read(&self, chat_id: String) {
         let s = self.session.clone();
         let known_user_id = self.me.as_ref().map(|me| me.id.clone());
@@ -1979,6 +2302,146 @@ impl App {
                 }
             }
         });
+    }
+
+    fn clear_teams_conversation_view(&mut self) {
+        self.teams.messages.clear();
+        self.teams.messages_rendered.clear();
+        self.teams.messages_links.clear();
+        self.teams.msg_sel = 0;
+        self.teams.selected_images.clear();
+        self.teams.selected_image_key = None;
+        self.teams.messages_next = None;
+        self.teams.loading_more = false;
+        self.teams.unseen = 0;
+        self.teams.replying_to = None;
+    }
+
+    fn restore_teams_conversation_cache(&mut self, chat_id: &str) -> bool {
+        let Some(cache_root) = self.session.config.teams_image_cache_dir.as_deref() else {
+            return false;
+        };
+
+        match load_teams_conversation_cache(cache_root, chat_id) {
+            Ok(Some((messages, next))) => {
+                let count = messages.len();
+                self.set_teams_messages(messages, next, ListUpdate::Replace);
+                tracing::debug!(
+                    "Teams conversation cache hit for {chat_id}: {count} message(s)"
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    "Teams conversation cache read failed for {chat_id}: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    fn persist_teams_conversation_cache(&self, chat_id: &str) {
+        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+            return;
+        };
+        if self.teams.messages.is_empty() {
+            return;
+        }
+
+        let chat_id = chat_id.to_string();
+        let messages = self.teams.messages.clone();
+
+        tokio::spawn(async move {
+            let cache_chat_id = chat_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                store_teams_conversation_cache(
+                    &cache_root,
+                    &cache_chat_id,
+                    &messages,
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    tracing::debug!("Teams conversation cache stored for {chat_id}");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "Teams conversation cache write failed for {chat_id}: {error}"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Teams conversation cache writer task failed for {chat_id}: {error}"
+                    );
+                }
+            }
+        });
+    }
+
+    fn preview_selected_teams_chat(&mut self) {
+        if self.teams.mode != TeamsMode::Chats || self.teams.focus != TeamsFocus::List {
+            return;
+        }
+
+        let Some(chat_id) = self
+            .teams
+            .chats
+            .get(self.teams.chat_sel)
+            .map(|chat| chat.id.clone())
+        else {
+            self.teams.preview_chat_id = None;
+            self.clear_teams_conversation_view();
+            return;
+        };
+
+        if self.teams.preview_chat_id.as_deref() == Some(&chat_id) {
+            return;
+        }
+
+        // Preview is local-only. It is not an open conversation, must not be
+        // polled, and must never trigger mark-read.
+        self.teams.preview_chat_id = Some(chat_id.clone());
+        self.teams.open_chat_id = None;
+        self.teams.open_channel = None;
+        self.teams.chat_open_pending_read = None;
+        self.clear_teams_conversation_view();
+
+        let cached = self.restore_teams_conversation_cache(&chat_id);
+        if !cached {
+            tracing::debug!("no Teams conversation cache for preview {chat_id}");
+        }
+    }
+
+    fn open_teams_chat(&mut self, chat_id: String) {
+        let preview_ready = self.teams.preview_chat_id.as_deref() == Some(&chat_id)
+            && !self.teams.messages.is_empty();
+
+        self.teams.mode = TeamsMode::Chats;
+        self.teams.open_chat_id = Some(chat_id.clone());
+        self.teams.preview_chat_id = None;
+        self.teams.last_chat_id = Some(chat_id.clone());
+        self.teams.open_channel = None;
+
+        let cached = if preview_ready {
+            true
+        } else {
+            self.clear_teams_conversation_view();
+            self.restore_teams_conversation_cache(&chat_id)
+        };
+        self.teams.focus = TeamsFocus::Messages;
+        self.teams.chat_open_pending_read = Some(chat_id.clone());
+        self.persist_ui_state();
+
+        self.load_chat_messages(
+            chat_id,
+            if cached {
+                ListUpdate::Merge
+            } else {
+                ListUpdate::Replace
+            },
+        );
     }
 
     fn load_chat_messages(&self, chat_id: String, mode: ListUpdate) {
@@ -2596,12 +3059,49 @@ impl App {
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
                 self.load_contact_presences(&c);
+                self.warm_teams_conversation_caches(&c);
+
+                let open_index = self
+                    .teams
+                    .open_chat_id
+                    .as_deref()
+                    .and_then(|open_id| c.iter().position(|chat| chat.id == open_id));
+                let visible_index = self
+                    .teams
+                    .preview_chat_id
+                    .as_deref()
+                    .and_then(|preview_id| c.iter().position(|chat| chat.id == preview_id))
+                    .or(open_index);
+
+                if self.screen == Screen::Teams && self.teams.focus == TeamsFocus::Messages {
+                    if let Some(index) = open_index {
+                        let chat = &c[index];
+                        self.teams.chat_unread_counts.remove(&chat.id);
+                        if let Some(latest_id) = chat
+                            .last_message_preview
+                            .as_ref()
+                            .and_then(|preview| preview.id.clone())
+                        {
+                            self.teams
+                                .locally_read_through
+                                .insert(chat.id.clone(), latest_id);
+                        }
+                    }
+                }
+
                 self.refresh_chat_unread_counts(&c);
                 self.teams.chats = c;
-                self.teams.chat_sel = self
-                    .teams
-                    .chat_sel
+                self.teams.chat_sel = visible_index
+                    .unwrap_or(self.teams.chat_sel)
                     .min(self.teams.chats.len().saturating_sub(1));
+
+                if self.screen == Screen::Teams
+                    && self.teams.mode == TeamsMode::Chats
+                    && self.teams.focus == TeamsFocus::List
+                    && self.teams.preview_chat_id.is_none()
+                {
+                    self.preview_selected_teams_chat();
+                }
             }
             AppMessage::ContactPresences(items) => {
                 self.teams.contact_presences = items
@@ -2623,25 +3123,39 @@ impl App {
                 mode,
             } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
-                    let first_load = matches!(&mode, ListUpdate::Replace);
-                    let latest_id = first_load
-                        .then(|| {
-                            self.teams
-                                .chats
-                                .iter()
-                                .find(|chat| chat.id == chat_id)
-                                .and_then(|chat| chat.last_message_preview.as_ref())
-                                .and_then(|preview| preview.id.clone())
-                        })
-                        .flatten();
+                    let opened_now =
+                        self.teams.chat_open_pending_read.as_deref() == Some(&chat_id);
+
                     self.set_teams_messages(messages, next, mode);
-                    if first_load {
+                    self.persist_teams_conversation_cache(&chat_id);
+
+                    if opened_now {
+                        self.teams.chat_open_pending_read = None;
                         self.teams.chat_unread_counts.remove(&chat_id);
                         self.mark_teams_chat_read(chat_id.clone());
-                        if let Some(latest_id) = latest_id {
+
+                        if let Some(latest_id) = self
+                            .teams
+                            .chats
+                            .iter()
+                            .find(|chat| chat.id == chat_id)
+                            .and_then(|chat| chat.last_message_preview.as_ref())
+                            .and_then(|preview| preview.id.clone())
+                        {
                             self.teams.locally_read_through.insert(chat_id, latest_id);
                         }
                     }
+                }
+            }
+            AppMessage::ChatCacheWarmed { chat_id, messages } => {
+                let still_previewing = self.screen == Screen::Teams
+                    && self.teams.mode == TeamsMode::Chats
+                    && self.teams.focus == TeamsFocus::List
+                    && self.teams.open_chat_id.is_none()
+                    && self.teams.preview_chat_id.as_deref() == Some(&chat_id);
+
+                if still_previewing {
+                    self.set_teams_messages(messages, None, ListUpdate::Replace);
                 }
             }
             AppMessage::Teams(t) => self.teams.teams = t,
@@ -2686,10 +3200,7 @@ impl App {
                 self.cancel_read_timer();
                 self.screen = Screen::Teams;
                 self.teams_unread = false;
-                self.teams.mode = TeamsMode::Chats;
-                self.teams.open_chat_id = Some(id.clone());
-                self.teams.focus = TeamsFocus::Messages;
-                self.load_chat_messages(id, ListUpdate::Replace);
+                self.open_teams_chat(id);
                 self.load_chats();
             }
             AppMessage::OpenChat(None) => {
@@ -2885,7 +3396,12 @@ impl App {
             }
             ListUpdate::Append => {
                 // An older page belongs *before* everything already loaded.
+                // Cache-restored ranges can overlap a fresh Graph page, so drop
+                // duplicate ids before prepending it.
                 let existing = std::mem::take(&mut self.teams.messages);
+                let known: std::collections::HashSet<String> =
+                    existing.iter().map(|message| message.id.clone()).collect();
+                page.retain(|message| !known.contains(&message.id));
                 self.teams.messages = page;
                 self.teams.messages.extend(existing);
                 self.teams.messages_next = next;
@@ -2899,6 +3415,10 @@ impl App {
                 };
             }
             ListUpdate::Merge => {
+                if self.teams.messages_next.is_none() {
+                    self.teams.messages_next = next;
+                }
+
                 // Chat convention: if the user is sitting on the newest message,
                 // follow new arrivals; if they've scrolled back to read history,
                 // hold their place and just count what came in.
@@ -3359,6 +3879,23 @@ impl App {
                 self.teams_unread = false;
                 if self.teams.chats.is_empty() {
                     self.load_chats();
+                }
+
+                if self.teams.mode == TeamsMode::Chats && self.teams.open_chat_id.is_none() {
+                    if let Some(chat_id) = self.teams.last_chat_id.clone() {
+                        self.teams.open_chat_id = Some(chat_id.clone());
+                        self.teams.focus = TeamsFocus::Messages;
+                        let cached = self.restore_teams_conversation_cache(&chat_id);
+                        self.teams.chat_open_pending_read = Some(chat_id.clone());
+                        self.load_chat_messages(
+                            chat_id,
+                            if cached {
+                                ListUpdate::Merge
+                            } else {
+                                ListUpdate::Replace
+                            },
+                        );
+                    }
                 }
             }
             Screen::Calendar => self.load_calendar(),
@@ -3838,6 +4375,13 @@ impl App {
                 self.teams_enter();
             }
             KeyCode::Tab => {
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+                    if let Some(chat_id) = self.teams.preview_chat_id.clone() {
+                        self.open_teams_chat(chat_id);
+                        return;
+                    }
+                }
+
                 self.teams.focus = match self.teams.focus {
                     TeamsFocus::List => TeamsFocus::Messages,
                     TeamsFocus::Messages => TeamsFocus::Composer,
@@ -3845,6 +4389,10 @@ impl App {
                 };
             }
             KeyCode::Char('t') => {
+                if self.teams.preview_chat_id.take().is_some() {
+                    self.clear_teams_conversation_view();
+                }
+
                 // Toggle chats/channels mode. Listing teams needs a scope that
                 // chats don't, so say so plainly instead of letting Graph 403.
                 self.teams.mode = match self.teams.mode {
@@ -3860,8 +4408,19 @@ impl App {
                     }
                     TeamsMode::Channels => TeamsMode::Chats,
                 };
+
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+                    self.preview_selected_teams_chat();
+                }
             }
-            KeyCode::Char('i') | KeyCode::Char('a') => self.teams.focus = TeamsFocus::Composer,
+            KeyCode::Char('i') | KeyCode::Char('a') => {
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+                    if let Some(chat_id) = self.teams.preview_chat_id.clone() {
+                        self.open_teams_chat(chat_id);
+                    }
+                }
+                self.teams.focus = TeamsFocus::Composer;
+            }
             // Reply to the selected message: same composer, quoted on send.
             KeyCode::Char('r')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
@@ -3926,6 +4485,7 @@ impl App {
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
                 self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams.chats.len());
+                self.preview_selected_teams_chat();
             }
             (TeamsMode::Channels, TeamsFocus::List) => {
                 // Navigate channels; if none loaded, navigate teams.
@@ -3944,19 +4504,7 @@ impl App {
         match self.teams.mode {
             TeamsMode::Chats => {
                 if let Some(c) = self.teams.chats.get(self.teams.chat_sel) {
-                    let id = c.id.clone();
-                    self.teams.open_chat_id = Some(id.clone());
-                    self.teams.open_channel = None;
-                    self.teams.messages.clear();
-                    self.teams.messages_rendered.clear();
-                    self.teams.messages_links.clear();
-                    self.teams.msg_sel = 0;
-                    self.teams.messages_next = None;
-                    self.teams.loading_more = false;
-                    self.teams.unseen = 0;
-                    self.teams.replying_to = None;
-                    self.load_chat_messages(id, ListUpdate::Replace);
-                    self.teams.focus = TeamsFocus::Messages;
+                    self.open_teams_chat(c.id.clone());
                 }
             }
             TeamsMode::Channels => {
@@ -3972,6 +4520,7 @@ impl App {
                     let ch_id = ch.id.clone();
                     self.teams.open_channel = Some((team_id.clone(), ch_id.clone()));
                     self.teams.open_chat_id = None;
+                    self.teams.preview_chat_id = None;
                     self.teams.messages.clear();
                     self.teams.messages_rendered.clear();
                     self.teams.messages_links.clear();

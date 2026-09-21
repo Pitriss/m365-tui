@@ -92,6 +92,9 @@ pub struct Config {
     pub teams_image_cache_dir: Option<PathBuf>,
     /// Maximum persistent Teams image cache size in MiB.
     pub teams_image_cache_max_mb: u64,
+    /// Automatically prefill persistent Teams conversation caches in the background.
+    /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
+    pub teams_cache_warmup: bool,
     /// Optional executable used to open Calendar online-meeting URLs.
     /// Unset uses the operating system handler (`xdg-open` / `open`).
     pub meeting_opener: Option<String>,
@@ -114,6 +117,7 @@ impl Config {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let teams_cache_warmup = env_flag_default_on("M365_TEAMS_CACHE_WARMUP");
         let teams_image_cache_max_mb =
             match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
                 Ok(value) if !value.trim().is_empty() => {
@@ -204,6 +208,7 @@ impl Config {
             teams_file_images,
             teams_image_cache_dir,
             teams_image_cache_max_mb,
+            teams_cache_warmup,
             meeting_opener,
         })
     }
@@ -265,6 +270,19 @@ impl Config {
     }
 }
 
+/// Enabled by default. Only `0`, `false`, `no`, or `off` disable it
+/// (case-insensitive).
+fn env_flag_default_on(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
 /// True for `1`, `true`, `yes`, `on` (case-insensitive).
 fn env_flag(key: &str) -> bool {
     std::env::var(key)
@@ -317,6 +335,7 @@ mod tests {
             teams_file_images: false,
             teams_image_cache_dir: None,
             teams_image_cache_max_mb: 256,
+            teams_cache_warmup: true,
             meeting_opener: None,
         }
     }

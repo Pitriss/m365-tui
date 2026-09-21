@@ -242,7 +242,7 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · l open · t chats/channels",
+            TeamsFocus::List => "j/k preview cache · l/Enter open · t chats/channels",
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
@@ -1432,7 +1432,11 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
-    let title = if app.teams.unseen > 0 {
+    let previewing =
+        app.teams.focus == TeamsFocus::List && app.teams.preview_chat_id.is_some();
+    let title = if previewing {
+        "Conversation preview · cached".to_string()
+    } else if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
     } else if focused {
         "Conversation (j/k select · e react · z copy-mode)".to_string()
@@ -1483,10 +1487,12 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
     let (mut lines, msg_starts) = conversation_lines(app, focused);
     if lines.is_empty() {
-        lines.push(Line::styled(
-            "Select a conversation and press Enter.",
-            Style::default().fg(DIM),
-        ));
+        let empty = if previewing {
+            "No cached conversation for the selected chat."
+        } else {
+            "Select a conversation and press Enter."
+        };
+        lines.push(Line::styled(empty, Style::default().fg(DIM)));
     }
 
     // Wrap first, then reserve terminal rows immediately after the selected
