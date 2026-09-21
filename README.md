@@ -74,6 +74,8 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   application.
 - Visual RSVP and online-meeting indicators.
 - Multi-day events rendered across calendar days.
+- 15- and 5-minute event reminders with configurable internal and desktop
+  notification delivery.
 - Persistent Calendar view selection when persistent UI state is enabled.
 
 ---
@@ -466,6 +468,43 @@ M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=0
 to disable the automatic Away transition.
 
 ### Calendar
+
+#### Event reminders
+
+m365-tui can remind you about timed Calendar events 15 and 5 minutes before
+they start. Reminders work while Outlook, Teams, or Calendar is active; the
+Calendar screen does not need to be open.
+
+Configure reminder delivery with:
+
+```dotenv
+M365_CALENDAR_NOTIFY=all
+```
+
+Available modes:
+
+| Value | Behaviour |
+|---|---|
+| `all` | Show a non-blocking reminder inside m365-tui and send a desktop notification |
+| `internal` | Show only the non-blocking reminder inside m365-tui |
+| `external` | Send only a desktop notification |
+| `none` | Disable Calendar reminders completely |
+
+The default is `all`.
+
+Cancelled, all-day, and declined events do not generate reminders.
+
+Desktop Calendar reminders also respect the global `M365_NOTIFY` setting.
+For example:
+
+```dotenv
+M365_NOTIFY=0
+M365_CALENDAR_NOTIFY=all
+```
+
+keeps the internal Calendar reminder but suppresses its desktop notification.
+
+#### Meeting opener
 
 Online meeting links normally use the operating-system URL handler.
 
@@ -998,6 +1037,25 @@ Minimum terminal size:
 If Month view cannot fit, m365-tui stays in or falls back to Agenda and displays
 a short notice.
 
+### Event reminders
+
+Timed events are checked independently of the currently visible screen.
+
+When enabled, each eligible event can generate two reminders:
+
+```text
+15 minutes before start
+5 minutes before start
+```
+
+Each reminder is emitted only once for that event and threshold during the
+running m365-tui process.
+
+Internal reminders use the normal status area and are non-blocking, so they do
+not open an overlay or interrupt keyboard control.
+
+Cancelled, all-day, and declined events are skipped.
+
 ---
 
 ## Persistent data and cache
@@ -1069,26 +1127,32 @@ accessible directory.
 
 ## Notifications
 
-Notifications are enabled by default.
+Desktop notifications are enabled by default.
 
-Disable them with:
+Disable desktop notifications globally with:
 
 ```dotenv
 M365_NOTIFY=0
 ```
 
-m365-tui notifies for:
+m365-tui can send desktop notifications for:
 
 - new unread inbox mail,
 - direct Teams messages,
-- group/meeting chat messages relevant to you, such as mentions.
+- group/meeting chat messages relevant to you, such as mentions,
+- Calendar event reminders when `M365_CALENDAR_NOTIFY` includes external
+  delivery.
+
+Calendar reminders have their own delivery setting,
+`M365_CALENDAR_NOTIFY`. `M365_NOTIFY=0` suppresses their desktop part but does
+not disable an internal Calendar reminder.
 
 Where supported, `notify-send` is used.
 
 Without a desktop notification helper, m365-tui falls back to a terminal bell.
 
-The initial synchronization establishes a baseline instead of generating
-notifications for existing history.
+The initial mail and Teams synchronization establishes a baseline instead of
+generating notifications for existing history.
 
 ---
 

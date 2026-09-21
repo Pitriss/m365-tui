@@ -46,6 +46,7 @@ pub enum AppMessage {
         read: bool,
     },
     Calendar(Vec<CalEvent>),
+    CalendarReminders(Vec<CalEvent>),
     Chats(Vec<Chat>),
     ContactPresences(Vec<Presence>),
     ChatUnreadCount {
@@ -528,6 +529,12 @@ pub struct App {
     pub outlook_focus: OutlookFocus,
     pub teams: TeamsState,
     pub calendar: CalendarState,
+    /// Small independent near-term feed used for 15/5-minute reminders.
+    calendar_reminder_events: Vec<CalEvent>,
+    /// Event/start/threshold keys already announced during this process.
+    calendar_reminder_fired: std::collections::HashSet<String>,
+    /// Last time the near-term reminder feed was queued for refresh.
+    calendar_reminder_last_refresh: Option<std::time::Instant>,
     pub overlay: Option<Overlay>,
     notice_until: Option<std::time::Instant>,
     pub status: String,
@@ -1261,6 +1268,36 @@ fn calendar_state_local_datetime(
     )
 }
 
+fn calendar_reminder_threshold_minutes(seconds_until: i64) -> Option<u16> {
+    match seconds_until {
+        1..=300 => Some(5),
+        301..=900 => Some(15),
+        _ => None,
+    }
+}
+
+fn calendar_event_reminder(
+    event: &CalEvent,
+    now: &chrono::DateTime<chrono::Local>,
+) -> Option<(u16, chrono::DateTime<chrono::Local>)> {
+    if event.is_cancelled.unwrap_or(false) || event.is_all_day.unwrap_or(false) {
+        return None;
+    }
+    if event
+        .response_status
+        .as_ref()
+        .and_then(|status| status.response.as_deref())
+        .is_some_and(|response| response.eq_ignore_ascii_case("declined"))
+    {
+        return None;
+    }
+
+    let start = event.start.as_ref().and_then(calendar_state_local_datetime)?;
+    let seconds_until = start.signed_duration_since(*now).num_seconds();
+    let minutes = calendar_reminder_threshold_minutes(seconds_until)?;
+    Some((minutes, start))
+}
+
 fn calendar_state_event_dates(event: &CalEvent) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
     let start = event.start.as_ref().and_then(calendar_state_local_datetime)?;
     let end = event.end.as_ref().and_then(calendar_state_local_datetime)?;
@@ -1353,6 +1390,9 @@ impl App {
                 view: ui_state.calendar_view,
                 ..CalendarState::default()
             },
+            calendar_reminder_events: Vec::new(),
+            calendar_reminder_fired: std::collections::HashSet::new(),
+            calendar_reminder_last_refresh: None,
             overlay: month_view_fallback.then(|| {
                 Overlay::Notice(format!(
                     "Month view requires at least {}x{} characters.\n\nAgenda view was opened instead.",
@@ -1406,6 +1446,7 @@ impl App {
         self.start_primary_presence();
         self.load_folders();
         self.load_chats();
+        self.refresh_calendar_reminders();
         if self.screen == Screen::Teams {
             if let Some(chat_id) = self.teams.open_chat_id.clone() {
                 self.teams.chat_open_pending_read = Some(chat_id.clone());
@@ -1925,6 +1966,113 @@ impl App {
         let read = !is_read;
         self.status = format!("marking as {}…", if read { "read" } else { "unread" });
         self.set_mail_read(id, read);
+    }
+
+    fn refresh_calendar_reminders_if_due(&mut self) {
+        if !self.session.config.calendar_notify.enabled() {
+            return;
+        }
+        if self
+            .calendar_reminder_last_refresh
+            .is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(60))
+        {
+            return;
+        }
+        self.refresh_calendar_reminders();
+    }
+
+    fn refresh_calendar_reminders(&mut self) {
+        if !self.session.config.calendar_notify.enabled() {
+            return;
+        }
+
+        self.calendar_reminder_last_refresh = Some(std::time::Instant::now());
+
+        // Keep this feed independent of the visible Calendar range. A user can
+        // stay in Outlook or Teams all day and still receive event reminders.
+        let now = chrono::Utc::now();
+        let start =
+            (now - chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end =
+            (now + chrono::Duration::minutes(20)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match calendar::calendar_view(&s.graph, &start, &end).await {
+                Ok(events) => {
+                    let _ = tx.send(AppMessage::CalendarReminders(events)).await;
+                }
+                Err(error) => {
+                    // Reminder refresh is auxiliary and must never replace the
+                    // user's current status line with a recurring network error.
+                    tracing::warn!("calendar reminder refresh failed: {error:#}");
+                }
+            }
+        });
+    }
+
+    fn check_calendar_reminders(&mut self) {
+        let mode = self.session.config.calendar_notify;
+        if !mode.enabled() {
+            return;
+        }
+
+        let now = chrono::Local::now();
+        let mut internal = Vec::new();
+        let mut external = Vec::new();
+
+        // Clone the small near-term feed so notification bookkeeping can mutate
+        // App state without fighting an immutable borrow of the event vector.
+        for event in self.calendar_reminder_events.clone() {
+            let Some((minutes, start)) = calendar_event_reminder(&event, &now) else {
+                continue;
+            };
+
+            let key = format!("{}:{}:{minutes}", event.id, start.timestamp());
+            if !self.calendar_reminder_fired.insert(key) {
+                continue;
+            }
+
+            let subject = event
+                .subject
+                .as_deref()
+                .map(str::trim)
+                .filter(|subject| !subject.is_empty())
+                .unwrap_or("(no subject)")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let at = start.format("%H:%M").to_string();
+
+            if mode.internal() {
+                internal.push(format!("{minutes} min: {subject} ({at})"));
+            }
+
+            if mode.external() && self.session.config.notifications {
+                let body = event
+                    .location
+                    .as_ref()
+                    .and_then(|location| location.display_name.as_deref())
+                    .map(str::trim)
+                    .filter(|location| !location.is_empty())
+                    .map(|location| format!("{subject} · {at} · {location}"))
+                    .unwrap_or_else(|| format!("{subject} · {at}"));
+                external.push((format!("📅 Calendar — {minutes} min"), body));
+            }
+        }
+
+        for (title, body) in external {
+            crate::notify::send(&title, &body);
+        }
+
+        if let Some(first) = internal.first() {
+            self.status = if internal.len() == 1 {
+                format!("📅 {first}")
+            } else {
+                format!("📅 {first} (+{} more)", internal.len() - 1)
+            };
+        }
     }
 
     fn load_calendar(&self) {
@@ -3104,6 +3252,10 @@ impl App {
                 self.status = format!("marked as {}", if read { "read" } else { "unread" });
                 self.load_folders();
             }
+            AppMessage::CalendarReminders(events) => {
+                self.calendar_reminder_events = events;
+                self.check_calendar_reminders();
+            }
             AppMessage::Calendar(events) => {
                 let selected_id = self
                     .calendar
@@ -3384,6 +3536,9 @@ impl App {
                     self.last_status = self.status.clone();
                     self.status_ticks = 0;
                 }
+
+                self.refresh_calendar_reminders_if_due();
+                self.check_calendar_reminders();
             }
             AppMessage::Poll => {
                 self.poll_started_at = std::time::Instant::now();
@@ -5273,7 +5428,21 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_newest_first, next_field, parse_recipients, step};
+    use super::{
+        calendar_reminder_threshold_minutes, merge_newest_first, next_field, parse_recipients,
+        step,
+    };
+
+    #[test]
+    fn calendar_reminder_thresholds_are_exact() {
+        assert_eq!(calendar_reminder_threshold_minutes(901), None);
+        assert_eq!(calendar_reminder_threshold_minutes(900), Some(15));
+        assert_eq!(calendar_reminder_threshold_minutes(301), Some(15));
+        assert_eq!(calendar_reminder_threshold_minutes(300), Some(5));
+        assert_eq!(calendar_reminder_threshold_minutes(1), Some(5));
+        assert_eq!(calendar_reminder_threshold_minutes(0), None);
+        assert_eq!(calendar_reminder_threshold_minutes(-1), None);
+    }
 
     #[test]
     fn messages_sort_chronologically_regardless_of_arrival_order() {

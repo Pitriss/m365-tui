@@ -62,6 +62,28 @@ pub enum TeamsSystemEvents {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarNotify {
+    All,
+    Internal,
+    External,
+    None,
+}
+
+impl CalendarNotify {
+    pub fn enabled(self) -> bool {
+        self != Self::None
+    }
+
+    pub fn internal(self) -> bool {
+        matches!(self, Self::All | Self::Internal)
+    }
+
+    pub fn external(self) -> bool {
+        matches!(self, Self::All | Self::External)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -82,6 +104,8 @@ pub struct Config {
     pub client_state: String,
     /// Desktop notifications for direct messages and `@mentions`.
     pub notifications: bool,
+    /// Calendar reminder delivery mode: all, internal, external, or none.
+    pub calendar_notify: CalendarNotify,
     /// Seconds an unread message must remain open before it is marked read.
     /// Zero marks it read immediately after the body is displayed.
     pub read_msg_timeout: u64,
@@ -196,6 +220,9 @@ impl Config {
             std::env::var("M365_NOTIFY").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         );
+        let calendar_notify = parse_calendar_notify(
+            std::env::var("M365_CALENDAR_NOTIFY").ok().as_deref(),
+        )?;
         let read_msg_timeout = match std::env::var("M365_READ_MSG_TIMEOUT") {
             Ok(value) if !value.trim().is_empty() => value
                 .trim()
@@ -214,6 +241,7 @@ impl Config {
             token_cache_path,
             client_state,
             notifications,
+            calendar_notify,
             read_msg_timeout,
             presence_read,
             presence_primary,
@@ -281,6 +309,19 @@ impl Config {
         self.tunnel_base_url
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
+    }
+}
+
+fn parse_calendar_notify(value: Option<&str>) -> Result<CalendarNotify> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(CalendarNotify::All),
+        Some(value) if value.eq_ignore_ascii_case("all") => Ok(CalendarNotify::All),
+        Some(value) if value.eq_ignore_ascii_case("internal") => Ok(CalendarNotify::Internal),
+        Some(value) if value.eq_ignore_ascii_case("external") => Ok(CalendarNotify::External),
+        Some(value) if value.eq_ignore_ascii_case("none") => Ok(CalendarNotify::None),
+        Some(value) => anyhow::bail!(
+            "M365_CALENDAR_NOTIFY must be one of: all, internal, external, none (got {value:?})"
+        ),
     }
 }
 
@@ -354,6 +395,7 @@ mod tests {
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
             notifications: true,
+            calendar_notify: CalendarNotify::All,
             read_msg_timeout: 0,
             presence_read: false,
             presence_primary: false,
@@ -365,6 +407,32 @@ mod tests {
             teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn parses_calendar_notification_mode() {
+        assert_eq!(parse_calendar_notify(None).unwrap(), CalendarNotify::All);
+        assert_eq!(
+            parse_calendar_notify(Some(" internal ")).unwrap(),
+            CalendarNotify::Internal
+        );
+        assert_eq!(
+            parse_calendar_notify(Some("EXTERNAL")).unwrap(),
+            CalendarNotify::External
+        );
+        assert_eq!(
+            parse_calendar_notify(Some("none")).unwrap(),
+            CalendarNotify::None
+        );
+        assert!(parse_calendar_notify(Some("desktop")).is_err());
+
+        assert!(CalendarNotify::All.internal());
+        assert!(CalendarNotify::All.external());
+        assert!(CalendarNotify::Internal.internal());
+        assert!(!CalendarNotify::Internal.external());
+        assert!(!CalendarNotify::External.internal());
+        assert!(CalendarNotify::External.external());
+        assert!(!CalendarNotify::None.enabled());
     }
 
     #[test]
