@@ -232,7 +232,8 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::CalendarEvent => "o open meeting · Esc close",
-            Overlay::Calendar | Overlay::Help => "Esc close",
+            Overlay::Calendar => "Esc close",
+            Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
         };
     }
     match app.screen {
@@ -1911,6 +1912,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         Overlay::Help => {
             let area = centered(60, 60, f.area());
             f.render_widget(Clear, area);
+            let block = popup_block("Help — j/k scroll · Esc close");
+            let inner = block.inner(area);
             let text = "\
  M365 TUI — keys\n\
  \n\
@@ -1942,13 +1945,18 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
           Enter newline in body · paste works (bracketed paste)\n\
  \n\
- Press Esc to close.";
-            f.render_widget(
-                Paragraph::new(text)
-                    .block(popup_block("Help"))
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
+ Help:    j/k or ↑/↓ scroll · PgUp/PgDn · Home/End · Esc close.";
+            let lines: Vec<Line<'static>> = text
+                .split('\n')
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.help_max_scroll.set(max);
+            let scroll = app.help_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
         }
         Overlay::Calendar => {
             let area = centered(70, 70, f.area());

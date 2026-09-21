@@ -568,12 +568,16 @@ Press `?` at any time outside the Teams composer to display the built-in help.
 | `F5` | Force an immediate poll |
 | `Ctrl+P` | Command palette |
 | `p` | Presence picker |
-| `?` | Help |
+| `?` | Open help |
 | `y` | Copy focused message |
 | `Y` | Copy complete current view |
 | `z` | Copy mode |
 | `q` | Quit |
 | `Ctrl+C` | Quit |
+
+The Help overlay is scrollable when its contents do not fit in the terminal.
+Use `j`/`k` or `Up`/`Down` to scroll one row, `PageUp`/`PageDown` for larger
+steps, `Home`/`End` to jump to the beginning or end, and `Esc` to close it.
 
 ### Navigation
 
@@ -1358,6 +1362,18 @@ and release history rather than being duplicated as a separate
 - Full bulk Teams chat export is not implemented.
 - OSC 8 terminal hyperlinks are intentionally not used; numbered links avoid
   terminal rendering problems and keep long tracked URLs out of message text.
+
+---
+
+## AI-assisted development
+
+Code changes in this fork are generated with ChatGPT under maintainer direction.
+Changes are built, linted, tested, and runtime-tested before release, but
+AI-generated code can still contain subtle defects or incorrect assumptions.
+
+Independent human code review is therefore recommended, especially before using
+the software in production, security-sensitive environments, or workflows that
+depend on Microsoft 365 data integrity.
 
 ---
 

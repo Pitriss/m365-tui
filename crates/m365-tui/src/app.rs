@@ -568,6 +568,10 @@ pub struct App {
     /// Largest useful reading-pane scroll offset, set by the renderer once it
     /// knows the wrapped height of the open message.
     pub reading_max_scroll: std::cell::Cell<u16>,
+    /// Current vertical scroll offset of the Help overlay.
+    pub help_scroll: u16,
+    /// Largest useful Help scroll offset, set by the renderer after wrapping.
+    pub help_max_scroll: std::cell::Cell<u16>,
     /// Generation token used to invalidate delayed automatic read timers.
     read_timer_generation: u64,
     /// A new Teams chat message arrived since Teams was last opened.
@@ -1376,6 +1380,8 @@ impl App {
             status_ticks: 0,
             text_width_hint: std::cell::Cell::new(60),
             reading_max_scroll: std::cell::Cell::new(0),
+            help_scroll: 0,
+            help_max_scroll: std::cell::Cell::new(0),
             read_timer_generation: 0,
             teams_unread: false,
             chat_cache_warmup_started: false,
@@ -3959,6 +3965,7 @@ impl App {
                 return;
             }
             (KeyCode::Char('?'), _) if !typing => {
+                self.help_scroll = 0;
                 self.overlay = Some(Overlay::Help);
                 return;
             }
@@ -4793,8 +4800,29 @@ impl App {
         // Take the overlay out so we can mutate self freely, then put it back.
         let overlay = self.overlay.take();
         match overlay {
-            Some(Overlay::Help) | Some(Overlay::Calendar) => {
-                // any key besides Esc closes
+            Some(Overlay::Help) => {
+                let max = self.help_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.help_scroll = 0,
+                    KeyCode::End => self.help_scroll = max,
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Help);
+            }
+            Some(Overlay::Calendar) => {
+                // Any key besides Esc closes the compact calendar overlay.
             }
             Some(Overlay::CalendarEvent) => {
                 if key.code == KeyCode::Char('o') {
@@ -5094,7 +5122,10 @@ impl App {
                 }
             }
             "refresh" => self.refresh_current(),
-            "help" => self.overlay = Some(Overlay::Help),
+            "help" => {
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help);
+            }
             "quit" => self.should_quit = true,
             _ => {}
         }
