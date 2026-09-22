@@ -63,6 +63,29 @@ pub enum TeamsSystemEvents {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfyMode {
+    Never,
+    Always,
+    Away,
+    AlwaysWd,
+    AwayWd,
+}
+
+impl NtfyMode {
+    pub fn enabled(self) -> bool {
+        self != Self::Never
+    }
+
+    pub fn needs_presence(self) -> bool {
+        matches!(self, Self::Away | Self::AwayWd)
+    }
+
+    pub fn needs_work_plan(self) -> bool {
+        matches!(self, Self::AlwaysWd | Self::AwayWd)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalendarNotify {
     All,
     Internal,
@@ -104,6 +127,14 @@ pub struct Config {
     pub client_state: String,
     /// Desktop notifications for direct messages and `@mentions`.
     pub notifications: bool,
+    /// Forward notification events to ntfy.
+    pub ntfy: NtfyMode,
+    /// ntfy server root URL, e.g. https://ntfy.example.com.
+    pub ntfy_server: Option<String>,
+    /// ntfy topic to publish to.
+    pub ntfy_topic: Option<String>,
+    /// Optional ntfy Bearer token for protected topics.
+    pub ntfy_token: Option<String>,
     /// Calendar reminder delivery mode: all, internal, external, or none.
     pub calendar_notify: CalendarNotify,
     /// Seconds an unread message must remain open before it is marked read.
@@ -152,23 +183,21 @@ impl Config {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let teams_cache_warmup = env_flag_default_on("M365_TEAMS_CACHE_WARMUP");
-        let teams_system_events = parse_teams_system_events(
-            std::env::var("M365_TEAMS_SYSTEM_EVENTS").ok().as_deref(),
-        )?;
-        let teams_image_cache_max_mb =
-            match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
-                Ok(value) if !value.trim().is_empty() => {
-                    let value = value.trim().parse::<u64>().context(
-                        "M365_TEAMS_IMAGE_CACHE_MAX_MB must be a positive integer number of MiB",
-                    )?;
-                    anyhow::ensure!(
-                        value > 0,
-                        "M365_TEAMS_IMAGE_CACHE_MAX_MB must be greater than zero"
-                    );
-                    value
-                }
-                _ => 256,
-            };
+        let teams_system_events =
+            parse_teams_system_events(std::env::var("M365_TEAMS_SYSTEM_EVENTS").ok().as_deref())?;
+        let teams_image_cache_max_mb = match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
+            Ok(value) if !value.trim().is_empty() => {
+                let value = value.trim().parse::<u64>().context(
+                    "M365_TEAMS_IMAGE_CACHE_MAX_MB must be a positive integer number of MiB",
+                )?;
+                anyhow::ensure!(
+                    value > 0,
+                    "M365_TEAMS_IMAGE_CACHE_MAX_MB must be greater than zero"
+                );
+                value
+            }
+            _ => 256,
+        };
         let presence_available_timeout_min =
             match std::env::var("M365_PRESENCE_AVAILABLE_TIMEOUT_MIN") {
                 Ok(value) if !value.trim().is_empty() => value.trim().parse::<u64>().context(
@@ -220,9 +249,36 @@ impl Config {
             std::env::var("M365_NOTIFY").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         );
-        let calendar_notify = parse_calendar_notify(
-            std::env::var("M365_CALENDAR_NOTIFY").ok().as_deref(),
-        )?;
+        let ntfy = parse_ntfy_mode(std::env::var("M365_NTFY").ok().as_deref())?;
+        let ntfy_server = std::env::var("M365_NTFY_SERVER")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+        let ntfy_topic = std::env::var("M365_NTFY_TOPIC")
+            .ok()
+            .map(|value| value.trim().trim_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+        let ntfy_token = std::env::var("M365_NTFY_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        if ntfy.enabled() {
+            let server = ntfy_server
+                .as_deref()
+                .context("M365_NTFY_SERVER is required when M365_NTFY is enabled")?;
+            anyhow::ensure!(
+                server.starts_with("http://") || server.starts_with("https://"),
+                "M365_NTFY_SERVER must start with http:// or https://"
+            );
+            anyhow::ensure!(
+                ntfy_topic.is_some(),
+                "M365_NTFY_TOPIC is required when M365_NTFY is enabled"
+            );
+        }
+
+        let calendar_notify =
+            parse_calendar_notify(std::env::var("M365_CALENDAR_NOTIFY").ok().as_deref())?;
         let read_msg_timeout = match std::env::var("M365_READ_MSG_TIMEOUT") {
             Ok(value) if !value.trim().is_empty() => value
                 .trim()
@@ -241,6 +297,10 @@ impl Config {
             token_cache_path,
             client_state,
             notifications,
+            ntfy,
+            ntfy_server,
+            ntfy_topic,
+            ntfy_token,
             calendar_notify,
             read_msg_timeout,
             presence_read,
@@ -309,6 +369,20 @@ impl Config {
         self.tunnel_base_url
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
+    }
+}
+
+fn parse_ntfy_mode(value: Option<&str>) -> Result<NtfyMode> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(NtfyMode::Never),
+        Some(value) if value.eq_ignore_ascii_case("never") => Ok(NtfyMode::Never),
+        Some(value) if value.eq_ignore_ascii_case("always") => Ok(NtfyMode::Always),
+        Some(value) if value.eq_ignore_ascii_case("away") => Ok(NtfyMode::Away),
+        Some(value) if value.eq_ignore_ascii_case("alwayswd") => Ok(NtfyMode::AlwaysWd),
+        Some(value) if value.eq_ignore_ascii_case("awaywd") => Ok(NtfyMode::AwayWd),
+        Some(value) => anyhow::bail!(
+            "M365_NTFY must be one of: never, always, away, alwayswd, awaywd (got {value:?})"
+        ),
     }
 }
 
@@ -395,6 +469,10 @@ mod tests {
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
             notifications: true,
+            ntfy: NtfyMode::Never,
+            ntfy_server: None,
+            ntfy_topic: None,
+            ntfy_token: None,
             calendar_notify: CalendarNotify::All,
             read_msg_timeout: 0,
             presence_read: false,
@@ -407,6 +485,36 @@ mod tests {
             teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn parses_ntfy_mode() {
+        assert_eq!(parse_ntfy_mode(None).unwrap(), NtfyMode::Never);
+        assert_eq!(parse_ntfy_mode(Some(" ALWAYS ")).unwrap(), NtfyMode::Always);
+        assert_eq!(parse_ntfy_mode(Some("away")).unwrap(), NtfyMode::Away);
+        assert_eq!(
+            parse_ntfy_mode(Some("alwayswd")).unwrap(),
+            NtfyMode::AlwaysWd
+        );
+        assert_eq!(parse_ntfy_mode(Some("AWAYWD")).unwrap(), NtfyMode::AwayWd);
+        assert_eq!(parse_ntfy_mode(Some("never")).unwrap(), NtfyMode::Never);
+        assert!(parse_ntfy_mode(Some("sometimes")).is_err());
+
+        assert!(!NtfyMode::Never.enabled());
+        assert!(NtfyMode::Always.enabled());
+        assert!(NtfyMode::Away.enabled());
+        assert!(NtfyMode::AlwaysWd.enabled());
+        assert!(NtfyMode::AwayWd.enabled());
+
+        assert!(!NtfyMode::Always.needs_presence());
+        assert!(NtfyMode::Away.needs_presence());
+        assert!(!NtfyMode::AlwaysWd.needs_presence());
+        assert!(NtfyMode::AwayWd.needs_presence());
+
+        assert!(!NtfyMode::Always.needs_work_plan());
+        assert!(!NtfyMode::Away.needs_work_plan());
+        assert!(NtfyMode::AlwaysWd.needs_work_plan());
+        assert!(NtfyMode::AwayWd.needs_work_plan());
     }
 
     #[test]

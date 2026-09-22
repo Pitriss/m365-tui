@@ -10,13 +10,13 @@ use std::io::IsTerminal;
 use anyhow::Context;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use m365_core::config::TeamsSystemEvents;
+use m365_core::config::{NtfyMode, TeamsSystemEvents};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
     Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence,
     SystemEventClass, Team, User,
 };
-use m365_core::{calendar, channels, chats, mail, people, Session};
+use m365_core::{calendar, channels, chats, mail, people, work_plan, Session};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
@@ -91,6 +91,10 @@ pub enum AppMessage {
         presence: Presence,
         requested: Option<String>,
     },
+    /// Silent own-presence refresh used by ntfy `away` forwarding.
+    PresenceRefresh(Presence),
+    /// Silent Microsoft 365 work-plan result used by `alwayswd` / `awaywd`.
+    NtfyWorkPlan(bool),
     /// Newest inbox messages, fetched purely to drive notifications.
     InboxPeek(Vec<MailMessage>),
     /// Attachments of the open mail message.
@@ -168,6 +172,10 @@ pub enum Overlay {
     React,
     /// Presence (status) picker for the signed-in user.
     Presence,
+    /// Temporary pause for ntfy forwarding.
+    NtfySnooze {
+        sel: usize,
+    },
     /// Numbered links in the focused message, to open in a browser.
     Links,
     /// Attachments of the open mail message, to save to disk.
@@ -541,10 +549,19 @@ pub struct App {
     pub me: Option<User>,
     /// The user's current presence (shown in the tab bar).
     pub my_presence: Option<Presence>,
-    /// Wall-clock of the last poll refresh (shown in the tab bar).
-    pub last_sync: Option<String>,
-    /// Monotonic start of the current 20-second polling cycle.
-    pub poll_started_at: std::time::Instant,
+    /// Latest Microsoft 365 work-plan answer for `alwayswd` / `awaywd`.
+    /// `None` means no successful refresh has completed yet.
+    ntfy_working_now: Option<bool>,
+    /// Temporary ntfy suppression deadline, persisted across restarts.
+    ntfy_snooze_until: Option<std::time::SystemTime>,
+    /// Last confirmed successful Graph folder refresh.
+    poll_last_success_at: std::time::Instant,
+    /// A scheduled poll has started and its folder-health response is still pending.
+    poll_health_pending: bool,
+    /// Current network retry interval after consecutive late poll-health responses.
+    poll_retry_interval_secs: u64,
+    /// Earliest instant at which a scheduled poll may hit Graph again.
+    poll_backoff_until: Option<std::time::Instant>,
     /// Whether instant push is working (shown in the status bar).
     pub push: PushState,
     /// Message ids already notified about, so a poll can't repeat them.
@@ -608,6 +625,16 @@ const MAX_MAIL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MAIL_IMAGE_WIDTH: u32 = 1600;
 const DEFAULT_CALENDAR_DAYS: i64 = 30;
 const CALENDAR_RANGES: &[i64] = &[7, 14, 30, 60, 90, 180, 365];
+/// Normal network poll cadence. The timer still ticks at this rate while
+/// App-level backoff decides whether another Graph poll is actually started.
+pub const POLL_SECONDS: u64 = 20;
+/// A successful Graph folder refresh older than this is visibly stale.
+pub const POLL_STALE_SECONDS: u64 = 2 * 60;
+/// Maximum poll retry interval after repeated late/failed poll health checks.
+const POLL_BACKOFF_MAX_SECONDS: u64 = 5 * 60;
+/// Choices shown by the F4 ntfy snooze picker.
+pub const NTFY_SNOOZE_HOURS: &[u64] = &[1, 2, 4, 8, 12, 24];
+const NTFY_SNOOZE_STATE_FILE: &str = "ntfy-snooze";
 const UI_STATE_FILE: &str = "ui-state";
 const CALENDAR_MONTH_MIN_WIDTH: u16 = 68;
 const CALENDAR_MONTH_MIN_HEIGHT: u16 = 23;
@@ -731,13 +758,14 @@ fn load_teams_conversation_cache(
         let _ = std::fs::remove_file(&path);
         return Ok(None);
     };
-    let messages: Vec<ChatMessage> = match serde_json::from_value::<Vec<ChatMessage>>(messages_value) {
-        Ok(messages) if messages.len() <= MAX_TEAMS_CACHED_MESSAGES => messages,
-        _ => {
-            let _ = std::fs::remove_file(&path);
-            return Ok(None);
-        }
-    };
+    let messages: Vec<ChatMessage> =
+        match serde_json::from_value::<Vec<ChatMessage>>(messages_value) {
+            Ok(messages) if messages.len() <= MAX_TEAMS_CACHED_MESSAGES => messages,
+            _ => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(None);
+            }
+        };
 
     Ok(Some((messages, next)))
 }
@@ -955,9 +983,8 @@ fn store_ui_state(
         CalendarView::Agenda => "agenda",
         CalendarView::Month => "month",
     };
-    let mut data = format!(
-        "screen={screen}\ncalendar_days={calendar_days}\ncalendar_view={calendar_view}\n"
-    );
+    let mut data =
+        format!("screen={screen}\ncalendar_days={calendar_days}\ncalendar_view={calendar_view}\n");
     if let Some(chat_id) = teams_chat_id.filter(|value| !value.is_empty()) {
         data.push_str("teams_chat_id=");
         data.push_str(chat_id);
@@ -971,6 +998,95 @@ fn store_ui_state(
         std::fs::remove_file(&final_path)?;
     }
     std::fs::rename(temp_path, final_path)
+}
+
+fn ntfy_snooze_state_path() -> Option<std::path::PathBuf> {
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })?;
+
+    Some(root.join("m365-tui").join(NTFY_SNOOZE_STATE_FILE))
+}
+
+fn ntfy_snooze_remaining_at(
+    until: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let remaining = until?.duration_since(now).ok()?;
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn load_ntfy_snooze_until() -> Option<std::time::SystemTime> {
+    let path = ntfy_snooze_state_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                "could not read ntfy snooze state {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+
+    let epoch_seconds = match text.trim().parse::<u64>() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                "invalid ntfy snooze state {}: {error}; discarding it",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let until = std::time::SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(epoch_seconds))?;
+
+    if ntfy_snooze_remaining_at(Some(until), std::time::SystemTime::now()).is_none() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+
+    Some(until)
+}
+
+fn store_ntfy_snooze_until(until: Option<std::time::SystemTime>) -> std::io::Result<()> {
+    let Some(path) = ntfy_snooze_state_path() else {
+        return Ok(());
+    };
+
+    let Some(until) = until else {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+    };
+
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    create_private_cache_dir(parent)?;
+
+    let epoch_seconds = until
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    write_private_cache_file(&path, format!("{epoch_seconds}\n").as_bytes())
+}
+
+fn next_poll_retry_interval(current: u64) -> u64 {
+    current
+        .saturating_mul(2)
+        .clamp(POLL_SECONDS, POLL_BACKOFF_MAX_SECONDS)
 }
 
 fn remove_teams_disk_cache_entry(dir: &std::path::Path, cache_key: &str) {
@@ -1128,7 +1244,9 @@ fn store_teams_disk_cache(
         let mut cursor = Cursor::new(Vec::new());
         image
             .write_to(&mut cursor, image::ImageFormat::Png)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
         let bytes = cursor.into_inner();
         if bytes.len() > MAX_TEAMS_IMAGE_BYTES {
             return Ok(());
@@ -1238,9 +1356,8 @@ fn hosted_content_ids(message: &ChatMessage) -> Vec<String> {
 
 fn calendar_month_first(offset: i32) -> chrono::NaiveDate {
     let today = chrono::Local::now().date_naive();
-    let month_index = chrono::Datelike::year(&today) * 12
-        + chrono::Datelike::month0(&today) as i32
-        + offset;
+    let month_index =
+        chrono::Datelike::year(&today) * 12 + chrono::Datelike::month0(&today) as i32 + offset;
     let year = month_index.div_euclid(12);
     let month = month_index.rem_euclid(12) as u32 + 1;
     chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid calendar month")
@@ -1253,19 +1370,34 @@ fn calendar_state_local_datetime(
         return Some(parsed.with_timezone(&chrono::Local));
     }
 
-    let naive = chrono::NaiveDateTime::parse_from_str(
-        &value.date_time,
-        "%Y-%m-%dT%H:%M:%S%.f",
-    )
-    .or_else(|_| {
-        chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S")
-    })
-    .ok()?;
+    let naive = chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
 
     Some(
         chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
             .with_timezone(&chrono::Local),
     )
+}
+
+fn ntfy_presence_is_away(presence: Option<&Presence>) -> bool {
+    presence
+        .and_then(|presence| presence.availability.as_deref())
+        .is_some_and(|availability| availability.eq_ignore_ascii_case("Away"))
+}
+
+fn ntfy_mode_should_forward(
+    mode: NtfyMode,
+    presence: Option<&Presence>,
+    working_now: Option<bool>,
+) -> bool {
+    match mode {
+        NtfyMode::Never => false,
+        NtfyMode::Always => true,
+        NtfyMode::Away => ntfy_presence_is_away(presence),
+        NtfyMode::AlwaysWd => working_now == Some(true),
+        NtfyMode::AwayWd => working_now == Some(true) && ntfy_presence_is_away(presence),
+    }
 }
 
 fn calendar_reminder_threshold_minutes(seconds_until: i64) -> Option<u16> {
@@ -1292,14 +1424,20 @@ fn calendar_event_reminder(
         return None;
     }
 
-    let start = event.start.as_ref().and_then(calendar_state_local_datetime)?;
+    let start = event
+        .start
+        .as_ref()
+        .and_then(calendar_state_local_datetime)?;
     let seconds_until = start.signed_duration_since(*now).num_seconds();
     let minutes = calendar_reminder_threshold_minutes(seconds_until)?;
     Some((minutes, start))
 }
 
 fn calendar_state_event_dates(event: &CalEvent) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
-    let start = event.start.as_ref().and_then(calendar_state_local_datetime)?;
+    let start = event
+        .start
+        .as_ref()
+        .and_then(calendar_state_local_datetime)?;
     let end = event.end.as_ref().and_then(calendar_state_local_datetime)?;
     let start_date = start.date_naive();
     let mut end_date = end.date_naive();
@@ -1377,6 +1515,8 @@ impl App {
             ..TeamsState::default()
         };
 
+        let ntfy_snooze_until = load_ntfy_snooze_until();
+
         let mut app = Self {
             session,
             tx,
@@ -1405,8 +1545,12 @@ impl App {
             status: "loading…".into(),
             me: None,
             my_presence: None,
-            last_sync: None,
-            poll_started_at: std::time::Instant::now(),
+            ntfy_working_now: None,
+            ntfy_snooze_until,
+            poll_last_success_at: std::time::Instant::now(),
+            poll_health_pending: false,
+            poll_retry_interval_secs: POLL_SECONDS,
+            poll_backoff_until: None,
             push: PushState::Off,
             notified: std::collections::HashSet::new(),
             chat_seen: None,
@@ -1443,6 +1587,7 @@ impl App {
     pub fn bootstrap(&mut self) {
         self.load_whoami();
         self.load_presence();
+        self.refresh_ntfy_work_plan();
         self.start_primary_presence();
         self.load_folders();
         self.load_chats();
@@ -1514,6 +1659,35 @@ impl App {
                 presence: people::my_presence(&s.graph).await?,
                 requested: None,
             })
+        });
+    }
+
+    fn refresh_presence_for_ntfy(&self) {
+        let s = self.session.clone();
+        self.spawn(async move {
+            Ok(AppMessage::PresenceRefresh(
+                people::my_presence(&s.graph).await?,
+            ))
+        });
+    }
+
+    fn refresh_ntfy_work_plan(&self) {
+        if !self.session.config.ntfy.needs_work_plan() {
+            return;
+        }
+
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let working = match work_plan::working_now(&s.graph, chrono::Utc::now()).await {
+                Ok(working) => working,
+                Err(error) => {
+                    tracing::warn!("ntfy work-plan refresh failed: {error:#}");
+                    false
+                }
+            };
+            tracing::debug!("ntfy M365 work-plan active={working}");
+            let _ = tx.send(AppMessage::NtfyWorkPlan(working)).await;
         });
     }
 
@@ -1788,7 +1962,7 @@ impl App {
     /// regardless of which folder is on screen, so mail is announced even while
     /// reading elsewhere.
     fn peek_inbox(&self) {
-        if !self.session.config.notifications {
+        if !self.notification_events_enabled() {
             return;
         }
         let s = self.session.clone();
@@ -1993,8 +2167,8 @@ impl App {
         let now = chrono::Utc::now();
         let start =
             (now - chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let end =
-            (now + chrono::Duration::minutes(20)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end = (now + chrono::Duration::minutes(20))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let s = self.session.clone();
         let tx = self.tx.clone();
@@ -2049,7 +2223,7 @@ impl App {
                 internal.push(format!("{minutes} min: {subject} ({at})"));
             }
 
-            if mode.external() && self.session.config.notifications {
+            if mode.external() {
                 let body = event
                     .location
                     .as_ref()
@@ -2063,7 +2237,7 @@ impl App {
         }
 
         for (title, body) in external {
-            crate::notify::send(&title, &body);
+            self.send_notification("Calendar", title, body);
         }
 
         if let Some(first) = internal.first() {
@@ -2085,8 +2259,7 @@ impl App {
             }
             CalendarView::Month => {
                 let first = calendar_month_first(self.calendar.month_offset);
-                let leading =
-                    chrono::Datelike::weekday(&first).num_days_from_monday() as i64;
+                let leading = chrono::Datelike::weekday(&first).num_days_from_monday() as i64;
                 let grid_start = first - chrono::Duration::days(leading + 1);
                 let grid_end = calendar_month_first(self.calendar.month_offset + 4)
                     + chrono::Duration::days(8);
@@ -2189,31 +2362,31 @@ impl App {
                     }
                 };
 
-                let cache_is_current = cached.as_ref().is_some_and(|(messages, _)| {
-                    match latest_id.as_deref() {
-                        Some(latest_id) => {
-                            messages.first().map(|message| message.id.as_str()) == Some(latest_id)
-                        }
-                        None => true,
+                let cache_is_current = cached.as_ref().is_some_and(|(messages, _)| match latest_id
+                    .as_deref()
+                {
+                    Some(latest_id) => {
+                        messages.first().map(|message| message.id.as_str()) == Some(latest_id)
                     }
+                    None => true,
                 });
                 if cache_is_current {
                     continue;
                 }
 
-                let (messages, _) =
-                    match chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await {
-                        Ok(page) => page,
-                        Err(error) => {
-                            tracing::warn!(
-                                "Teams conversation cache warm-up failed for {chat_id}: {error:#}"
-                            );
-                            // Keep this deliberately gentle on Graph even when
-                            // one conversation repeatedly fails.
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            continue;
-                        }
-                    };
+                let (messages, _) = match chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Teams conversation cache warm-up failed for {chat_id}: {error:#}"
+                        );
+                        // Keep this deliberately gentle on Graph even when
+                        // one conversation repeatedly fails.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
                 // Graph returns newest-first; persistent storage expects the
                 // app's oldest-first ordering and reverses it for JSON.
@@ -2224,11 +2397,7 @@ impl App {
                 let write_chat_id = chat_id.clone();
                 let write_messages = oldest_first;
                 match tokio::task::spawn_blocking(move || {
-                    store_teams_conversation_cache(
-                        &write_root,
-                        &write_chat_id,
-                        &write_messages,
-                    )
+                    store_teams_conversation_cache(&write_root, &write_chat_id, &write_messages)
                 })
                 .await
                 {
@@ -2250,10 +2419,7 @@ impl App {
                 }
 
                 let _ = tx
-                    .send(AppMessage::ChatCacheWarmed {
-                        chat_id,
-                        messages,
-                    })
+                    .send(AppMessage::ChatCacheWarmed { chat_id, messages })
                     .await;
 
                 // Sequential fetching already limits concurrency; this tiny gap
@@ -2481,16 +2647,12 @@ impl App {
             Ok(Some((messages, next))) => {
                 let count = messages.len();
                 self.set_teams_messages(messages, next, ListUpdate::Replace);
-                tracing::debug!(
-                    "Teams conversation cache hit for {chat_id}: {count} message(s)"
-                );
+                tracing::debug!("Teams conversation cache hit for {chat_id}: {count} message(s)");
                 true
             }
             Ok(None) => false,
             Err(error) => {
-                tracing::warn!(
-                    "Teams conversation cache read failed for {chat_id}: {error}"
-                );
+                tracing::warn!("Teams conversation cache read failed for {chat_id}: {error}");
                 false
             }
         }
@@ -2510,11 +2672,7 @@ impl App {
         tokio::spawn(async move {
             let cache_chat_id = chat_id.clone();
             match tokio::task::spawn_blocking(move || {
-                store_teams_conversation_cache(
-                    &cache_root,
-                    &cache_chat_id,
-                    &messages,
-                )
+                store_teams_conversation_cache(&cache_root, &cache_chat_id, &messages)
             })
             .await
             {
@@ -2522,9 +2680,7 @@ impl App {
                     tracing::debug!("Teams conversation cache stored for {chat_id}");
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(
-                        "Teams conversation cache write failed for {chat_id}: {error}"
-                    );
+                    tracing::warn!("Teams conversation cache write failed for {chat_id}: {error}");
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -2675,10 +2831,8 @@ impl App {
             let read_dir = cache_dir;
             let read_key = disk_cache_key;
 
-            match tokio::task::spawn_blocking(move || {
-                load_teams_disk_cache(&read_dir, &read_key)
-            })
-            .await
+            match tokio::task::spawn_blocking(move || load_teams_disk_cache(&read_dir, &read_key))
+                .await
             {
                 Ok(Ok(Some(images))) => {
                     tracing::debug!(
@@ -3147,6 +3301,9 @@ impl App {
                 self.me = Some(u);
             }
             AppMessage::Folders(f) => {
+                // Folder loading is part of every network poll, so any successful
+                // result proves Graph is responsive and resets poll health/backoff.
+                self.mark_poll_success();
                 let first_load = self.outlook.folders.is_empty();
                 self.outlook.folders = f;
                 if first_load {
@@ -3352,8 +3509,7 @@ impl App {
                 mode,
             } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
-                    let opened_now =
-                        self.teams.chat_open_pending_read.as_deref() == Some(&chat_id);
+                    let opened_now = self.teams.chat_open_pending_read.as_deref() == Some(&chat_id);
 
                     self.set_teams_messages(messages, next, mode);
                     self.persist_teams_conversation_cache(&chat_id);
@@ -3461,6 +3617,12 @@ impl App {
                 };
                 self.my_presence = Some(presence);
             }
+            AppMessage::PresenceRefresh(presence) => {
+                self.my_presence = Some(presence);
+            }
+            AppMessage::NtfyWorkPlan(working) => {
+                self.ntfy_working_now = Some(working);
+            }
             AppMessage::InboxPeek(items) => self.notify_for_mail(&items),
             AppMessage::Attachments { message_id, items } => {
                 // Ignore a late response for a message we've navigated away from.
@@ -3521,6 +3683,7 @@ impl App {
                     self.notice_until = None;
                 }
                 self.update_primary_presence_idle();
+                self.expire_ntfy_snooze_if_due();
                 self.rss_kb = read_rss_kb();
                 // Clear a message once it has sat unchanged for a while, so the
                 // status bar never shows something from half an hour ago.
@@ -3540,18 +3703,66 @@ impl App {
                 self.refresh_calendar_reminders_if_due();
                 self.check_calendar_reminders();
             }
-            AppMessage::Poll => {
-                self.poll_started_at = std::time::Instant::now();
-                self.poll();
-            }
+            AppMessage::Poll => self.scheduled_poll(),
         }
+    }
+
+    /// Time since Graph last returned a successful folder refresh. The top
+    /// poll gauge uses this instead of the time a request was merely started.
+    pub fn poll_elapsed(&self) -> std::time::Duration {
+        self.poll_last_success_at.elapsed()
+    }
+
+    fn mark_poll_success(&mut self) {
+        self.poll_last_success_at = std::time::Instant::now();
+        self.poll_health_pending = false;
+        self.poll_retry_interval_secs = POLL_SECONDS;
+        self.poll_backoff_until = None;
+    }
+
+    /// Handle the fixed 20-second local timer. If the previous poll's folder
+    /// health response is still missing, exponentially back off future network
+    /// polls instead of starting overlapping Graph request waves.
+    fn scheduled_poll(&mut self) {
+        let now = std::time::Instant::now();
+
+        if self.poll_health_pending {
+            self.poll_health_pending = false;
+            self.poll_retry_interval_secs = next_poll_retry_interval(self.poll_retry_interval_secs);
+            let remaining_backoff = self.poll_retry_interval_secs.saturating_sub(POLL_SECONDS);
+            self.poll_backoff_until = Some(now + std::time::Duration::from_secs(remaining_backoff));
+            tracing::warn!(
+                "poll health response is late; Graph poll interval backed off to {}s",
+                self.poll_retry_interval_secs
+            );
+        }
+
+        if self.poll_backoff_until.is_some_and(|until| now < until) {
+            return;
+        }
+
+        self.poll_backoff_until = None;
+        self.poll_health_pending = true;
+        self.poll();
+    }
+
+    /// Manual F5 deliberately bypasses App-level backoff, but does not pretend
+    /// the refresh succeeded; the gauge resets only when Graph answers.
+    fn force_poll(&mut self) {
+        self.poll_health_pending = true;
+        self.poll_retry_interval_secs = POLL_SECONDS;
+        self.poll_backoff_until = None;
+        self.poll();
     }
 
     /// Refresh the current view from the server. Driven by a periodic timer so
     /// the UI stays live even without the push tunnel.
     fn poll(&mut self) {
-        self.last_sync = Some(now_hms());
         self.renew_presence_session();
+        if self.session.config.ntfy.needs_presence() {
+            self.refresh_presence_for_ntfy();
+        }
+        self.refresh_ntfy_work_plan();
         self.peek_inbox();
         // Mail: refresh folder unread counts + the open folder's messages.
         self.load_folders();
@@ -3708,15 +3919,12 @@ impl App {
                 // Chat convention: if the user is sitting on the newest message,
                 // follow new arrivals; if they've scrolled back to read history,
                 // hold their place and just count what came in.
-                follow_newest =
-                    self.last_selectable_teams_message() == Some(self.teams.msg_sel);
+                follow_newest = self.last_selectable_teams_message() == Some(self.teams.msg_sel);
                 let known: std::collections::HashSet<&str> =
                     self.teams.messages.iter().map(|m| m.id.as_str()).collect();
                 let arrived = page
                     .iter()
-                    .filter(|m| {
-                        !known.contains(m.id.as_str()) && self.teams_message_selectable(m)
-                    })
+                    .filter(|m| !known.contains(m.id.as_str()) && self.teams_message_selectable(m))
                     .count();
                 if !follow_newest {
                     self.teams.unseen += arrived;
@@ -3849,9 +4057,88 @@ impl App {
         }
     }
 
+    pub fn ntfy_snooze_remaining(&self) -> Option<std::time::Duration> {
+        ntfy_snooze_remaining_at(self.ntfy_snooze_until, std::time::SystemTime::now())
+    }
+
+    fn persist_ntfy_snooze(&self) {
+        if let Err(error) = store_ntfy_snooze_until(self.ntfy_snooze_until) {
+            tracing::warn!("could not persist ntfy snooze state: {error}");
+        }
+    }
+
+    fn set_ntfy_snooze(&mut self, hours: u64) {
+        let duration = std::time::Duration::from_secs(hours.saturating_mul(60 * 60));
+        let Some(until) = std::time::SystemTime::now().checked_add(duration) else {
+            self.status = "could not set ntfy snooze".into();
+            return;
+        };
+
+        self.ntfy_snooze_until = Some(until);
+        self.persist_ntfy_snooze();
+        self.status = format!("ntfy snoozed for {hours}h");
+    }
+
+    fn clear_ntfy_snooze(&mut self) {
+        self.ntfy_snooze_until = None;
+        self.persist_ntfy_snooze();
+        self.status = "ntfy snooze cleared".into();
+    }
+
+    fn expire_ntfy_snooze_if_due(&mut self) {
+        if self.ntfy_snooze_until.is_some() && self.ntfy_snooze_remaining().is_none() {
+            self.ntfy_snooze_until = None;
+            self.persist_ntfy_snooze();
+        }
+    }
+
+    fn notification_events_enabled(&self) -> bool {
+        self.session.config.notifications || self.session.config.ntfy.enabled()
+    }
+
+    fn ntfy_should_forward(&self) -> bool {
+        if self.ntfy_snooze_remaining().is_some() {
+            return false;
+        }
+
+        ntfy_mode_should_forward(
+            self.session.config.ntfy,
+            self.my_presence.as_ref(),
+            self.ntfy_working_now,
+        )
+    }
+
+    fn send_notification(&self, _category: &'static str, title: String, body: String) {
+        if self.session.config.notifications {
+            crate::notify::send(&title, &body);
+        }
+
+        if !self.ntfy_should_forward() {
+            return;
+        }
+
+        let (Some(server), Some(topic)) = (
+            self.session.config.ntfy_server.clone(),
+            self.session.config.ntfy_topic.clone(),
+        ) else {
+            tracing::warn!("ntfy forwarding enabled without server/topic");
+            return;
+        };
+        let token = self.session.config.ntfy_token.clone();
+
+        tokio::spawn(async move {
+            if let Err(error) =
+                m365_core::ntfy::send(&server, &topic, token.as_deref(), &title, &body).await
+            {
+                tracing::warn!("ntfy forwarding failed: {error:#}");
+            }
+        });
+    }
+
     /// Raise notifications for chats whose newest message changed: direct
     /// messages always, group chats only when they `@mention` the user.
     fn notify_for_chats(&mut self, chats: &[Chat]) {
+        let notification_events_enabled = self.notification_events_enabled();
         let my_id = self.me.as_ref().map(|m| m.id.clone());
         let my_name = self.me.as_ref().and_then(|m| m.display_name.clone());
 
@@ -3895,7 +4182,7 @@ impl App {
             if self.screen != Screen::Teams {
                 self.teams_unread = true;
             }
-            if !self.session.config.notifications {
+            if !notification_events_enabled {
                 continue;
             }
             if !self.notified.insert(msg_id.clone()) {
@@ -3935,13 +4222,13 @@ impl App {
             self.notified.clear();
         }
         for (title, body) in to_notify {
-            crate::notify::send(&title, &body);
+            self.send_notification("Teams", title, body);
         }
     }
 
     /// Announce new, still-unread inbox mail.
     fn notify_for_mail(&mut self, items: &[MailMessage]) {
-        if !self.session.config.notifications {
+        if !self.notification_events_enabled() {
             return;
         }
         // First sync records a baseline; otherwise the whole inbox would
@@ -3976,7 +4263,7 @@ impl App {
             self.notified.clear();
         }
         for (who, subject) in to_notify {
-            crate::notify::send(&format!("✉ {who}"), &subject);
+            self.send_notification("Mail", format!("✉ {who}"), subject);
         }
     }
 
@@ -4107,9 +4394,16 @@ impl App {
                 self.switch_screen(Screen::Calendar);
                 return;
             }
+            (KeyCode::F(4), _) => {
+                if self.session.config.ntfy.enabled() {
+                    self.overlay = Some(Overlay::NtfySnooze { sel: 0 });
+                } else {
+                    self.status = "ntfy forwarding is disabled (M365_NTFY=never)".into();
+                }
+                return;
+            }
             (KeyCode::F(5), _) => {
-                self.poll_started_at = std::time::Instant::now();
-                self.poll();
+                self.force_poll();
                 return;
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
@@ -4331,16 +4625,13 @@ impl App {
                 }
             }
             KeyCode::Char('v') => {
-                if self.calendar.view == CalendarView::Agenda
-                    && !calendar_month_view_available()
-                {
+                if self.calendar.view == CalendarView::Agenda && !calendar_month_view_available() {
                     self.overlay = Some(Overlay::Notice(format!(
                         "Month view requires at least {}x{} characters.\n\nAgenda view remains active.",
                         CALENDAR_MONTH_MIN_WIDTH, CALENDAR_MONTH_MIN_HEIGHT
                     )));
-                    self.notice_until = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(3),
-                    );
+                    self.notice_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     return;
                 }
 
@@ -4417,8 +4708,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, event)| {
-                calendar_event_intersects_month(event, self.calendar.month_offset)
-                    .then_some(index)
+                calendar_event_intersects_month(event, self.calendar.month_offset).then_some(index)
             })
             .collect()
     }
@@ -4463,16 +4753,11 @@ impl App {
                 return value.with_timezone(&chrono::Local).date_naive() == today;
             }
 
-            let parsed = chrono::NaiveDateTime::parse_from_str(
-                &start.date_time,
-                "%Y-%m-%dT%H:%M:%S%.f",
-            )
-            .or_else(|_| {
-                chrono::NaiveDateTime::parse_from_str(
-                    &start.date_time,
-                    "%Y-%m-%dT%H:%M:%S",
-                )
-            });
+            let parsed =
+                chrono::NaiveDateTime::parse_from_str(&start.date_time, "%Y-%m-%dT%H:%M:%S%.f")
+                    .or_else(|_| {
+                        chrono::NaiveDateTime::parse_from_str(&start.date_time, "%Y-%m-%dT%H:%M:%S")
+                    });
 
             let Ok(value) = parsed else {
                 return false;
@@ -5038,6 +5323,28 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Presence), // ignore other keys
             },
+            Some(Overlay::NtfySnooze { mut sel }) => {
+                let max = NTFY_SNOOZE_HOURS.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        self.overlay = Some(Overlay::NtfySnooze { sel });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = sel.saturating_add(1).min(max);
+                        self.overlay = Some(Overlay::NtfySnooze { sel });
+                    }
+                    KeyCode::Enter => {
+                        if let Some(&hours) = NTFY_SNOOZE_HOURS.get(sel) {
+                            self.set_ntfy_snooze(hours);
+                        } else if sel == NTFY_SNOOZE_HOURS.len() {
+                            self.clear_ntfy_snooze();
+                        }
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('0') => self.clear_ntfy_snooze(),
+                    _ => self.overlay = Some(Overlay::NtfySnooze { sel }),
+                }
+            }
             Some(Overlay::Search { mut query }) => match key.code {
                 KeyCode::Enter => {
                     let q = query.clone();
@@ -5083,7 +5390,7 @@ impl App {
                 }
             }
             Some(Overlay::Compose(mut c)) => self.on_key_compose(key, &mut c),
-            Some(Overlay::Notice(_)) => {},
+            Some(Overlay::Notice(_)) => {}
             None => {}
         }
     }
@@ -5372,10 +5679,6 @@ fn sort_key(m: &ChatMessage) -> (i64, u64) {
     (at, m.id.parse::<u64>().unwrap_or(0))
 }
 
-fn now_hms() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
-}
-
 /// Split a comma/semicolon/space-separated recipients string into addresses.
 fn parse_recipients(s: &str) -> Vec<String> {
     s.split([',', ';', ' '])
@@ -5427,11 +5730,121 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 }
 
 #[cfg(test)]
+mod ntfy_snooze_poll_tests {
+    use super::{
+        next_poll_retry_interval, ntfy_snooze_remaining_at, POLL_BACKOFF_MAX_SECONDS, POLL_SECONDS,
+    };
+
+    #[test]
+    fn poll_retry_backoff_caps_at_five_minutes() {
+        let mut interval = POLL_SECONDS;
+        let mut actual = Vec::new();
+        for _ in 0..5 {
+            interval = next_poll_retry_interval(interval);
+            actual.push(interval);
+        }
+
+        assert_eq!(actual, vec![40, 80, 160, 300, 300]);
+        assert_eq!(actual.last().copied(), Some(POLL_BACKOFF_MAX_SECONDS));
+    }
+
+    #[test]
+    fn persisted_snooze_remaining_expires_at_deadline() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let until = now + std::time::Duration::from_secs(90);
+
+        assert_eq!(
+            ntfy_snooze_remaining_at(Some(until), now),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(ntfy_snooze_remaining_at(Some(until), until), None);
+        assert_eq!(ntfy_snooze_remaining_at(None, now), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        calendar_reminder_threshold_minutes, merge_newest_first, next_field, parse_recipients,
-        step,
+        calendar_reminder_threshold_minutes, merge_newest_first, next_field, ntfy_presence_is_away,
+        parse_recipients, step,
     };
+
+    #[test]
+    fn ntfy_away_mode_is_strictly_graph_away() {
+        let presence = |availability: &str| -> m365_core::models::Presence {
+            serde_json::from_value(serde_json::json!({
+                "availability": availability,
+                "activity": availability
+            }))
+            .unwrap()
+        };
+
+        let away = presence("Away");
+        let available = presence("Available");
+        let offline = presence("Offline");
+
+        assert!(ntfy_presence_is_away(Some(&away)));
+        assert!(!ntfy_presence_is_away(Some(&available)));
+        assert!(!ntfy_presence_is_away(Some(&offline)));
+        assert!(!ntfy_presence_is_away(None));
+    }
+
+    #[test]
+    fn ntfy_workday_modes_require_graph_work_plan() {
+        let presence = |availability: &str| -> m365_core::models::Presence {
+            serde_json::from_value(serde_json::json!({
+                "availability": availability,
+                "activity": availability
+            }))
+            .unwrap()
+        };
+
+        let away = presence("Away");
+        let available = presence("Available");
+
+        assert!(super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::Always,
+            Some(&available),
+            None,
+        ));
+        assert!(super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::Away,
+            Some(&away),
+            Some(false),
+        ));
+
+        assert!(!super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::AlwaysWd,
+            Some(&available),
+            None,
+        ));
+        assert!(!super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::AlwaysWd,
+            Some(&available),
+            Some(false),
+        ));
+        assert!(super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::AlwaysWd,
+            Some(&available),
+            Some(true),
+        ));
+
+        assert!(!super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::AwayWd,
+            Some(&available),
+            Some(true),
+        ));
+        assert!(!super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::AwayWd,
+            Some(&away),
+            Some(false),
+        ));
+        assert!(super::ntfy_mode_should_forward(
+            m365_core::config::NtfyMode::AwayWd,
+            Some(&away),
+            Some(true),
+        ));
+    }
 
     #[test]
     fn calendar_reminder_thresholds_are_exact() {

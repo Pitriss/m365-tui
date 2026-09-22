@@ -26,7 +26,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, AppMessage, PushState};
+use app::{App, AppMessage, PushState, POLL_SECONDS};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
@@ -40,9 +40,6 @@ use m365_core::{subscriptions, DeviceCodePrompt, Session};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
-
-/// How often to poll the server to refresh the current view.
-const POLL_SECONDS: u64 = 20;
 
 /// Lightweight local tick: refreshes memory usage and ages out status text.
 /// Costs nothing on the network.
@@ -204,7 +201,12 @@ async fn run_tui(session: Session) -> Result<()> {
 
     // Terminal teardown (best-effort even on error).
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     // Drop our presence session on the way out, otherwise the user would keep
@@ -259,7 +261,9 @@ fn spawn_realtime(
     app_tx: mpsc::Sender<AppMessage>,
 ) {
     let redis_url = session.config.redis_url.clone();
-    tokio::spawn(m365_core::events::run_subscriber_forever(redis_url, change_tx));
+    tokio::spawn(m365_core::events::run_subscriber_forever(
+        redis_url, change_tx,
+    ));
 
     let session = session.clone();
     tokio::spawn(async move {
@@ -274,10 +278,7 @@ fn spawn_realtime(
 
 /// Create the inbox + all-chats subscriptions and renew them before they lapse.
 /// Chat subscriptions expire in ~1h, so we renew every 45 minutes.
-async fn manage_subscriptions(
-    session: Session,
-    app_tx: mpsc::Sender<AppMessage>,
-) -> Result<()> {
+async fn manage_subscriptions(session: Session, app_tx: mpsc::Sender<AppMessage>) -> Result<()> {
     let _ = app_tx.send(AppMessage::Push(PushState::Connecting)).await;
     let notify = session.config.notification_url().unwrap();
     let lifecycle = session.config.lifecycle_url();
@@ -355,7 +356,9 @@ fn init_tracing() {
     let log_path = std::env::temp_dir().join("m365-tui.log");
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
         .with_writer(move || {
             std::fs::OpenOptions::new()
                 .create(true)

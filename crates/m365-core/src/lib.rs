@@ -14,9 +14,11 @@ pub mod events;
 pub mod graph;
 pub mod mail;
 pub mod models;
+pub mod ntfy;
 pub mod people;
 pub mod subscriptions;
 pub mod util;
+pub mod work_plan;
 
 use std::sync::Arc;
 

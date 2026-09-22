@@ -10,8 +10,8 @@ use ratatui_image::{Resize, StatefulImage};
 use m365_core::models::SystemEventClass;
 
 use crate::app::{
-    filter_commands, App, CalendarView, Compose, OutlookFocus, Overlay, PushState, Screen,
-    TeamsFocus, TeamsMode,
+    filter_commands, App, CalendarView, Compose, OutlookFocus, Overlay, Screen, TeamsFocus,
+    TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -124,11 +124,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         "Teams (F2)  "
     };
     let tabs = Line::from(vec![
-        tab(
-            outlook_tab,
-            app.screen == Screen::Outlook,
-            outlook_unread,
-        ),
+        tab(outlook_tab, app.screen == Screen::Outlook, outlook_unread),
         Span::raw("  "),
         tab(
             teams_tab,
@@ -139,38 +135,27 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         tab("Calendar (F3)  ", app.screen == Screen::Calendar, false),
     ]);
 
-    // Right-hand state: presence · push · memory · last sync.
+    // Right-hand state: presence · poll health · ntfy · memory · local clock.
     let (dot, avail) = presence_indicator(app);
-    let (push_label, push_colour) = match &app.push {
-        PushState::Off => {
-            let filled = ((app.poll_started_at.elapsed().as_secs() / 2) as usize).min(10);
-            (
-                format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled)),
-                DIM,
-            )
-        }
-        PushState::Connecting => ("push …".to_string(), Color::Yellow),
-        PushState::Live => ("push live".to_string(), Color::Green),
-        PushState::Failed(_) => ("push FAILED".to_string(), Color::Red),
-    };
+    let (poll_label, poll_colour) = poll_indicator(app.poll_elapsed());
+    let (ntfy_label, ntfy_colour) = ntfy_indicator(app);
     let ram = match app.rss_kb {
         Some(kb) if kb >= 1024 => format!("{:.0} MB", kb as f64 / 1024.0),
         Some(kb) => format!("{kb} KB"),
         None => "—".to_string(),
     };
-    let sync = match &app.last_sync {
-        Some(t) => format!("⟳ {t}"),
-        None => "⟳ …".to_string(),
-    };
+    let clock = chrono::Local::now().format("%H:%M").to_string();
     let sep = || Span::styled(" · ", Style::default().fg(DIM));
     let state = Line::from(vec![
         Span::styled(format!("{dot} {avail}"), presence_style(app)),
         sep(),
-        Span::styled(push_label, Style::default().fg(push_colour)),
+        Span::styled(poll_label, Style::default().fg(poll_colour)),
+        sep(),
+        Span::styled(ntfy_label, Style::default().fg(ntfy_colour)),
         sep(),
         Span::styled(format!("rss {ram}"), Style::default().fg(Color::Gray)),
         sep(),
-        Span::styled(sync, Style::default().fg(Color::Green)),
+        Span::styled(clock, Style::default().fg(Color::Green)),
         Span::raw(" "),
     ]);
 
@@ -219,6 +204,62 @@ fn line_width(line: &Line) -> u16 {
         .sum::<usize>() as u16
 }
 
+fn bar_with_label(label: &str) -> String {
+    const INNER: usize = 10;
+    let label_len = label.chars().count().min(INNER);
+    let remaining = INNER.saturating_sub(label_len);
+    let left = remaining / 2;
+    let right = remaining - left;
+    format!("[{}{}{}]", "█".repeat(left), label, "█".repeat(right))
+}
+
+fn poll_indicator(elapsed: std::time::Duration) -> (String, Color) {
+    let seconds = elapsed.as_secs();
+
+    if seconds >= POLL_STALE_SECONDS {
+        return (bar_with_label("STALE"), Color::Red);
+    }
+
+    if seconds > POLL_SECONDS {
+        let late = seconds - POLL_SECONDS;
+        let label = if late < 60 {
+            format!("+{late}s")
+        } else {
+            format!("+{}m", late / 60)
+        };
+        return (bar_with_label(&label), Color::Yellow);
+    }
+
+    let filled = ((seconds.saturating_mul(10) / POLL_SECONDS) as usize).min(10);
+    (
+        format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled)),
+        DIM,
+    )
+}
+
+fn format_snooze_remaining(remaining: std::time::Duration) -> String {
+    let minutes = remaining.as_secs().saturating_add(59) / 60;
+    if minutes >= 60 {
+        format!("N:{}h{:02}", minutes / 60, minutes % 60)
+    } else {
+        format!("N:{}m", minutes.max(1))
+    }
+}
+
+fn ntfy_indicator(app: &App) -> (String, Color) {
+    let (label, colour) = if !app.session.config.ntfy.enabled() {
+        (String::new(), DIM)
+    } else if let Some(remaining) = app.ntfy_snooze_remaining() {
+        (format_snooze_remaining(remaining), Color::Red)
+    } else {
+        ("NTFY ON".to_string(), Color::White)
+    };
+
+    // Fixed 7-column slot: "NTFY ON" and the longest snooze form "N:24h00"
+    // both fit exactly, so neighbouring status fields never jump.
+    (format!("{label:<7}"), colour)
+}
+
 /// Key hints for whatever currently has focus.
 fn context_hints(app: &App) -> &'static str {
     if let Some(overlay) = &app.overlay {
@@ -229,6 +270,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Attachments => "1-9 save · Esc close",
             Overlay::React => "1-7 react · Esc close",
             Overlay::Presence => "1-6 set · c clear · Esc close",
+            Overlay::NtfySnooze { .. } => "j/k choose · Enter apply · c/0 resume · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::CalendarEvent => "o open meeting · Esc close",
@@ -565,10 +607,7 @@ pub fn conversation_lines(
         if m.deleted_date_time.is_some() {
             lines.push(lead(
                 normal_time_style,
-                vec![Span::styled(
-                    "(message deleted)",
-                    Style::default().fg(DIM),
-                )],
+                vec![Span::styled("(message deleted)", Style::default().fg(DIM))],
             ));
             prev = None; // a deletion breaks the run
             continue;
@@ -721,14 +760,9 @@ fn calendar_local_datetime(
         return Some(parsed.with_timezone(&chrono::Local));
     }
 
-    let naive = chrono::NaiveDateTime::parse_from_str(
-        &value.date_time,
-        "%Y-%m-%dT%H:%M:%S%.f",
-    )
-    .or_else(|_| {
-        chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S")
-    })
-    .ok()?;
+    let naive = chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&value.date_time, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
 
     Some(
         chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
@@ -781,8 +815,7 @@ fn calendar_response_label(event: &m365_core::models::Event) -> &'static str {
         "tentative"
     } else if response.eq_ignore_ascii_case("declined") {
         "declined"
-    } else if response.eq_ignore_ascii_case("notResponded")
-        || response.eq_ignore_ascii_case("none")
+    } else if response.eq_ignore_ascii_case("notResponded") || response.eq_ignore_ascii_case("none")
     {
         "waiting"
     } else if response.eq_ignore_ascii_case("organizer") {
@@ -851,16 +884,19 @@ fn calendar_plain_line(event: &m365_core::models::Event, show_day: bool) -> Stri
     };
     let time = calendar_time_label(event);
     let marker = calendar_response_marker(event).0;
-    let meeting = if calendar_has_join_url(event) { "M" } else { " " };
+    let meeting = if calendar_has_join_url(event) {
+        "M"
+    } else {
+        " "
+    };
     let subject = event.subject.as_deref().unwrap_or("(no subject)");
     format!("{day}  {time:<11}  [{marker}] [{meeting}] {subject}")
 }
 
 fn calendar_month_first_ui(offset: i32) -> chrono::NaiveDate {
     let today = chrono::Local::now().date_naive();
-    let month_index = chrono::Datelike::year(&today) * 12
-        + chrono::Datelike::month0(&today) as i32
-        + offset;
+    let month_index =
+        chrono::Datelike::year(&today) * 12 + chrono::Datelike::month0(&today) as i32 + offset;
     let year = month_index.div_euclid(12);
     let month = month_index.rem_euclid(12) as u32 + 1;
     chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid calendar month")
@@ -910,10 +946,7 @@ fn calendar_event_date_range(
     Some((start_date, end_date, start))
 }
 
-fn calendar_month_event_style(
-    event: &m365_core::models::Event,
-    selected: bool,
-) -> Style {
+fn calendar_month_event_style(event: &m365_core::models::Event, selected: bool) -> Style {
     let color = if event.is_cancelled.unwrap_or(false) {
         Color::DarkGray
     } else if event.is_organizer.unwrap_or(false) {
@@ -948,9 +981,7 @@ fn calendar_month_event_style(
 
     let mut style = Style::default().fg(foreground).bg(color);
     if selected {
-        style = style.add_modifier(
-            Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED,
-        );
+        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED);
     } else if calendar_needs_response(event) {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -995,12 +1026,11 @@ fn render_calendar_month_panel(
 
     if widths.iter().any(|width| *width < 5) || inner_height < 19 {
         f.render_widget(
-            Paragraph::new("Window too small for month view.")
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(first.format("%B %Y").to_string()),
-                ),
+            Paragraph::new("Window too small for month view.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(first.format("%B %Y").to_string()),
+            ),
             area,
         );
         return;
@@ -1061,12 +1091,8 @@ fn render_calendar_month_panel(
             } else {
                 week_end
             };
-            let start_day = visible_start
-                .signed_duration_since(week_start)
-                .num_days() as usize;
-            let end_day = visible_end
-                .signed_duration_since(week_start)
-                .num_days() as usize;
+            let start_day = visible_start.signed_duration_since(week_start).num_days() as usize;
+            let end_day = visible_end.signed_duration_since(week_start).num_days() as usize;
 
             let mut mask = 0u8;
             for day in start_day..=end_day {
@@ -1093,14 +1119,9 @@ fn render_calendar_month_panel(
                 dates.push(Span::styled("│", Style::default().fg(DIM)));
             }
             let date = week_start + chrono::Duration::days(day as i64);
-            let in_month =
-                chrono::Datelike::month(&date) == chrono::Datelike::month(&first);
+            let in_month = chrono::Datelike::month(&date) == chrono::Datelike::month(&first);
             let label = if overflow[day] > 0 {
-                format!(
-                    "{} +{}",
-                    chrono::Datelike::day(&date),
-                    overflow[day]
-                )
+                format!("{} +{}", chrono::Datelike::day(&date), overflow[day])
             } else {
                 chrono::Datelike::day(&date).to_string()
             };
@@ -1265,7 +1286,11 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 "      ".into()
             };
-            let meeting = if calendar_has_join_url(event) { "M" } else { " " };
+            let meeting = if calendar_has_join_url(event) {
+                "M"
+            } else {
+                " "
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{day}  "),
@@ -1276,20 +1301,24 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw(format!("{:<11}  ", calendar_time_label(event))),
                 Span::styled(
                     format!("[{marker}] "),
-                    Style::default().fg(marker_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(marker_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("[{meeting}] "),
                     if meeting == "M" {
-                        Style::default()
-                            .fg(ACCENT)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(DIM)
                     },
                 ),
                 Span::styled(
-                    event.subject.as_deref().unwrap_or("(no subject)").to_string(),
+                    event
+                        .subject
+                        .as_deref()
+                        .unwrap_or("(no subject)")
+                        .to_string(),
                     if calendar_needs_response(event) {
                         Style::default()
                             .fg(Color::Yellow)
@@ -1303,7 +1332,9 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let items = if items.is_empty() {
-        vec![ListItem::new("No events in the next 7 days (or still loading).")]
+        vec![ListItem::new(
+            "No events in the next 7 days (or still loading).",
+        )]
     } else {
         items
     };
@@ -1485,28 +1516,24 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             );
         }
         TeamsMode::Channels => {
-            let (title, items, sel): (&str, Vec<ListItem>, usize) =
-                if app.teams.channels.is_empty() {
-                    let items = app
-                        .teams
-                        .teams
-                        .iter()
-                        .map(|t| {
-                            ListItem::new(truncate(t.display_name.as_deref().unwrap_or(""), 30))
-                        })
-                        .collect();
-                    ("Teams (Enter→channels)", items, app.teams.team_sel)
-                } else {
-                    let items = app
-                        .teams
-                        .channels
-                        .iter()
-                        .map(|c| {
-                            ListItem::new(truncate(c.display_name.as_deref().unwrap_or(""), 30))
-                        })
-                        .collect();
-                    ("Channels (t→chats)", items, app.teams.channel_sel)
-                };
+            let (title, items, sel): (&str, Vec<ListItem>, usize) = if app.teams.channels.is_empty()
+            {
+                let items = app
+                    .teams
+                    .teams
+                    .iter()
+                    .map(|t| ListItem::new(truncate(t.display_name.as_deref().unwrap_or(""), 30)))
+                    .collect();
+                ("Teams (Enter→channels)", items, app.teams.team_sel)
+            } else {
+                let items = app
+                    .teams
+                    .channels
+                    .iter()
+                    .map(|c| ListItem::new(truncate(c.display_name.as_deref().unwrap_or(""), 30)))
+                    .collect();
+                ("Channels (t→chats)", items, app.teams.channel_sel)
+            };
 
             let mut state = ListState::default();
             state.select(Some(sel));
@@ -1534,8 +1561,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
-    let previewing =
-        app.teams.focus == TeamsFocus::List && app.teams.preview_chat_id.is_some();
+    let previewing = app.teams.focus == TeamsFocus::List && app.teams.preview_chat_id.is_some();
     let title = if previewing {
         "Conversation preview · cached".to_string()
     } else if app.teams.unseen > 0 {
@@ -1697,8 +1723,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         // Apply it for a single inline image so the image aligns
                         // with the message body rather than the pane border.
                         let text_indent = if teams_image_count == 1 {
-                            (TIME_WIDTH as u16 + 3)
-                                .min(area.width.saturating_sub(fitted.width))
+                            (TIME_WIDTH as u16 + 3).min(area.width.saturating_sub(fitted.width))
                         } else {
                             0
                         };
@@ -1790,7 +1815,11 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 // ---------------------------------------------------------------------------
 
 fn calendar_event_detail(event: &m365_core::models::Event) -> Vec<Line<'static>> {
-    let subject = event.subject.as_deref().unwrap_or("(no subject)").to_string();
+    let subject = event
+        .subject
+        .as_deref()
+        .unwrap_or("(no subject)")
+        .to_string();
     let date = event
         .start
         .as_ref()
@@ -1902,10 +1931,12 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let area = centered(66, 30, f.area());
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(format!("{message}\n\nAny key dismisses · auto-closes in 3s"))
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(Color::Yellow))
-                    .block(popup_block("Calendar notice")),
+                Paragraph::new(format!(
+                    "{message}\n\nAny key dismisses · auto-closes in 3s"
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Yellow))
+                .block(popup_block("Calendar notice")),
                 area,
             );
         }
@@ -1917,7 +1948,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F1 Outlook · F2 Teams · F3 Calendar · F5 force poll · Ctrl+P palette · p presence · ? help · q quit\n\
+ Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · Ctrl+P palette · p presence · ? help · q quit\n\
+ \n\
+ NTFY:    F4 menu · j/k choose · Enter apply · c/0 resume now · Esc cancel\n\
+          Snooze: 1h · 2h · 4h · 8h · 12h · 24h · Resume now\n\
  \n\
  Links:   o list links in the message · 1-9 open in browser\n\
  Attach:  A list attachments · 1-9 save to your Downloads folder\n\
@@ -2135,6 +2169,63 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 })
                 .collect();
             f.render_widget(List::new(items), inner);
+        }
+        Overlay::NtfySnooze { sel } => {
+            let area = centered(42, 50, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("ntfy snooze — F4");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min((NTFY_SNOOZE_HOURS.len() + 1) as u16),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            let current = app
+                .ntfy_snooze_remaining()
+                .map(|remaining| format!("Current: {}", format_snooze_remaining(remaining)))
+                .unwrap_or_else(|| "Current: no snooze".to_string());
+            f.render_widget(
+                Paragraph::new(Span::styled(current, Style::default().fg(Color::Gray))),
+                rows[0],
+            );
+
+            let mut items: Vec<ListItem> = NTFY_SNOOZE_HOURS
+                .iter()
+                .map(|hours| {
+                    ListItem::new(format!(
+                        "{hours} hour{}",
+                        if *hours == 1 { "" } else { "s" }
+                    ))
+                })
+                .collect();
+            items.push(ListItem::new("Resume now"));
+            let mut state = ListState::default();
+            state.select(Some((*sel).min(NTFY_SNOOZE_HOURS.len())));
+            f.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▏"),
+                rows[1],
+                &mut state,
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "Enter set · c/0 resume now · Esc cancel",
+                    Style::default().fg(DIM),
+                )),
+                rows[2],
+            );
         }
         Overlay::Presence => {
             let area = centered(46, 55, f.area());
@@ -2406,14 +2497,25 @@ fn day_separator(label: &str) -> Line<'static> {
     ])
 }
 
-/// Tab-bar presence dot symbol + availability label.
-fn presence_indicator(app: &App) -> (&'static str, String) {
+fn compact_presence_label(availability: Option<&str>) -> &'static str {
+    match availability.unwrap_or("") {
+        "Available" | "AvailableIdle" => "Avail",
+        "Busy" | "BusyIdle" => "Busy ",
+        "DoNotDisturb" => "DND  ",
+        "Away" => "Away ",
+        "BeRightBack" => "BRB  ",
+        "Offline" => "Off  ",
+        _ => "…    ",
+    }
+}
+
+/// Tab-bar presence uses a fixed compact 7-column slot: dot, space, 5-char label.
+fn presence_indicator(app: &App) -> (&'static str, &'static str) {
     let avail = app
         .my_presence
         .as_ref()
-        .and_then(|p| p.availability.clone())
-        .unwrap_or_else(|| "…".into());
-    ("●", avail)
+        .and_then(|p| p.availability.as_deref());
+    ("●", compact_presence_label(avail))
 }
 
 fn presence_style(app: &App) -> Style {
@@ -2582,6 +2684,56 @@ mod tests {
 }
 
 #[cfg(test)]
+mod ntfy_status_tests {
+    use super::{compact_presence_label, format_snooze_remaining, poll_indicator};
+
+    #[test]
+    fn poll_indicator_keeps_normal_bar_then_reports_late_and_stale() {
+        assert_eq!(
+            poll_indicator(std::time::Duration::from_secs(18)).0,
+            "[█████████░]"
+        );
+        assert_eq!(
+            poll_indicator(std::time::Duration::from_secs(22)).0,
+            "[███+2s████]"
+        );
+        assert_eq!(
+            poll_indicator(std::time::Duration::from_secs(120)).0,
+            "[██STALE███]"
+        );
+    }
+
+    #[test]
+    fn snooze_status_is_compact() {
+        assert_eq!(
+            format_snooze_remaining(std::time::Duration::from_secs(47 * 60)),
+            "N:47m"
+        );
+        assert_eq!(
+            format_snooze_remaining(std::time::Duration::from_secs(97 * 60)),
+            "N:1h37"
+        );
+    }
+
+    #[test]
+    fn presence_labels_have_fixed_compact_width() {
+        for (availability, expected) in [
+            (Some("Available"), "Avail"),
+            (Some("Busy"), "Busy "),
+            (Some("DoNotDisturb"), "DND  "),
+            (Some("Away"), "Away "),
+            (Some("BeRightBack"), "BRB  "),
+            (Some("Offline"), "Off  "),
+            (None, "…    "),
+        ] {
+            let label = compact_presence_label(availability);
+            assert_eq!(label, expected);
+            assert_eq!(label.chars().count(), 5);
+        }
+    }
+}
+
+#[cfg(test)]
 mod calendar_meeting_indicator_tests {
     use super::{calendar_has_join_url, calendar_plain_line, calendar_response_marker};
     use m365_core::models::Event;
@@ -2624,11 +2776,9 @@ mod calendar_meeting_indicator_tests {
 
     #[test]
     fn organizer_and_cancelled_flags_do_not_hide_join_links() {
-        for (organizer, cancelled, marker) in [
-            (true, false, "O"),
-            (false, true, "!"),
-            (true, true, "!"),
-        ] {
+        for (organizer, cancelled, marker) in
+            [(true, false, "O"), (false, true, "!"), (true, true, "!")]
+        {
             let event: Event = serde_json::from_value(json!({
                 "id": "test",
                 "isOrganizer": organizer,
