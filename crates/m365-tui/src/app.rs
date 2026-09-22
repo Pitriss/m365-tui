@@ -1000,7 +1000,13 @@ fn store_ui_state(
     std::fs::rename(temp_path, final_path)
 }
 
-fn ntfy_snooze_state_path() -> Option<std::path::PathBuf> {
+fn ntfy_snooze_state_path(token_cache_path: &std::path::Path) -> std::path::PathBuf {
+    // Keep persistent application state beside the already-established token
+    // cache. This also honours a custom M365_TOKEN_CACHE path automatically.
+    token_cache_path.with_file_name(NTFY_SNOOZE_STATE_FILE)
+}
+
+fn legacy_ntfy_snooze_state_path() -> Option<std::path::PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
@@ -1022,9 +1028,19 @@ fn ntfy_snooze_remaining_at(
     (!remaining.is_zero()).then_some(remaining)
 }
 
-fn load_ntfy_snooze_until() -> Option<std::time::SystemTime> {
-    let path = ntfy_snooze_state_path()?;
-    let text = match std::fs::read_to_string(&path) {
+fn remove_file_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn load_ntfy_snooze_file(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::SystemTime> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
@@ -1043,34 +1059,35 @@ fn load_ntfy_snooze_until() -> Option<std::time::SystemTime> {
                 "invalid ntfy snooze state {}: {error}; discarding it",
                 path.display()
             );
-            let _ = std::fs::remove_file(&path);
+            let _ = remove_file_if_present(path);
             return None;
         }
     };
-    let until = std::time::SystemTime::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(epoch_seconds))?;
 
-    if ntfy_snooze_remaining_at(Some(until), std::time::SystemTime::now()).is_none() {
-        let _ = std::fs::remove_file(&path);
+    let Some(until) = std::time::SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(epoch_seconds))
+    else {
+        tracing::warn!(
+            "invalid ntfy snooze deadline in {}; discarding it",
+            path.display()
+        );
+        let _ = remove_file_if_present(path);
+        return None;
+    };
+
+    if ntfy_snooze_remaining_at(Some(until), now).is_none() {
+        let _ = remove_file_if_present(path);
         return None;
     }
 
     Some(until)
 }
 
-fn store_ntfy_snooze_until(until: Option<std::time::SystemTime>) -> std::io::Result<()> {
-    let Some(path) = ntfy_snooze_state_path() else {
-        return Ok(());
-    };
-
-    let Some(until) = until else {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        };
-    };
-
+fn store_ntfy_snooze_until(
+    token_cache_path: &std::path::Path,
+    until: std::time::SystemTime,
+) -> std::io::Result<()> {
+    let path = ntfy_snooze_state_path(token_cache_path);
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -1080,7 +1097,96 @@ fn store_ntfy_snooze_until(until: Option<std::time::SystemTime>) -> std::io::Res
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    write_private_cache_file(&path, format!("{epoch_seconds}\n").as_bytes())
+    let data = format!(
+        "{epoch_seconds}
+"
+    );
+
+    // Write through a private temporary file, then replace the final state.
+    // An application crash therefore cannot leave a partially written deadline.
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    write_private_cache_file(&temp_path, data.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        std::fs::rename(&temp_path, &path)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            remove_file_if_present(&path)?;
+        }
+        std::fs::rename(&temp_path, &path)?;
+    }
+
+    Ok(())
+}
+
+fn clear_ntfy_snooze_state(token_cache_path: &std::path::Path) -> std::io::Result<()> {
+    let primary = ntfy_snooze_state_path(token_cache_path);
+    remove_file_if_present(&primary)?;
+
+    // Also clear the short-lived legacy location so Resume now cannot cause a
+    // previously persisted snooze to reappear after the next restart.
+    if let Some(legacy) = legacy_ntfy_snooze_state_path() {
+        if legacy != primary {
+            remove_file_if_present(&legacy)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn load_ntfy_snooze_until(token_cache_path: &std::path::Path) -> Option<std::time::SystemTime> {
+    let now = std::time::SystemTime::now();
+    let primary = ntfy_snooze_state_path(token_cache_path);
+
+    if let Some(until) = load_ntfy_snooze_file(&primary, now) {
+        if let Some(remaining) = ntfy_snooze_remaining_at(Some(until), now) {
+            tracing::info!(
+                "restored ntfy snooze from {} ({}m remaining)",
+                primary.display(),
+                remaining.as_secs().div_ceil(60)
+            );
+        }
+        return Some(until);
+    }
+
+    let legacy = legacy_ntfy_snooze_state_path()?;
+    if legacy == primary {
+        return None;
+    }
+
+    let until = load_ntfy_snooze_file(&legacy, now)?;
+
+    match store_ntfy_snooze_until(token_cache_path, until) {
+        Ok(()) => {
+            if let Err(error) = remove_file_if_present(&legacy) {
+                tracing::warn!(
+                    "ntfy snooze migrated but old state {} could not be removed: {error}",
+                    legacy.display()
+                );
+            } else {
+                tracing::info!(
+                    "migrated ntfy snooze state from {} to {}",
+                    legacy.display(),
+                    primary.display()
+                );
+            }
+        }
+        Err(error) => {
+            // Keep using the valid legacy deadline in memory. The legacy file
+            // stays in place so migration can be retried on the next launch.
+            tracing::warn!(
+                "could not migrate ntfy snooze state from {} to {}: {error}",
+                legacy.display(),
+                primary.display()
+            );
+        }
+    }
+
+    Some(until)
 }
 
 fn next_poll_retry_interval(current: u64) -> u64 {
@@ -1524,7 +1630,7 @@ impl App {
             ..TeamsState::default()
         };
 
-        let ntfy_snooze_until = load_ntfy_snooze_until();
+        let ntfy_snooze_until = load_ntfy_snooze_until(&session.config.token_cache_path);
 
         let mut app = Self {
             session,
@@ -4071,7 +4177,12 @@ impl App {
     }
 
     fn persist_ntfy_snooze(&self) {
-        if let Err(error) = store_ntfy_snooze_until(self.ntfy_snooze_until) {
+        let result = match self.ntfy_snooze_until {
+            Some(until) => store_ntfy_snooze_until(&self.session.config.token_cache_path, until),
+            None => clear_ntfy_snooze_state(&self.session.config.token_cache_path),
+        };
+
+        if let Err(error) = result {
             tracing::warn!("could not persist ntfy snooze state: {error}");
         }
     }
@@ -5746,10 +5857,7 @@ mod ntfy_category_tag_tests {
     #[test]
     fn maps_notification_categories_to_ntfy_emoji_tags() {
         assert_eq!(ntfy_tag_for_category("Mail"), Some("email"));
-        assert_eq!(
-            ntfy_tag_for_category("Teams"),
-            Some("speech_balloon")
-        );
+        assert_eq!(ntfy_tag_for_category("Teams"), Some("speech_balloon"));
         assert_eq!(ntfy_tag_for_category("Calendar"), Some("calendar"));
         assert_eq!(ntfy_tag_for_category("Unknown"), None);
     }
@@ -5785,6 +5893,67 @@ mod ntfy_snooze_poll_tests {
         );
         assert_eq!(ntfy_snooze_remaining_at(Some(until), until), None);
         assert_eq!(ntfy_snooze_remaining_at(None, now), None);
+    }
+
+    #[test]
+    fn snooze_state_uses_token_cache_directory_and_round_trips_deadline() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "m365-tui-ntfy-snooze-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let token_cache = dir.join("token-cache.json");
+        let state_path = super::ntfy_snooze_state_path(&token_cache);
+        assert_eq!(state_path, dir.join("ntfy-snooze"));
+
+        let until = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        super::store_ntfy_snooze_until(&token_cache, until).unwrap();
+        assert!(state_path.exists());
+
+        let loaded =
+            super::load_ntfy_snooze_file(&state_path, std::time::SystemTime::now()).unwrap();
+        assert_eq!(
+            loaded
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            until
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expired_or_malformed_snooze_state_is_removed() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "m365-tui-ntfy-snooze-invalid-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ntfy-snooze");
+
+        std::fs::write(&path, b"not-an-epoch\n").unwrap();
+        assert!(super::load_ntfy_snooze_file(&path, std::time::SystemTime::now()).is_none());
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"1\n").unwrap();
+        assert!(super::load_ntfy_snooze_file(&path, std::time::SystemTime::now()).is_none());
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
