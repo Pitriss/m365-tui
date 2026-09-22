@@ -1400,6 +1400,15 @@ fn ntfy_mode_should_forward(
     }
 }
 
+fn ntfy_tag_for_category(category: &str) -> Option<&'static str> {
+    match category {
+        "Mail" => Some("email"),
+        "Teams" => Some("speech_balloon"),
+        "Calendar" => Some("calendar"),
+        _ => None,
+    }
+}
+
 fn calendar_reminder_threshold_minutes(seconds_until: i64) -> Option<u16> {
     match seconds_until {
         1..=300 => Some(5),
@@ -4108,7 +4117,7 @@ impl App {
         )
     }
 
-    fn send_notification(&self, _category: &'static str, title: String, body: String) {
+    fn send_notification(&self, category: &'static str, title: String, body: String) {
         if self.session.config.notifications {
             crate::notify::send(&title, &body);
         }
@@ -4125,10 +4134,11 @@ impl App {
             return;
         };
         let token = self.session.config.ntfy_token.clone();
+        let tag = ntfy_tag_for_category(category);
 
         tokio::spawn(async move {
             if let Err(error) =
-                m365_core::ntfy::send(&server, &topic, token.as_deref(), &title, &body).await
+                m365_core::ntfy::send(&server, &topic, token.as_deref(), tag, &title, &body).await
             {
                 tracing::warn!("ntfy forwarding failed: {error:#}");
             }
@@ -5727,6 +5737,22 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
         })
         .copied()
         .collect()
+}
+
+#[cfg(test)]
+mod ntfy_category_tag_tests {
+    use super::ntfy_tag_for_category;
+
+    #[test]
+    fn maps_notification_categories_to_ntfy_emoji_tags() {
+        assert_eq!(ntfy_tag_for_category("Mail"), Some("email"));
+        assert_eq!(
+            ntfy_tag_for_category("Teams"),
+            Some("speech_balloon")
+        );
+        assert_eq!(ntfy_tag_for_category("Calendar"), Some("calendar"));
+        assert_eq!(ntfy_tag_for_category("Unknown"), None);
+    }
 }
 
 #[cfg(test)]

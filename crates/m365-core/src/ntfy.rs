@@ -9,14 +9,11 @@ pub async fn send(
     server: &str,
     topic: &str,
     token: Option<&str>,
+    tag: Option<&str>,
     title: &str,
     body: &str,
 ) -> Result<()> {
-    let payload = serde_json::json!({
-        "topic": topic,
-        "title": title,
-        "message": summarise(body),
-    });
+    let payload = message_payload(topic, tag, title, body);
 
     let client = reqwest::Client::new();
     let mut request = client
@@ -45,6 +42,25 @@ pub async fn send(
     Ok(())
 }
 
+fn message_payload(
+    topic: &str,
+    tag: Option<&str>,
+    title: &str,
+    body: &str,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "topic": topic,
+        "title": title,
+        "message": summarise(body),
+    });
+
+    if let Some(tag) = tag.map(str::trim).filter(|tag| !tag.is_empty()) {
+        payload["tags"] = serde_json::json!([tag]);
+    }
+
+    payload
+}
+
 fn summarise(body: &str) -> String {
     let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= 140 {
@@ -64,6 +80,15 @@ mod tests {
         assert_eq!(summarise("hello\n\n  world   again "), "hello world again");
         let long = summarise(&"x".repeat(500));
         assert_eq!(long.chars().count(), 138);
+    }
+
+    #[test]
+    fn payload_encodes_optional_ntfy_tag_as_array() {
+        let tagged = message_payload("m365", Some("email"), "Subject", "Body");
+        assert_eq!(tagged["tags"], serde_json::json!(["email"]));
+
+        let plain = message_payload("m365", None, "Subject", "Body");
+        assert!(plain.get("tags").is_none());
     }
 
     #[tokio::test]
@@ -121,6 +146,7 @@ mod tests {
             assert_eq!(json["topic"], "m365");
             assert_eq!(json["title"], "Test title");
             assert_eq!(json["message"], "hello world");
+            assert_eq!(json["tags"], serde_json::json!(["email"]));
 
             stream
                 .write_all(
@@ -134,6 +160,7 @@ mod tests {
             &server,
             "m365",
             Some("secret-token"),
+            Some("email"),
             "Test title",
             "hello\nworld",
         )
