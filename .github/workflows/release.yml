@@ -1,13 +1,18 @@
 name: release
 
-# Build and publish a GitHub Release when explicitly dispatched.
-# CI dispatches this workflow only after all required checks succeed on main.
+# Build and publish a versioned GitHub Release when explicitly dispatched.
+# CI dispatches this workflow only after all required checks succeed on main
+# and an existing vX.Y.Z tag points at the exact tested commit.
 on:
   workflow_dispatch:
     inputs:
       commit_sha:
         description: Commit SHA to build and publish
-        required: false
+        required: true
+        type: string
+      release_tag:
+        description: Existing version tag to publish, for example v1.6.1
+        required: true
         type: string
 
 permissions:
@@ -26,23 +31,41 @@ jobs:
       - name: Checkout CI-tested commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.commit_sha || github.sha }}
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
 
-      - name: Generate release metadata
+      - name: Validate release metadata
         id: meta
         shell: bash
         env:
           REQUESTED_SHA: ${{ inputs.commit_sha }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
 
-          commit="${REQUESTED_SHA:-$GITHUB_SHA}"
-          short_sha="${commit::7}"
-          tag="build-${GITHUB_RUN_NUMBER}-${short_sha}"
-          name="$(git log -1 --format=%s "$commit")"
+          commit="$REQUESTED_SHA"
+          tag="$REQUESTED_TAG"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+
+          if [ "$tag" != "v${version}" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
+          if [ "$(git rev-parse HEAD)" != "$commit" ]; then
+            echo "::error::Checked-out commit does not match requested commit $commit"
+            exit 1
+          fi
+
+          git fetch --quiet --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          if [ "$tag_commit" != "$commit" ]; then
+            echo "::error::Tag $tag points to $tag_commit, expected $commit"
+            exit 1
+          fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "name=m365-tui ${version}" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   build:
