@@ -37,7 +37,7 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use m365_core::events::ChangeEvent;
-use m365_core::{subscriptions, DeviceCodePrompt, Session};
+use m365_core::{subscriptions, teams_presence, DeviceCodePrompt, Session};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -51,6 +51,7 @@ enum Command {
     Tui,
     WhoAmI,
     Login,
+    TeamsConsentProbe,
 }
 
 const USAGE: &str = "\
@@ -61,8 +62,9 @@ USAGE:
 
 COMMANDS:
     (none)      launch the TUI
-    login       sign in and cache the token, then exit
-    whoami      print the signed-in account, then exit
+    login                sign in and cache the Graph token, then exit
+    whoami               print the signed-in account, then exit
+    teams-consent-probe   one-off Teams/Skype resource consent diagnostic
 
 OPTIONS:
     -h, --help     print this help
@@ -76,6 +78,7 @@ fn parse_args() -> Command {
         None => Command::Tui,
         Some("whoami") => Command::WhoAmI,
         Some("login") => Command::Login,
+        Some("teams-consent-probe") => Command::TeamsConsentProbe,
         Some("-h") | Some("--help") | Some("help") => {
             println!("{USAGE}");
             std::process::exit(0);
@@ -109,6 +112,20 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The Teams resource-consent diagnostic is intentionally isolated from
+    // the normal Graph login/cache. It never writes the primary token cache and
+    // requests no refresh token of its own.
+    if matches!(&command, Command::TeamsConsentProbe) {
+        let result = teams_presence::consent_probe(&session.auth, |p| {
+            print_teams_consent_prompt(&p)
+        })
+        .await;
+        print_diagnostic_step("Interactive consent", &result.interactive_consent);
+        print_diagnostic_step("Existing Graph refresh token", &result.existing_refresh_token);
+        println!("Primary Graph token cache: untouched");
+        return Ok(());
+    }
+
     // Device-code login up front (prints the code to stdout, before the TUI).
     session
         .ensure_logged_in(|p: DeviceCodePrompt| print_device_prompt(&p))
@@ -129,6 +146,7 @@ async fn main() -> Result<()> {
             println!("signed in — token cached.");
             Ok(())
         }
+        Command::TeamsConsentProbe => unreachable!("handled before primary Graph login"),
         Command::Tui => run_tui(session).await,
     }
 }
@@ -141,6 +159,27 @@ fn print_device_prompt(p: &DeviceCodePrompt) {
     println!("──────────────────────────────────────────────");
     println!(" {}", p.message);
     println!(" (waiting for you to finish in the browser…)\n");
+}
+
+fn print_teams_consent_prompt(p: &DeviceCodePrompt) {
+    println!("\n──────────────────────────────────────────────");
+    println!(" Teams/Skype resource consent diagnostic");
+    println!(" 1. Open: {}", p.verification_uri);
+    println!(" 2. Enter code: {}", p.user_code);
+    println!("──────────────────────────────────────────────");
+    println!(" This one-off flow does NOT modify the local Graph token cache.");
+    println!(" The issued resource token is discarded after consent.");
+    println!(" (waiting for you to finish in the browser…)\n");
+}
+
+fn print_diagnostic_step(label: &str, step: &teams_presence::DiagnosticStep) {
+    match step {
+        teams_presence::DiagnosticStep::Ok(detail) => println!("{label}: OK — {detail}"),
+        teams_presence::DiagnosticStep::Skipped(detail) => {
+            println!("{label}: skipped — {detail}")
+        }
+        teams_presence::DiagnosticStep::Error(detail) => println!("{label}: ERROR — {detail}"),
+    }
 }
 
 async fn run_tui(session: Session) -> Result<()> {

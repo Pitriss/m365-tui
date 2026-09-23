@@ -16,12 +16,17 @@ use m365_core::models::{
     Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Person, Presence,
     SystemEventClass, Team, User,
 };
-use m365_core::{calendar, channels, chats, mail, people, work_plan, Session};
+use m365_core::{
+    calendar, channels, chats, mail, people, teams_presence, work_plan, Session,
+};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
 use crate::content;
-use crate::diagnostics::{DiagnosticsRemote, DiagnosticsState};
+use crate::diagnostics::{
+    ContactDiagnosticsRemote, ContactDiagnosticsState, DiagnosticsRemote, DiagnosticsState,
+    PresenceProbe,
+};
 use crate::editor::TextInput;
 use crate::navigation;
 
@@ -103,6 +108,8 @@ pub enum AppMessage {
     NtfyWorkPlan(bool),
     /// Fresh read-only data for the F6 diagnostics overlay.
     DiagnosticsLoaded(DiagnosticsRemote),
+    /// Fresh read-only data for the selected-contact F7 diagnostics overlay.
+    ContactDiagnosticsLoaded(ContactDiagnosticsRemote),
     /// Newest inbox messages, fetched purely to drive notifications.
     InboxPeek(Vec<MailMessage>),
     /// Attachments of the open mail message.
@@ -167,6 +174,7 @@ pub enum Overlay {
     Notice(String),
     Help,
     Diagnostics,
+    ContactDiagnostics,
     Palette {
         query: String,
         sel: usize,
@@ -637,6 +645,20 @@ pub struct App {
     pub diagnostics_scroll: u16,
     /// Largest useful diagnostics scroll offset, set by the renderer.
     pub diagnostics_max_scroll: std::cell::Cell<u16>,
+    /// Read-only F7 diagnostics for the selected Teams 1:1 contact.
+    pub contact_diagnostics: ContactDiagnosticsState,
+    /// Current vertical scroll offset of the contact diagnostics overlay.
+    pub contact_diagnostics_scroll: u16,
+    /// Largest useful contact diagnostics scroll offset, set by the renderer.
+    pub contact_diagnostics_max_scroll: std::cell::Cell<u16>,
+    /// Raw Graph user id used only for the live F7 probe; never rendered/exported.
+    contact_diagnostics_user_id: Option<String>,
+    /// Raw Teams user MRI candidate retained only for read-only UPS probing.
+    /// The value is never rendered or exported.
+    contact_diagnostics_mri: Option<String>,
+    /// Raw lookup address used only by the read-only Middle Tier diagnostics.
+    /// The value is never rendered, logged, or exported.
+    contact_diagnostics_lookup_address: Option<String>,
     /// Contact profile currently shown by Teams `g`.
     pub contact_profile: Option<ContactProfileState>,
     /// Vertical scroll offset for the contact profile.
@@ -1732,6 +1754,12 @@ impl App {
             diagnostics: DiagnosticsState::default(),
             diagnostics_scroll: 0,
             diagnostics_max_scroll: std::cell::Cell::new(0),
+            contact_diagnostics: ContactDiagnosticsState::default(),
+            contact_diagnostics_scroll: 0,
+            contact_diagnostics_max_scroll: std::cell::Cell::new(0),
+            contact_diagnostics_user_id: None,
+            contact_diagnostics_mri: None,
+            contact_diagnostics_lookup_address: None,
             contact_profile: None,
             contact_profile_scroll: 0,
             contact_profile_max_scroll: std::cell::Cell::new(0),
@@ -1895,6 +1923,299 @@ impl App {
         self.diagnostics_scroll = 0;
         self.overlay = Some(Overlay::Diagnostics);
         self.refresh_diagnostics();
+    }
+
+    fn open_contact_diagnostics(&mut self) {
+        if self.screen != Screen::Teams || self.teams.mode != TeamsMode::Chats {
+            self.status = "F7 contact diagnostics needs the Teams chat list".into();
+            return;
+        }
+
+        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+            self.status = "select a Teams contact first".into();
+            return;
+        };
+        if !chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            self.status = "F7 contact diagnostics is available for one-to-one chats".into();
+            return;
+        }
+
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+        let peer_member = chat.members.iter().find(|member| {
+            me_id
+                .map(|id| member.user_id.as_deref() != Some(id))
+                .unwrap_or(true)
+        });
+        let preview_peer = chat
+            .last_message_preview
+            .as_ref()
+            .and_then(|preview| preview.from.as_ref())
+            .and_then(|from| from.user.as_ref())
+            .filter(|user| {
+                me_id
+                    .map(|id| user.id.as_deref() != Some(id))
+                    .unwrap_or(true)
+            });
+
+        let member_resource_id = peer_member
+            .and_then(|member| member.id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let member_id = peer_member
+            .and_then(|member| member.user_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let preview_id = preview_peer
+            .and_then(|user| user.id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let cached_id = self
+            .teams
+            .contact_user_ids
+            .get(&chat.id)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let member_guid = member_id.is_some_and(chats::looks_like_user_guid);
+        let preview_guid = preview_id.is_some_and(chats::looks_like_user_guid);
+        let cached_guid = cached_id.is_some_and(chats::looks_like_user_guid);
+
+        let member_id_shape = crate::diagnostics::identifier_shape(member_resource_id).to_string();
+        let member_user_id_shape = crate::diagnostics::identifier_shape(member_id).to_string();
+        let preview_id_shape = crate::diagnostics::identifier_shape(preview_id).to_string();
+        let cached_id_shape = crate::diagnostics::identifier_shape(cached_id).to_string();
+
+        let mri_candidates = [
+            ("member resource ID", member_resource_id),
+            ("member userId", member_id),
+            ("message sender ID", preview_id),
+            ("cached contact ID", cached_id),
+        ];
+        let (mri_candidate, mri_candidate_source) = mri_candidates
+            .into_iter()
+            .find(|(_, value)| crate::diagnostics::is_presence_mri_candidate(*value))
+            .map(|(source, value)| (value.map(str::to_string), source))
+            .unwrap_or((None, "none"));
+
+        let (probe_user_id, probe_source) = if cached_guid {
+            (cached_id.map(str::to_string), "cached contact ID")
+        } else if member_guid {
+            (member_id.map(str::to_string), "chat member")
+        } else if preview_guid {
+            (preview_id.map(str::to_string), "message sender")
+        } else {
+            (None, "none")
+        };
+
+        let lookup_address = peer_member
+            .and_then(|member| member.email.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let raw_member_type = peer_member.and_then(|member| member.odata_type.as_deref());
+        let member_type = raw_member_type
+            .map(|kind| {
+                kind.rsplit('.')
+                    .next()
+                    .unwrap_or(kind)
+                    .trim_start_matches('#')
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let personal = member_type.eq_ignore_ascii_case("microsoftAccountUserConversationMember");
+        let skype = member_type.eq_ignore_ascii_case("skypeUserConversationMember")
+            || member_type.eq_ignore_ascii_case("skypeForBusinessUserConversationMember");
+        let aad = member_type.eq_ignore_ascii_case("aadUserConversationMember");
+        let external = self.teams.external_chats.contains(&chat.id);
+
+        let peer_tenant = peer_member
+            .and_then(|member| member.tenant_id.as_deref())
+            .or_else(|| preview_peer.and_then(|user| user.tenant_id.as_deref()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let tenant_relation = match (self.teams.own_tenant_id.as_deref(), peer_tenant) {
+            (Some(own), Some(peer)) if own.eq_ignore_ascii_case(peer) => "same tenant",
+            (Some(_), Some(_)) => "external",
+            _ if external => "external",
+            _ => "unknown",
+        }
+        .to_string();
+
+        let account_type = if personal {
+            "Microsoft personal account"
+        } else if skype {
+            "Skype identity"
+        } else if aad && external {
+            "External / federated Entra user"
+        } else if aad {
+            "Organization user"
+        } else if external {
+            "External / federated identity"
+        } else {
+            "Unknown"
+        }
+        .to_string();
+
+        let presence_supported = !personal && !skype && probe_user_id.is_some();
+        let cross_tenant_candidate = external && presence_supported;
+
+        self.contact_diagnostics = ContactDiagnosticsState {
+            loading: true,
+            member_type,
+            account_type,
+            member_guid,
+            preview_guid,
+            cached_guid,
+            member_id_shape,
+            member_user_id_shape,
+            preview_id_shape,
+            cached_id_shape,
+            mri_candidate_source: mri_candidate_source.to_string(),
+            lookup_address_available: lookup_address.is_some(),
+            probe_source: probe_source.to_string(),
+            tenant_relation,
+            cross_tenant_candidate,
+            presence_supported,
+            remote: None,
+        };
+        self.contact_diagnostics_user_id = probe_user_id;
+        self.contact_diagnostics_mri = mri_candidate;
+        self.contact_diagnostics_lookup_address = lookup_address;
+        self.contact_diagnostics_scroll = 0;
+        self.overlay = Some(Overlay::ContactDiagnostics);
+        self.refresh_contact_diagnostics();
+    }
+
+    fn refresh_contact_diagnostics(&mut self) {
+        self.contact_diagnostics.loading = true;
+
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        let user_id = self.contact_diagnostics_user_id.clone();
+        let lookup_address = self.contact_diagnostics_lookup_address.clone();
+        let mri = self.contact_diagnostics_mri.clone();
+        let personal_account = self
+            .contact_diagnostics
+            .member_type
+            .eq_ignore_ascii_case("microsoftAccountUserConversationMember");
+        let enabled = self.session.config.presence_read;
+        let supported = self.contact_diagnostics.presence_supported;
+
+        tokio::spawn(async move {
+            let presence_read_all = match s.auth.access_token().await {
+                Ok(_) => s
+                    .auth
+                    .token_info()
+                    .await
+                    .map(|token| {
+                        token
+                            .scopes
+                            .iter()
+                            .any(|scope| scope.eq_ignore_ascii_case("Presence.Read.All"))
+                    })
+                    .ok_or_else(|| "token metadata unavailable".to_string()),
+                Err(error) => Err(crate::diagnostics::safe_graph_error(&error)),
+            };
+
+            let (batch, direct) = if !enabled {
+                (
+                    PresenceProbe::Skipped("disabled by configuration".into()),
+                    PresenceProbe::Skipped("disabled by configuration".into()),
+                )
+            } else if !supported {
+                (
+                    PresenceProbe::Skipped("unsupported identity / no GUID".into()),
+                    PresenceProbe::Skipped("unsupported identity / no GUID".into()),
+                )
+            } else if let Some(user_id) = user_id {
+                let ids = vec![user_id.clone()];
+                match people::presences(&s.graph, &ids).await {
+                    Ok(items) => {
+                        if let Some(presence) = items.into_iter().find(|presence| {
+                            presence
+                                .id
+                                .as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(&user_id))
+                        }) {
+                            (
+                                crate::diagnostics::presence_probe(&presence),
+                                PresenceProbe::Skipped("not needed".into()),
+                            )
+                        } else {
+                            let direct = match people::presence(&s.graph, &user_id).await {
+                                Ok(presence) => crate::diagnostics::presence_probe(&presence),
+                                Err(error) => PresenceProbe::Error(
+                                    crate::diagnostics::safe_graph_error(&error),
+                                ),
+                            };
+                            (PresenceProbe::Omitted, direct)
+                        }
+                    }
+                    Err(error) => {
+                        let batch =
+                            PresenceProbe::Error(crate::diagnostics::safe_graph_error(&error));
+                        let direct = match people::presence(&s.graph, &user_id).await {
+                            Ok(presence) => crate::diagnostics::presence_probe(&presence),
+                            Err(error) => {
+                                PresenceProbe::Error(crate::diagnostics::safe_graph_error(&error))
+                            }
+                        };
+                        (batch, direct)
+                    }
+                }
+            } else {
+                (
+                    PresenceProbe::Skipped("no Entra GUID".into()),
+                    PresenceProbe::Skipped("no Entra GUID".into()),
+                )
+            };
+
+            let teams = if enabled {
+                teams_presence::diagnose(
+                    &s.auth,
+                    lookup_address.as_deref(),
+                    mri.as_deref(),
+                    personal_account,
+                )
+                .await
+            } else {
+                m365_core::teams_presence::Diagnostics {
+                    lookup_address_available: lookup_address.is_some(),
+                    resource_token: m365_core::teams_presence::DiagnosticStep::Skipped(
+                        "contact presence disabled".into(),
+                    ),
+                    authz: m365_core::teams_presence::DiagnosticStep::Skipped(
+                        "contact presence disabled".into(),
+                    ),
+                    middle_tier_lookup: m365_core::teams_presence::DiagnosticStep::Skipped(
+                        "contact presence disabled".into(),
+                    ),
+                    resolved_mri_shape: "none".into(),
+                    ups_presence: m365_core::teams_presence::DiagnosticStep::Skipped(
+                        "contact presence disabled".into(),
+                    ),
+                }
+            };
+
+            let _ = tx
+                .send(AppMessage::ContactDiagnosticsLoaded(
+                    ContactDiagnosticsRemote {
+                        generated_at: chrono::Utc::now(),
+                        presence_read_all,
+                        batch,
+                        direct,
+                        teams,
+                    },
+                ))
+                .await;
+        });
     }
 
     /// Start the opt-in application presence session without setting a sticky
@@ -4327,6 +4648,10 @@ impl App {
                 self.diagnostics.remote = Some(remote);
                 self.diagnostics.loading = false;
             }
+            AppMessage::ContactDiagnosticsLoaded(remote) => {
+                self.contact_diagnostics.remote = Some(remote);
+                self.contact_diagnostics.loading = false;
+            }
             AppMessage::InboxPeek(items) => self.notify_for_mail(&items),
             AppMessage::Attachments { message_id, items } => {
                 // Ignore a late response for a message we've navigated away from.
@@ -5055,6 +5380,33 @@ impl App {
         }
     }
 
+    fn export_contact_diagnostics(&mut self, force_log: bool) {
+        let text = crate::diagnostics::contact_text(self);
+
+        if !force_log {
+            if let Some(via) = crate::clipboard::copy_native(&text) {
+                self.status = format!("contact diagnostics copied to clipboard via {via}");
+                return;
+            }
+        }
+
+        match crate::diagnostics::save_contact_log(&text) {
+            Ok(path) => {
+                self.status = if force_log {
+                    format!("contact diagnostics saved to {}", path.display())
+                } else {
+                    format!(
+                        "clipboard helper unavailable — contact diagnostics saved to {}",
+                        path.display()
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = format!("could not export contact diagnostics: {error:#}");
+            }
+        }
+    }
+
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -5062,6 +5414,10 @@ impl App {
         // the Teams composer has focus.
         if key.code == KeyCode::F(6) {
             self.open_diagnostics();
+            return;
+        }
+        if key.code == KeyCode::F(7) {
+            self.open_contact_diagnostics();
             return;
         }
         if matches!(self.overlay.as_ref(), Some(Overlay::Notice(_))) {
@@ -6039,6 +6395,34 @@ impl App {
                     _ => {}
                 }
                 self.overlay = Some(Overlay::Diagnostics);
+            }
+            Some(Overlay::ContactDiagnostics) => {
+                let max = self.contact_diagnostics_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.contact_diagnostics_scroll =
+                            self.contact_diagnostics_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.contact_diagnostics_scroll =
+                            self.contact_diagnostics_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        self.contact_diagnostics_scroll =
+                            self.contact_diagnostics_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.contact_diagnostics_scroll =
+                            self.contact_diagnostics_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.contact_diagnostics_scroll = 0,
+                    KeyCode::End => self.contact_diagnostics_scroll = max,
+                    KeyCode::Char('r') => self.refresh_contact_diagnostics(),
+                    KeyCode::Char('c') => self.export_contact_diagnostics(false),
+                    KeyCode::Char('l') => self.export_contact_diagnostics(true),
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::ContactDiagnostics);
             }
             Some(Overlay::ContactProfile) => {
                 let max = self.contact_profile_max_scroll.get();

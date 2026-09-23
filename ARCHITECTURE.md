@@ -141,6 +141,18 @@ native clipboard helper first and writes a private timestamped temporary log if
 none is usable; `l` always writes the log. This avoids making successful support
 export depend on terminal OSC 52 support.
 
+`F7` adds a contextual diagnostics snapshot for the selected Teams one-to-one
+contact. It records only identity classification (member type, GUID availability,
+safe ID-shape labels such as `MRI consumer (8:live:)`, and same/external/unknown
+tenant relation) plus safe batch/direct Graph presence results. It can retain a
+raw user-MRI candidate and lookup address privately in `App` for the read-only
+Teams diagnostic chain. That chain attempts a Skype-resource token from the
+existing refresh token, exchanges it through Teams `authz` for a Skype token,
+uses `externalsearchv3?includeTFLUsers=true` only when an MRI is not already
+available, and finally reads UPS presence. Names, email addresses, raw IDs,
+access/refresh/Skype tokens, MRIs, tenant IDs, and raw service responses are
+intentionally excluded from the rendered/exported snapshot.
+
 ## The UI loop
 
 The terminal thread never blocks on the network. Key handlers spawn tokio tasks;
@@ -528,3 +540,15 @@ Compose config validation on every push and pull request.
 Asset filenames are deliberately **not** versioned, so that
 `/releases/latest/download/<asset>` always resolves and the README can offer a
 copy-paste install. The version lives in the directory inside each archive.
+
+
+## Non-Entra presence investigation
+
+The optional Teams/Skype presence diagnostic code is intentionally retained,
+even though the current tenant/app registration cannot complete it. It is
+isolated from the normal Graph authentication path and exists so personal
+Microsoft-account presence can be resumed if the required Microsoft Teams
+Services permission becomes available.
+
+The current findings and security requirements are documented in
+[`docs/non-entra-presence.md`](docs/non-entra-presence.md).

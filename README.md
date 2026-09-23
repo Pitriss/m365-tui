@@ -80,9 +80,31 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   and ntfy delivery.
 - Persistent Calendar view selection when persistent UI state is enabled.
 
-### Diagnostics
+#### Teams/Skype resource-consent probe
+
+If F7 reports `consent required (AADSTS65001)` for the Skype resource token,
+run the explicit one-off probe:
+
+```sh
+m365 teams-consent-probe
+```
+
+This command is isolated from normal startup. It requests only
+`https://api.spaces.skype.com/.default`, does **not** request `offline_access`,
+does not alter `M365_SCOPES`, and never writes the primary Graph token cache.
+The interactive access token is discarded. After consent, it only verifies
+whether the already-cached Graph refresh token can silently obtain the
+Teams/Skype resource token. Normal `m365`, `m365 login`, F6 and F7 behavior is
+unchanged unless this command is explicitly invoked.
+
+## Diagnostics
 
 - Global `F6` read-only diagnostics overlay.
+- Contextual `F7` diagnostics for the selected Teams one-to-one contact. It
+  classifies Graph/Teams identity shapes, detects a safe Teams user-MRI candidate,
+  probes batch/direct Graph presence, and traces the read-only Teams path
+  (Skype-resource token -> authz/Skype token -> Middle Tier MRI lookup -> UPS)
+  without exporting names, email addresses, raw IDs, tokens, MRIs, or tenant IDs.
 - Shows account/token health, Microsoft 365 work-plan hours and time zones,
   actual Graph token scopes, optional feature state, presence, push/cache and
   terminal integration state.
@@ -680,7 +702,8 @@ Press `?` at any time outside the Teams composer to display the built-in help.
 | `F2` | Teams |
 | `F3` | Calendar |
 | `F5` | Force an immediate poll |
-| `F6` | Open diagnostics |
+| `F6` | Open generic diagnostics |
+| `F7` | Diagnose the selected Teams 1:1 contact |
 | `Ctrl+P` | Command palette |
 | `p` | Presence picker |
 | `?` | Open help |
@@ -696,6 +719,8 @@ steps, `Home`/`End` to jump to the beginning or end, and `Esc` to close it.
 
 The Diagnostics overlay uses the same scrolling keys. Inside it, `r` refreshes
 the live checks, `c` copies/exports the snapshot, and `l` forces a log export.
+`F7` uses the same controls for the selected Teams one-to-one contact and writes
+fallback logs as `/tmp/m365-tui-contact-diagnostics-*.log`.
 
 ### Navigation
 
@@ -1561,3 +1586,20 @@ m365-tui is not affiliated with or endorsed by Microsoft.
 
 "Microsoft 365", "Outlook", and "Teams" are trademarks of Microsoft
 Corporation.
+
+
+### Presence for Microsoft personal / non-Entra contacts
+
+Microsoft Graph presence requires a usable Entra user identity. Some Teams
+one-to-one contacts are returned as `microsoftAccountUserConversationMember`
+without an Entra GUID or usable Teams MRI, so their presence cannot currently
+be displayed through the normal Graph path.
+
+An experimental read-only Teams/Skype presence diagnostic path is retained for
+future use, but it requires Microsoft Teams Services to be configured for the
+app registration. In the current tenant the explicit consent probe stops with
+`AADSTS650057` because `https://api.spaces.skype.com` is not listed in the
+app registration's requested API resources.
+
+See [`docs/non-entra-presence.md`](docs/non-entra-presence.md) for the findings,
+privacy constraints, and continuation procedure.

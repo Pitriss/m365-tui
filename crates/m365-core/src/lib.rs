@@ -17,6 +17,7 @@ pub mod models;
 pub mod ntfy;
 pub mod people;
 pub mod subscriptions;
+pub mod teams_presence;
 pub mod util;
 pub mod work_plan;
 
