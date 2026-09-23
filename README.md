@@ -953,6 +953,39 @@ row-selection foreground to hide it.
 
 A dark one-cell badge gives the marker additional contrast on highlighted rows.
 
+### Experimental directory contact profiles
+
+> **Untested:** this path is implemented but has not been validated against a
+> tenant that grants the required permission.
+
+By default, contact profile enrichment continues to use the existing
+`People.Read` / `/me/people` path.
+
+For internal one-to-one Teams contacts whose Entra user GUID is known, an
+experimental direct directory lookup can be enabled with:
+
+```dotenv
+M365_DIRECTORY_PROFILE=1
+```
+
+When default scopes are used, this adds the delegated Microsoft Graph
+`User.Read.All` permission. `User.Read.All` requires administrator consent.
+
+The direct `/users/{GUID}` lookup can request richer directory fields including:
+
+- business phone numbers
+- mobile phone
+- job title
+- department
+- office location
+- company name
+
+If `M365_SCOPES` is set explicitly, enabling `M365_DIRECTORY_PROFILE` does not
+alter that custom list; include `User.Read.All` in `M365_SCOPES` yourself.
+
+Leave this option disabled unless intentionally testing the directory-profile
+path.
+
 ### System events
 
 Teams uses special messages for events that are not ordinary user-authored

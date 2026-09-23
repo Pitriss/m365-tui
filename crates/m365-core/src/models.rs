@@ -804,8 +804,46 @@ pub struct Person {
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub surname: Option<String>,
+    #[serde(default)]
+    pub job_title: Option<String>,
+    #[serde(default)]
+    pub company_name: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub office_location: Option<String>,
+    #[serde(default)]
+    pub user_principal_name: Option<String>,
+    #[serde(default)]
+    pub im_address: Option<String>,
+    #[serde(default)]
+    pub phones: Vec<Phone>,
+    #[serde(default)]
+    pub person_type: Option<PersonType>,
     #[serde(default, rename = "scoredEmailAddresses")]
     pub scored_email_addresses: Vec<ScoredEmailAddress>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Phone {
+    #[serde(default, rename = "type")]
+    pub phone_type: Option<String>,
+    #[serde(default)]
+    pub number: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonType {
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub subclass: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

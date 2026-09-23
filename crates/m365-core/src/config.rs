@@ -55,6 +55,17 @@ pub const TEAMS_READ_SCOPE: &str = "Team.ReadBasic.All";
 /// Opt in with `M365_TEAMS_FILE_IMAGES=1`.
 pub const FILES_READ_SCOPE: &str = "Files.Read.All";
 
+/// Needed to read profile photos of other organization users.
+/// Opt in with `M365_PROFILE_PHOTO=1`; kept out of DEFAULT_SCOPES so existing
+/// consent is not disturbed for users who do not want contact avatars.
+pub const PROFILE_PHOTO_SCOPE: &str = "User.ReadBasic.All";
+
+/// Experimental full directory profile lookup for Teams contacts.
+///
+/// Opt in with `M365_DIRECTORY_PROFILE=1`. This adds delegated `User.Read.All`,
+/// which requires administrator consent. The feature is currently untested.
+pub const DIRECTORY_PROFILE_SCOPE: &str = "User.Read.All";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeamsSystemEvents {
     Useful,
@@ -149,6 +160,9 @@ pub struct Config {
     pub presence_available_timeout_min: u64,
     /// Download regular Teams image file attachments from SharePoint/OneDrive.
     pub teams_file_images: bool,
+    /// Experimental direct Entra directory profile lookup for Teams contacts.
+    /// Off by default; requires delegated User.Read.All and administrator consent.
+    pub directory_profile: bool,
     /// Optional persistent cache for decoded Teams image thumbnails.
     /// Unset keeps Teams image caching memory-only.
     pub teams_image_cache_dir: Option<PathBuf>,
@@ -173,6 +187,7 @@ impl Config {
         let tenant_id = std::env::var("M365_TENANT_ID").unwrap_or_else(|_| "organizations".into());
         let presence_primary = env_flag("M365_PRESENCE_PRIMARY");
         let teams_file_images = env_flag("M365_TEAMS_FILE_IMAGES");
+        let directory_profile = env_flag("M365_DIRECTORY_PROFILE");
         let teams_image_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR")
             .ok()
             .map(|value| value.trim().to_string())
@@ -221,6 +236,12 @@ impl Config {
                 }
                 if teams_file_images {
                     s.push(FILES_READ_SCOPE.to_string());
+                }
+                if env_flag("M365_PROFILE_PHOTO") {
+                    s.push(PROFILE_PHOTO_SCOPE.to_string());
+                }
+                if directory_profile {
+                    s.push(DIRECTORY_PROFILE_SCOPE.to_string());
                 }
                 s
             }
@@ -307,6 +328,7 @@ impl Config {
             presence_primary,
             presence_available_timeout_min,
             teams_file_images,
+            directory_profile,
             teams_image_cache_dir,
             teams_image_cache_max_mb,
             teams_cache_warmup,
@@ -338,6 +360,11 @@ impl Config {
     /// Whether the current token request includes read access to files.
     pub fn can_read_files(&self) -> bool {
         self.has_scope(FILES_READ_SCOPE)
+    }
+
+    /// Whether the requested token can read other users' basic profile/photo.
+    pub fn can_read_profile_photos(&self) -> bool {
+        self.has_scope(PROFILE_PHOTO_SCOPE)
     }
 
     fn has_scope(&self, scope: &str) -> bool {
@@ -479,6 +506,7 @@ mod tests {
             presence_primary: false,
             presence_available_timeout_min: 5,
             teams_file_images: false,
+            directory_profile: false,
             teams_image_cache_dir: None,
             teams_image_cache_max_mb: 256,
             teams_cache_warmup: true,

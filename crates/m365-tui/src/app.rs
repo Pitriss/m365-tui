@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::config::{NtfyMode, TeamsSystemEvents};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Presence,
+    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Person, Presence,
     SystemEventClass, Team, User,
 };
 use m365_core::{calendar, channels, chats, mail, people, work_plan, Session};
@@ -49,6 +49,11 @@ pub enum AppMessage {
     CalendarReminders(Vec<CalEvent>),
     Chats(Vec<Chat>),
     ContactPresences(Vec<Presence>),
+    ContactProfileLoaded {
+        chat_id: String,
+        person: Option<Person>,
+        avatar: Option<image::DynamicImage>,
+    },
     ChatUnreadCount {
         chat_id: String,
         count: usize,
@@ -168,6 +173,7 @@ pub enum Overlay {
     Compose(Compose),
     Calendar,
     CalendarEvent,
+    ContactProfile,
     /// Emoji reaction picker for the selected Teams message.
     React,
     /// Presence (status) picker for the signed-in user.
@@ -362,6 +368,18 @@ impl Compose {
 pub struct MailImage {
     pub state: std::cell::RefCell<ratatui_image::protocol::StatefulProtocol>,
 }
+
+pub struct ContactProfileState {
+    pub chat_id: String,
+    pub user_id: Option<String>,
+    pub display_name: String,
+    pub fallback_email: Option<String>,
+    pub account: String,
+    pub person: Option<Person>,
+    pub avatar: Option<MailImage>,
+    pub loading: bool,
+}
+
 
 #[derive(Default)]
 pub struct OutlookState {
@@ -609,6 +627,12 @@ pub struct App {
     pub help_scroll: u16,
     /// Largest useful Help scroll offset, set by the renderer after wrapping.
     pub help_max_scroll: std::cell::Cell<u16>,
+    /// Contact profile currently shown by Teams `g`.
+    pub contact_profile: Option<ContactProfileState>,
+    /// Vertical scroll offset for the contact profile.
+    pub contact_profile_scroll: u16,
+    /// Maximum useful vertical contact-profile scroll offset.
+    pub contact_profile_max_scroll: std::cell::Cell<u16>,
     /// Generation token used to invalidate delayed automatic read timers.
     read_timer_generation: u64,
     /// A new Teams chat message arrived since Teams was last opened.
@@ -1694,6 +1718,9 @@ impl App {
             reading_max_scroll: std::cell::Cell::new(0),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            contact_profile: None,
+            contact_profile_scroll: 0,
+            contact_profile_max_scroll: std::cell::Cell::new(0),
             read_timer_generation: 0,
             teams_unread: false,
             chat_cache_warmup_started: false,
@@ -2818,6 +2845,173 @@ impl App {
         learned_peer_id
     }
 
+    fn open_selected_contact_profile(&mut self) {
+        if self.teams.mode != TeamsMode::Chats || self.teams.focus != TeamsFocus::List {
+            return;
+        }
+
+        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+            self.status = "select a Teams contact first".into();
+            return;
+        };
+
+        if !chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            self.status = "profile is available for one-to-one chats".into();
+            return;
+        }
+
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+        let chat_id = chat.id.clone();
+        let user_id = self
+            .teams
+            .contact_user_ids
+            .get(&chat_id)
+            .cloned()
+            .or_else(|| chat.peer_user_id(me_id).map(str::to_string));
+        let display_name = self
+            .teams
+            .contact_names
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_else(|| chat.label(me_id));
+
+        let peer_member = user_id
+            .as_deref()
+            .and_then(|id| {
+                chat.members
+                    .iter()
+                    .find(|member| member.user_id.as_deref() == Some(id))
+            })
+            .or_else(|| {
+                chat.members.iter().find(|member| {
+                    me_id
+                        .map(|id| member.user_id.as_deref() != Some(id))
+                        .unwrap_or(true)
+                })
+            });
+
+        let fallback_email = peer_member.and_then(|member| member.email.clone());
+        let personal_account = peer_member
+            .and_then(|member| member.odata_type.as_deref())
+            .is_some_and(|kind| kind.ends_with("microsoftAccountUserConversationMember"));
+        let external = self.teams.external_chats.contains(&chat_id);
+        let account = if personal_account {
+            "Personal Microsoft account".to_string()
+        } else if external {
+            "External / federated account".to_string()
+        } else {
+            "Organization user".to_string()
+        };
+
+        self.contact_profile = Some(ContactProfileState {
+            chat_id: chat_id.clone(),
+            user_id: user_id.clone(),
+            display_name: display_name.clone(),
+            fallback_email: fallback_email.clone(),
+            account,
+            person: None,
+            avatar: None,
+            loading: true,
+        });
+        self.contact_profile_scroll = 0;
+        self.contact_profile_max_scroll.set(0);
+        self.overlay = Some(Overlay::ContactProfile);
+
+        let s = self.session.clone();
+        self.spawn(async move {
+            let directory_user = user_id
+                .as_deref()
+                .is_some_and(chats::looks_like_user_guid);
+            let can_resolve_profile = directory_user || fallback_email.is_some();
+
+            let person = if directory_user && s.config.directory_profile {
+                match user_id.as_deref() {
+                    Some(id) => match people::directory_profile_for_contact(&s.graph, id).await {
+                        Ok(person) => Some(person),
+                        Err(error) => {
+                            tracing::debug!(
+                                "Teams directory profile lookup failed for {chat_id}: {error:#}"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            } else if can_resolve_profile {
+                match people::profile_for_contact(
+                    &s.graph,
+                    user_id.as_deref(),
+                    fallback_email.as_deref(),
+                    &display_name,
+                )
+                .await
+                {
+                    Ok(person) => person,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Teams contact profile lookup failed for {chat_id}: {error:#}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    "Teams contact profile lookup skipped for {chat_id}: opaque external id without email"
+                );
+                None
+            };
+
+            let avatar = if !s.config.can_read_profile_photos() {
+                tracing::debug!(
+                    "Teams contact avatar lookup skipped for {chat_id}: M365_PROFILE_PHOTO is disabled"
+                );
+                None
+            } else if let Some(id) = user_id
+                .as_deref()
+                .filter(|id| chats::looks_like_user_guid(id))
+            {
+                match people::profile_photo(&s.graph, id).await {
+                    Ok(bytes) if bytes.len() <= MAX_MAIL_IMAGE_BYTES => {
+                        match image::load_from_memory(&bytes) {
+                            Ok(image) => Some(image),
+                            Err(error) => {
+                                tracing::debug!(
+                                    "Teams contact avatar decode failed for {chat_id}: {error}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Ok(bytes) => {
+                        tracing::debug!(
+                            "Teams contact avatar ignored for {chat_id}: {} bytes exceeds limit",
+                            bytes.len()
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "Teams contact avatar unavailable for {chat_id}: {error:#}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            Ok(AppMessage::ContactProfileLoaded {
+                chat_id,
+                person,
+                avatar,
+            })
+        });
+    }
+
     fn load_contact_presences(&self, chats: &[Chat]) {
         if !self.session.config.presence_read {
             return;
@@ -3910,6 +4104,27 @@ impl App {
                     && self.teams.preview_chat_id.is_none()
                 {
                     self.preview_selected_teams_chat();
+                }
+            }
+            AppMessage::ContactProfileLoaded {
+                chat_id,
+                person,
+                avatar,
+            } => {
+                if let Some(profile) = self.contact_profile.as_mut() {
+                    if profile.chat_id == chat_id {
+                        profile.person = person;
+                        profile.loading = false;
+                        if let (Some(image), Some(picker)) =
+                            (avatar, self.image_picker.as_ref())
+                        {
+                            profile.avatar = Some(MailImage {
+                                state: std::cell::RefCell::new(
+                                    picker.new_resize_protocol(image),
+                                ),
+                            });
+                        }
+                    }
                 }
             }
             AppMessage::ContactPresences(items) => {
@@ -5478,6 +5693,12 @@ impl App {
                     self.overlay = Some(Overlay::React);
                 }
             }
+            KeyCode::Char('g')
+                if self.teams.mode == TeamsMode::Chats
+                    && self.teams.focus == TeamsFocus::List =>
+            {
+                self.open_selected_contact_profile();
+            }
             // Jump back to the newest visible message and resume following it.
             KeyCode::End | KeyCode::Char('g') if self.teams.focus == TeamsFocus::Messages => {
                 if let Some(index) = self.last_selectable_teams_message() {
@@ -5700,6 +5921,21 @@ impl App {
                     _ => {}
                 }
                 self.overlay = Some(Overlay::Help);
+            }
+            Some(Overlay::ContactProfile) => {
+                let max = self.contact_profile_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.contact_profile_scroll =
+                            self.contact_profile_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.contact_profile_scroll =
+                            self.contact_profile_scroll.saturating_add(1).min(max);
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::ContactProfile);
             }
             Some(Overlay::Calendar) => {
                 // Any key besides Esc closes the compact calendar overlay.

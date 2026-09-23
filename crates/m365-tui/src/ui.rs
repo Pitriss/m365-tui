@@ -274,6 +274,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::CalendarEvent => "o open meeting · Esc close",
+            Overlay::ContactProfile => "j/k scroll · Esc close",
             Overlay::Calendar => "Esc close",
             Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
         };
@@ -289,7 +290,7 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k preview cache · l/Enter open · t chats/channels",
+            TeamsFocus::List => "j/k preview cache · l/Enter open · g profile · t chats/channels",
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
@@ -1941,6 +1942,122 @@ fn calendar_event_detail(event: &m365_core::models::Event) -> Vec<Line<'static>>
     lines
 }
 
+fn contact_profile_field(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    value: Option<String>,
+) {
+    let Some(value) = value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(Color::Gray)),
+        Span::raw(value),
+    ]));
+}
+
+fn contact_profile_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(profile) = app.contact_profile.as_ref() else {
+        return vec![Line::raw("No contact selected.")];
+    };
+
+    let presence = profile
+        .user_id
+        .as_deref()
+        .and_then(|id| app.teams.contact_presences.get(id));
+    let (symbol, color) = contact_presence_marker(presence);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                profile.display_name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+
+    if let Some(presence) = presence {
+        let status = match (
+            presence.availability.as_deref(),
+            presence.activity.as_deref(),
+        ) {
+            (Some(availability), Some(activity))
+                if !availability.eq_ignore_ascii_case(activity) =>
+            {
+                Some(format!("{availability} · {activity}"))
+            }
+            (Some(availability), _) => Some(availability.to_string()),
+            (_, Some(activity)) => Some(activity.to_string()),
+            _ => None,
+        };
+        contact_profile_field(&mut lines, "Status:", status);
+    }
+
+    if let Some(person) = profile.person.as_ref() {
+        contact_profile_field(&mut lines, "Position:", person.job_title.clone());
+        contact_profile_field(&mut lines, "Department:", person.department.clone());
+        contact_profile_field(&mut lines, "Company:", person.company_name.clone());
+        contact_profile_field(&mut lines, "Office:", person.office_location.clone());
+
+        let email = person
+            .scored_email_addresses
+            .iter()
+            .find_map(|address| address.address.clone())
+            .or_else(|| person.user_principal_name.clone())
+            .or_else(|| profile.fallback_email.clone());
+        contact_profile_field(&mut lines, "E-mail:", email);
+
+        let phones = person
+            .phones
+            .iter()
+            .filter_map(|phone| {
+                let number = phone.number.as_deref()?.trim();
+                if number.is_empty() {
+                    return None;
+                }
+                Some(match phone.phone_type.as_deref() {
+                    Some(kind) if !kind.trim().is_empty() => {
+                        format!("{number} ({kind})")
+                    }
+                    _ => number.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, phone) in phones.into_iter().enumerate() {
+            contact_profile_field(
+                &mut lines,
+                if index == 0 { "Phone:" } else { "" },
+                Some(phone),
+            );
+        }
+
+        contact_profile_field(&mut lines, "IM:", person.im_address.clone());
+    } else {
+        contact_profile_field(&mut lines, "E-mail:", profile.fallback_email.clone());
+    }
+
+    contact_profile_field(&mut lines, "Account:", Some(profile.account.clone()));
+
+    if profile.loading {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Loading profile…",
+            Style::default().fg(DIM),
+        ));
+    }
+
+    lines
+}
+
 fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
     match overlay {
         Overlay::Notice(message) => {
@@ -1982,7 +2099,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
           f forward · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
- Teams:   t chats/channels · j/k select message · g newest · e react\n\
+ Teams:   t chats/channels · g profile on chat · g newest in messages · e react\n\
           a/i type message · r reply to selected · Enter send\n\
  \n\
  Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
@@ -2007,6 +2124,70 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
 
             f.render_widget(block, area);
             f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
+        Overlay::ContactProfile => {
+            let area = centered(76, 72, f.area());
+            f.render_widget(Clear, area);
+
+            let block = popup_block("Contact profile — j/k scroll · Esc close");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let profile = app.contact_profile.as_ref();
+
+            // Keep the contact text at a stable x-position regardless of whether
+            // an avatar exists or has finished loading. Reserve at most 25% of
+            // the profile width for the image, capped at the previous 18 cells.
+            let avatar_width = (inner.width / 4).min(18);
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(avatar_width),
+                    Constraint::Min(1),
+                ])
+                .split(inner);
+            let avatar_area = columns[0];
+            let text_area = columns[1];
+
+            let lines = contact_profile_lines(app);
+            let (rows, _) =
+                crate::wrap::wrap_all(&lines, text_area.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(text_area.height);
+            app.contact_profile_max_scroll.set(max);
+            let scroll = app.contact_profile_scroll.min(max);
+
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), text_area);
+
+            if let Some(profile) = profile {
+                if let Some(avatar) = profile.avatar.as_ref() {
+                    if avatar_area.width > 0 && avatar_area.height > 0 {
+                        if let Ok(mut state) = avatar.state.try_borrow_mut() {
+                            let bounds = Rect::new(
+                                0,
+                                0,
+                                avatar_area.width,
+                                avatar_area.height.clamp(1, 12),
+                            );
+                            let fitted = state.size_for(Resize::Fit(None), bounds);
+                            if fitted.width > 0 && fitted.height > 0 {
+                                let image_area = Rect::new(
+                                    avatar_area.x
+                                        + avatar_area.width.saturating_sub(fitted.width) / 2,
+                                    avatar_area.y
+                                        + avatar_area.height.saturating_sub(fitted.height) / 2,
+                                    fitted.width.min(avatar_area.width),
+                                    fitted.height.min(avatar_area.height),
+                                );
+                                f.render_stateful_widget(
+                                    StatefulImage::new().resize(Resize::Fit(None)),
+                                    image_area,
+                                    &mut *state,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         Overlay::Calendar => {
             let area = centered(70, 70, f.area());
