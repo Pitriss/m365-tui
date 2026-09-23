@@ -36,6 +36,7 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - Preview JPEG, PNG, and GIF image attachments in terminals supporting the
   Kitty graphics protocol.
 - Desktop notifications for new inbox mail.
+- Optional forwarding of notification events to an ntfy server.
 - Quick access to Calendar with `g`.
 
 ### Teams
@@ -61,6 +62,7 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - Selected presence markers retain their status colour and use a high-contrast
   dark badge on the highlighted row.
 - Desktop notifications for direct messages and relevant mentions.
+- Optional ntfy forwarding with a Teams-specific notification tag.
 
 ### Calendar
 
@@ -74,8 +76,8 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   application.
 - Visual RSVP and online-meeting indicators.
 - Multi-day events rendered across calendar days.
-- 15- and 5-minute event reminders with configurable internal and desktop
-  notification delivery.
+- 15- and 5-minute event reminders with configurable internal, desktop,
+  and ntfy delivery.
 - Persistent Calendar view selection when persistent UI state is enabled.
 
 ---
@@ -289,6 +291,60 @@ M365_CLIENT_ID=00000000-0000-0000-0000-000000000000
 | `M365_TOKEN_CACHE` | OS configuration directory | Token cache location |
 | `M365_GRAPH_BASE` | Microsoft Graph | Alternate Graph endpoint, mainly for testing |
 | `M365_NOTIFY` | enabled | Set to `0`, `false`, `no`, or `off` to disable desktop notifications |
+| `M365_NTFY` | `never` | ntfy forwarding mode: `never`, `always`, `away`, `alwayswd`, or `awaywd` |
+| `M365_NTFY_SERVER` | unset | ntfy server root URL; required when ntfy forwarding is enabled |
+| `M365_NTFY_TOPIC` | unset | ntfy topic; required when ntfy forwarding is enabled |
+| `M365_NTFY_TOKEN` | unset | Optional Bearer token for a protected ntfy topic |
+
+### ntfy forwarding
+
+m365-tui can forward the same notification events it handles locally to an
+[ntfy](https://ntfy.sh/) server. Desktop delivery and ntfy delivery are
+independent. `M365_NOTIFY` controls desktop notifications only. Set
+`M365_NTFY=never` to disable ntfy forwarding.
+
+Example:
+
+```dotenv
+M365_NTFY=awaywd
+M365_NTFY_SERVER=https://ntfy.example.com
+M365_NTFY_TOPIC=m365
+# M365_NTFY_TOKEN=optional-bearer-token
+```
+
+Available forwarding modes:
+
+| Mode | Behaviour |
+|---|---|
+| `never` | Disable ntfy forwarding (default) |
+| `always` | Forward every eligible notification event |
+| `away` | Forward only while Microsoft Graph reports your availability exactly as `Away` |
+| `alwayswd` | Forward only while the current instant is inside your Microsoft 365 Work Plan |
+| `awaywd` | Require both `Away` presence and an active Work Plan occurrence |
+
+The Work Plan modes use Microsoft Graph
+`/me/settings/workHoursAndLocations/occurrencesView` for the current instant.
+`office`, `remote`, and `unspecified` occurrences count as working; a `timeOff`
+occurrence takes precedence and suppresses forwarding. This uses the existing
+`Calendars.ReadWrite` delegated permission, so enabling ntfy does not add a new
+Graph scope.
+
+Published ntfy messages carry an application tag so clients can distinguish the
+source at a glance:
+
+| Source | ntfy tag |
+|---|---|
+| Outlook mail | `email` (📧) |
+| Teams | `speech_balloon` (💬) |
+| Calendar | `calendar` (📆) |
+
+Press `F4` while ntfy is enabled to temporarily snooze forwarding for 1, 2, 4,
+8, 12, or 24 hours. The menu also contains **Resume now**; `c` or `0` resumes
+immediately and `Esc` closes the menu without changing the current snooze.
+
+Snooze does not modify `M365_NTFY`. Its absolute expiry time is persisted beside
+the configured token cache, so an application restart or unexpected exit does
+not reset or extend the selected snooze interval.
 
 ### Outlook
 

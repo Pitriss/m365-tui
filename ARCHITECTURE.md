@@ -28,6 +28,8 @@ The webhook shares the core only for its event types.
 | `config.rs` | Environment-driven settings, scope selection, Graph endpoint |
 | `models.rs` | Serde structs for the Graph resources actually rendered |
 | `mail.rs` `calendar.rs` `chats.rs` `channels.rs` `people.rs` | Endpoint wrappers |
+| `ntfy.rs` | HTTP publisher for optional remote ntfy notifications |
+| `work_plan.rs` | Current Microsoft 365 Work Plan occurrence lookup |
 | `subscriptions.rs` | Change-notification lifecycle |
 | `events.rs` | Redis subscriber → typed UI events |
 | `util.rs` | base64, HTML escaping |
@@ -95,6 +97,27 @@ to authenticate before it would tell them what the flags were.
 
 The distinction between `get_page` and `get_collection` matters: an inbox view
 uses `get_page`, because `get_collection` would walk the entire mailbox.
+
+## Notification delivery
+
+Notification events are collected in the TUI and fan out independently to the
+local desktop notifier and, when configured, to ntfy. `M365_NOTIFY` therefore
+controls only desktop delivery; `M365_NTFY` controls the remote path.
+
+ntfy forwarding is gated as late as possible before publishing. Presence-aware
+modes use the current Graph availability, while `alwayswd` and `awaywd` query
+`me/settings/workHoursAndLocations/occurrencesView` with a one-second UTC window
+around the current instant. `timeOff` overrides working occurrences.
+
+A temporary F4 snooze suppresses only the ntfy branch. The persisted value is an
+absolute Unix expiry timestamp stored beside the configured token cache. Writing
+only when the snooze changes means there is no periodic state churn, while a
+crash or restart still preserves the original deadline. The loader also accepts
+the short-lived older XDG state location and migrates it on first use.
+
+Mail, Teams, and Calendar ntfy payloads carry distinct emoji-compatible tags
+(`email`, `speech_balloon`, and `calendar`) while keeping a single configured
+topic.
 
 ## The UI loop
 
@@ -209,6 +232,9 @@ cheap layout runs per frame.
 Two independent mechanisms, so the app is never dependent on the tunnel:
 
 1. **Polling** — a 20-second timer refreshes the current view. Always on.
+   The status bar reports normal progress, overdue time, and `STALE`; if a
+   scheduled poll is still outstanding, application-level polling backs off up
+   to five minutes rather than stacking additional request waves.
 2. **Push** — Graph change notifications, when a tunnel is configured.
 
 ### Why a tunnel is needed at all
