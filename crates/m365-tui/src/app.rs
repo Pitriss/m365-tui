@@ -21,6 +21,7 @@ use ratatui::text::Text;
 use tokio::sync::mpsc;
 
 use crate::content;
+use crate::diagnostics::{DiagnosticsRemote, DiagnosticsState};
 use crate::editor::TextInput;
 use crate::navigation;
 
@@ -100,6 +101,8 @@ pub enum AppMessage {
     PresenceRefresh(Presence),
     /// Silent Microsoft 365 work-plan result used by `alwayswd` / `awaywd`.
     NtfyWorkPlan(bool),
+    /// Fresh read-only data for the F6 diagnostics overlay.
+    DiagnosticsLoaded(DiagnosticsRemote),
     /// Newest inbox messages, fetched purely to drive notifications.
     InboxPeek(Vec<MailMessage>),
     /// Attachments of the open mail message.
@@ -163,6 +166,7 @@ pub enum TeamsFocus {
 pub enum Overlay {
     Notice(String),
     Help,
+    Diagnostics,
     Palette {
         query: String,
         sel: usize,
@@ -627,6 +631,12 @@ pub struct App {
     pub help_scroll: u16,
     /// Largest useful Help scroll offset, set by the renderer after wrapping.
     pub help_max_scroll: std::cell::Cell<u16>,
+    /// Read-only F6 diagnostics state.
+    pub diagnostics: DiagnosticsState,
+    /// Current vertical scroll offset of the diagnostics overlay.
+    pub diagnostics_scroll: u16,
+    /// Largest useful diagnostics scroll offset, set by the renderer.
+    pub diagnostics_max_scroll: std::cell::Cell<u16>,
     /// Contact profile currently shown by Teams `g`.
     pub contact_profile: Option<ContactProfileState>,
     /// Vertical scroll offset for the contact profile.
@@ -653,6 +663,7 @@ const PALETTE_COMMANDS: &[(&str, &str)] = &[
     ("compose", "Compose new mail"),
     ("chat-sender", "Teams: chat with selected email's sender"),
     ("refresh", "Refresh current view"),
+    ("diagnostics", "Show diagnostics"),
     ("help", "Show help"),
     ("quit", "Quit"),
 ];
@@ -1718,6 +1729,9 @@ impl App {
             reading_max_scroll: std::cell::Cell::new(0),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            diagnostics: DiagnosticsState::default(),
+            diagnostics_scroll: 0,
+            diagnostics_max_scroll: std::cell::Cell::new(0),
             contact_profile: None,
             contact_profile_scroll: 0,
             contact_profile_max_scroll: std::cell::Cell::new(0),
@@ -1844,6 +1858,43 @@ impl App {
             tracing::debug!("ntfy M365 work-plan active={working}");
             let _ = tx.send(AppMessage::NtfyWorkPlan(working)).await;
         });
+    }
+
+    fn refresh_diagnostics(&mut self) {
+        self.diagnostics.loading = true;
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            let token = match s.auth.access_token().await {
+                Ok(_) => s
+                    .auth
+                    .token_info()
+                    .await
+                    .ok_or_else(|| "token metadata unavailable".to_string()),
+                Err(error) => Err(m365_core::util::graph_error_summary(&format!("{error:#}"))),
+            };
+
+            let work_plan = work_plan::diagnostics(&s.graph, chrono::Utc::now())
+                .await
+                .map_err(|error| {
+                    m365_core::util::graph_error_summary(&format!("{error:#}"))
+                });
+
+            let _ = tx
+                .send(AppMessage::DiagnosticsLoaded(DiagnosticsRemote {
+                    generated_at: chrono::Utc::now(),
+                    token,
+                    work_plan,
+                }))
+                .await;
+        });
+    }
+
+    fn open_diagnostics(&mut self) {
+        self.diagnostics_scroll = 0;
+        self.overlay = Some(Overlay::Diagnostics);
+        self.refresh_diagnostics();
     }
 
     /// Start the opt-in application presence session without setting a sticky
@@ -4272,6 +4323,10 @@ impl App {
             AppMessage::NtfyWorkPlan(working) => {
                 self.ntfy_working_now = Some(working);
             }
+            AppMessage::DiagnosticsLoaded(remote) => {
+                self.diagnostics.remote = Some(remote);
+                self.diagnostics.loading = false;
+            }
             AppMessage::InboxPeek(items) => self.notify_for_mail(&items),
             AppMessage::Attachments { message_id, items } => {
                 // Ignore a late response for a message we've navigated away from.
@@ -4360,6 +4415,10 @@ impl App {
     /// poll gauge uses this instead of the time a request was merely started.
     pub fn poll_elapsed(&self) -> std::time::Duration {
         self.poll_last_success_at.elapsed()
+    }
+
+    pub fn kitty_images_available(&self) -> bool {
+        self.image_picker.is_some()
     }
 
     fn mark_poll_success(&mut self) {
@@ -4969,9 +5028,42 @@ impl App {
         }
     }
 
+    fn export_diagnostics(&mut self, force_log: bool) {
+        let text = crate::diagnostics::text(self);
+
+        if !force_log {
+            if let Some(via) = crate::clipboard::copy_native(&text) {
+                self.status = format!("diagnostics copied to clipboard via {via}");
+                return;
+            }
+        }
+
+        match crate::diagnostics::save_log(&text) {
+            Ok(path) => {
+                self.status = if force_log {
+                    format!("diagnostics saved to {}", path.display())
+                } else {
+                    format!(
+                        "clipboard helper unavailable — diagnostics saved to {}",
+                        path.display()
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = format!("could not export diagnostics: {error:#}");
+            }
+        }
+    }
+
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        // F6 is deliberately global, including while another overlay or
+        // the Teams composer has focus.
+        if key.code == KeyCode::F(6) {
+            self.open_diagnostics();
+            return;
+        }
         if matches!(self.overlay.as_ref(), Some(Overlay::Notice(_))) {
             self.overlay = None;
             self.notice_until = None;
@@ -5922,6 +6014,32 @@ impl App {
                 }
                 self.overlay = Some(Overlay::Help);
             }
+            Some(Overlay::Diagnostics) => {
+                let max = self.diagnostics_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.diagnostics_scroll = self.diagnostics_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.diagnostics_scroll =
+                            self.diagnostics_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        self.diagnostics_scroll = self.diagnostics_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.diagnostics_scroll =
+                            self.diagnostics_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.diagnostics_scroll = 0,
+                    KeyCode::End => self.diagnostics_scroll = max,
+                    KeyCode::Char('r') => self.refresh_diagnostics(),
+                    KeyCode::Char('c') => self.export_diagnostics(false),
+                    KeyCode::Char('l') => self.export_diagnostics(true),
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Diagnostics);
+            }
             Some(Overlay::ContactProfile) => {
                 let max = self.contact_profile_max_scroll.get();
                 match key.code {
@@ -6260,6 +6378,7 @@ impl App {
                 }
             }
             "refresh" => self.refresh_current(),
+            "diagnostics" => self.open_diagnostics(),
             "help" => {
                 self.help_scroll = 0;
                 self.overlay = Some(Overlay::Help);

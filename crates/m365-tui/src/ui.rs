@@ -9,6 +9,7 @@ use ratatui_image::{Resize, StatefulImage};
 
 use m365_core::models::SystemEventClass;
 
+use crate::diagnostics;
 use crate::app::{
     filter_commands, App, CalendarView, Compose, OutlookFocus, Overlay, Screen, TeamsFocus,
     TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
@@ -275,6 +276,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::CalendarEvent => "o open meeting · Esc close",
             Overlay::ContactProfile => "j/k scroll · Esc close",
+            Overlay::Diagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
             Overlay::Calendar => "Esc close",
             Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
         };
@@ -2081,7 +2083,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let text = "\
  M365 TUI — keys\n\
  \n\
- Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · Ctrl+P palette · p presence · ? help · q quit\n\
+ Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · F6 diagnostics · Ctrl+P palette · p presence · ? help · q quit\n\
  \n\
  NTFY:    F4 menu · j/k choose · Enter apply · c/0 resume now · Esc cancel\n\
           Snooze: 1h · 2h · 4h · 8h · 12h · 24h · Resume now\n\
@@ -2121,6 +2123,65 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let max = (rows.len() as u16).saturating_sub(inner.height);
             app.help_max_scroll.set(max);
             let scroll = app.help_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
+        Overlay::Diagnostics => {
+            let area = centered(84, 86, f.area());
+            f.render_widget(Clear, area);
+
+            let block = popup_block(
+                "Diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close",
+            );
+            let inner = block.inner(area);
+            let text = diagnostics::text(app);
+
+            let lines: Vec<Line<'static>> = text
+                .lines()
+                .map(|line| {
+                    if line.is_empty() {
+                        return Line::raw("");
+                    }
+                    if !line.starts_with(' ') {
+                        return Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default()
+                                .fg(ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+
+                    let marker = [
+                        ('●', Color::Green),
+                        ('○', Color::DarkGray),
+                        ('!', Color::Yellow),
+                        ('×', Color::Red),
+                        ('?', Color::DarkGray),
+                    ]
+                    .into_iter()
+                    .find_map(|(symbol, color)| line.find(symbol).map(|index| (symbol, color, index)));
+
+                    if let Some((symbol, color, index)) = marker {
+                        let end = index + symbol.len_utf8();
+                        Line::from(vec![
+                            Span::raw(line[..index].to_string()),
+                            Span::styled(
+                                symbol.to_string(),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(line[end..].to_string()),
+                        ])
+                    } else {
+                        Line::raw(line.to_string())
+                    }
+                })
+                .collect();
+
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.diagnostics_max_scroll.set(max);
+            let scroll = app.diagnostics_scroll.min(max);
 
             f.render_widget(block, area);
             f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);

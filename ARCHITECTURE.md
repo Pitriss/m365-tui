@@ -44,6 +44,7 @@ The webhook shares the core only for its event types.
 | `editor.rs` | Text buffer with cursor, wrapping, and editing operations |
 | `wrap.rs` | Exact word wrapping, so scrolling can trust the row count |
 | `clipboard.rs` `opener.rs` `files.rs` `notify.rs` | System integration |
+| `diagnostics.rs` | F6 diagnostics snapshot, permission/work-plan reporting and safe export |
 | `navigation.rs` | Cross-links between the Outlook and Teams sides |
 
 ## Authentication
@@ -118,6 +119,27 @@ the short-lived older XDG state location and migrates it on first use.
 Mail, Teams, and Calendar ntfy payloads carry distinct emoji-compatible tags
 (`email`, `speech_balloon`, and `calendar`) while keeping a single configured
 topic.
+
+## Diagnostics
+
+`F6` opens a read-only diagnostics overlay. Network-backed details are
+refreshed asynchronously and returned through the normal `AppMessage` channel,
+so opening or refreshing diagnostics never blocks terminal input.
+
+The snapshot deliberately separates requested Graph scopes from the scopes
+actually returned with the cached access token. Token metadata exposes only
+expiry, scope names, and validity; bearer and refresh-token bytes never leave
+`auth.rs`.
+
+Work-day diagnostics read the modern Microsoft 365
+`workHoursAndLocations/recurrences` resource and the same `occurrencesView`
+state used by ntfy `alwayswd` / `awaywd`. `Calendars.ReadWrite`, already a
+default scope, is sufficient for those delegated calls.
+
+The diagnostics UI and export use the same plain-text snapshot. `c` tries a
+native clipboard helper first and writes a private timestamped temporary log if
+none is usable; `l` always writes the log. This avoids making successful support
+export depend on terminal OSC 52 support.
 
 ## The UI loop
 

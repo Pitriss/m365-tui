@@ -80,6 +80,25 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   and ntfy delivery.
 - Persistent Calendar view selection when persistent UI state is enabled.
 
+### Diagnostics
+
+- Global `F6` read-only diagnostics overlay.
+- Shows account/token health, Microsoft 365 work-plan hours and time zones,
+  actual Graph token scopes, optional feature state, presence, push/cache and
+  terminal integration state.
+- `r` refreshes live diagnostics.
+- `c` exports the same plain-text snapshot to a native clipboard helper
+  (`wl-copy`, `xclip`, `xsel`, or `pbcopy`). If none is usable, the snapshot is
+  automatically written to a private `/tmp/m365-tui-diagnostics-*.log` file.
+- `l` always writes the log file.
+- Access tokens, refresh tokens, `M365_CLIENT_STATE`, ntfy bearer tokens and
+  authorization headers are never included in the diagnostics snapshot.
+
+The work-plan section reads the same Microsoft 365
+`workHoursAndLocations` data used by work-day ntfy modes. The existing
+`Calendars.ReadWrite` delegated permission is sufficient; diagnostics do not add
+another Graph scope.
+
 ---
 
 ## Requirements
@@ -661,6 +680,7 @@ Press `?` at any time outside the Teams composer to display the built-in help.
 | `F2` | Teams |
 | `F3` | Calendar |
 | `F5` | Force an immediate poll |
+| `F6` | Open diagnostics |
 | `Ctrl+P` | Command palette |
 | `p` | Presence picker |
 | `?` | Open help |
@@ -673,6 +693,9 @@ Press `?` at any time outside the Teams composer to display the built-in help.
 The Help overlay is scrollable when its contents do not fit in the terminal.
 Use `j`/`k` or `Up`/`Down` to scroll one row, `PageUp`/`PageDown` for larger
 steps, `Home`/`End` to jump to the beginning or end, and `Esc` to close it.
+
+The Diagnostics overlay uses the same scrolling keys. Inside it, `r` refreshes
+the live checks, `c` copies/exports the snapshot, and `l` forces a log export.
 
 ### Navigation
 

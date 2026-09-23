@@ -20,6 +20,13 @@ use crate::config::Config;
 
 /// Prompt shown to the user to complete the device-code login.
 #[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub expires_at: DateTime<Utc>,
+    pub scopes: Vec<String>,
+    pub valid: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct DeviceCodePrompt {
     pub verification_uri: String,
     pub user_code: String,
@@ -96,6 +103,27 @@ impl Authenticator {
         self.persist(&refreshed);
         *guard = Some(refreshed);
         Ok(token)
+    }
+
+    /// Return non-secret metadata about the currently cached token.
+    ///
+    /// The access token and refresh token are intentionally never exposed.
+    pub async fn token_info(&self) -> Option<TokenInfo> {
+        let guard = self.state.lock().await;
+        let current = guard.as_ref()?;
+        let mut scopes: Vec<String> = current
+            .scope
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        scopes.sort_by_key(|scope| scope.to_ascii_lowercase());
+        scopes.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+        Some(TokenInfo {
+            expires_at: current.expires_at,
+            scopes,
+            valid: current.is_valid(),
+        })
     }
 
     /// Run the interactive device-code flow. `on_prompt` is invoked once with

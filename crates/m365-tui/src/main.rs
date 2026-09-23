@@ -14,6 +14,7 @@
 mod app;
 mod clipboard;
 mod content;
+mod diagnostics;
 mod editor;
 mod files;
 mod navigation;
