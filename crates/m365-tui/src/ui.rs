@@ -1386,7 +1386,7 @@ fn contact_presence_marker(
         ("×", Color::Red)
     } else if activity == "inacall" || activity == "inameeting" || availability.starts_with("busy")
     {
-        ("●", Color::Yellow)
+        ("●", Color::Red)
     } else if availability == "away" || availability == "berightback" {
         ("◐", Color::Yellow)
     } else if availability.starts_with("available") {
@@ -1433,33 +1433,49 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         Style::default()
                     };
                     let marker = if selected { "▏" } else { " " };
-                    let label = c.label(me_id);
-
-                    let Some(user_id) = c.peer_user_id(me_id) else {
-                        // Group/meeting chats deliberately have no presence or count.
-                        let label = truncate(&label, inner_width);
-                        let padding = inner_width.saturating_sub(label.chars().count());
-                        return ListItem::new(Line::from(vec![
-                            Span::styled(marker, selection_style),
-                            Span::styled(label, selection_style),
-                            Span::styled(" ".repeat(padding), selection_style),
-                        ]));
-                    };
-
-                    let unread = app
+                    let label = app
                         .teams
-                        .chat_unread_counts
+                        .contact_names
                         .get(&c.id)
-                        .copied()
-                        .unwrap_or(0);
-                    let suffix = match unread {
+                        .cloned()
+                        .unwrap_or_else(|| c.label(me_id));
+                    let one_on_one = c
+                        .chat_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"));
+                    let user_id = app
+                        .teams
+                        .contact_user_ids
+                        .get(&c.id)
+                        .map(String::as_str)
+                        .or_else(|| c.peer_user_id(me_id));
+
+                    let unread = if one_on_one {
+                        app.teams
+                            .chat_unread_counts
+                            .get(&c.id)
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let unread_suffix = match unread {
                         0 => String::new(),
                         1..=99 => format!("[{unread}]"),
                         _ => "[+]".to_string(),
                     };
+                    let external = app.teams.external_chats.contains(&c.id);
+                    let suffix = match (external, unread_suffix.is_empty()) {
+                        (true, true) => "↗".to_string(),
+                        (true, false) => format!("↗ {unread_suffix}"),
+                        (false, _) => unread_suffix,
+                    };
                     let suffix_width = suffix.chars().count();
 
-                    if !app.session.config.presence_read {
+                    // Group/meeting chats have no presence. One-to-one chats keep
+                    // a fixed two-cell presence prefix even when the external
+                    // user's presence cannot be retrieved, so names never shift.
+                    if !app.session.config.presence_read || !one_on_one {
                         let label_width = inner_width.saturating_sub(suffix_width);
                         let label = truncate(&label, label_width);
                         let padding =
@@ -1472,7 +1488,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         ]));
                     }
 
-                    let presence = app.teams.contact_presences.get(user_id);
+                    let presence = user_id.and_then(|id| app.teams.contact_presences.get(id));
                     let (symbol, color) = contact_presence_marker(presence);
                     let prefix_width = 2usize;
                     let label_width = inner_width.saturating_sub(prefix_width + suffix_width);
@@ -2604,7 +2620,54 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{day_label, local_time};
+    use super::{contact_presence_marker, day_label, local_time};
+    use ratatui::style::Color;
+
+    #[test]
+    fn contact_presence_marker_matches_teams_status_colors() {
+        use m365_core::models::Presence;
+
+        fn presence(availability: &str, activity: &str) -> Presence {
+            Presence {
+                id: None,
+                availability: Some(availability.to_string()),
+                activity: Some(activity.to_string()),
+            }
+        }
+
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Available", "Available"))),
+            ("●", Color::LightGreen)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Busy", "Busy"))),
+            ("●", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Busy", "InAMeeting"))),
+            ("●", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Busy", "InACall"))),
+            ("●", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("DoNotDisturb", "DoNotDisturb"))),
+            ("×", Color::Red)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Away", "Away"))),
+            ("◐", Color::Yellow)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("BeRightBack", "BeRightBack"))),
+            ("◐", Color::Yellow)
+        );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("Offline", "Offline"))),
+            ("○", Color::DarkGray)
+        );
+    }
 
     #[test]
     fn labels_relative_days() {

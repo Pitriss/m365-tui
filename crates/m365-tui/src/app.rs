@@ -448,6 +448,15 @@ pub struct TeamsState {
     pub chat_sel: usize,
     /// Presence by directory user id for one-to-one chat contacts.
     pub contact_presences: std::collections::HashMap<String, Presence>,
+    /// Last known display name by one-to-one chat id. Federated chat member
+    /// objects can omit displayName, so keep a name learned from messages.
+    pub contact_names: std::collections::HashMap<String, String>,
+    /// Last known peer directory user id by one-to-one chat id.
+    pub contact_user_ids: std::collections::HashMap<String, String>,
+    /// One-to-one chats whose peer is known to belong to another tenant.
+    pub external_chats: std::collections::HashSet<String>,
+    /// Signed-in tenant id learned from config, chat membership or messages.
+    own_tenant_id: Option<String>,
     /// Server-derived unread message count by one-to-one chat id.
     pub chat_unread_counts: std::collections::HashMap<String, usize>,
     /// Latest message id already shown to the user per one-to-one chat.
@@ -498,6 +507,10 @@ impl Default for TeamsState {
             chats: Vec::new(),
             chat_sel: 0,
             contact_presences: std::collections::HashMap::new(),
+            contact_names: std::collections::HashMap::new(),
+            contact_user_ids: std::collections::HashMap::new(),
+            external_chats: std::collections::HashSet::new(),
+            own_tenant_id: None,
             chat_unread_counts: std::collections::HashMap::new(),
             locally_read_through: std::collections::HashMap::new(),
             teams: Vec::new(),
@@ -2477,6 +2490,23 @@ impl App {
                     }
                 };
 
+                // Feed an existing disk cache back through the normal warm-up
+                // message path even when it is already current. Besides restoring
+                // the preview, local Teams metadata (including learned contact
+                // names for personal/federated 1:1 chats) can then be rebuilt
+                // immediately at startup without an unnecessary Graph request.
+                if let Some((messages, _)) = cached.as_ref() {
+                    let _ = tx
+                        .send(AppMessage::ChatCacheWarmed {
+                            chat_id: chat_id.clone(),
+                            messages: messages.clone(),
+                        })
+                        .await;
+                    tracing::debug!(
+                        "Teams conversation cache restored into warm-up state for {chat_id}"
+                    );
+                }
+
                 let cache_is_current = cached.as_ref().is_some_and(|(messages, _)| match latest_id
                     .as_deref()
                 {
@@ -2565,13 +2595,237 @@ impl App {
         });
     }
 
+    fn configured_tenant_id(&self) -> Option<&str> {
+        let value = self.session.config.tenant_id.trim();
+        if value.is_empty()
+            || value.eq_ignore_ascii_case("common")
+            || value.eq_ignore_ascii_case("organizations")
+            || value.eq_ignore_ascii_case("consumers")
+        {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn remember_contact_from_chat(&mut self, chat: &Chat) -> bool {
+        if !chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            return false;
+        }
+
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+
+        if self.teams.own_tenant_id.is_none() {
+            let configured = self.configured_tenant_id().map(str::to_string);
+            let from_member = me_id.and_then(|id| {
+                chat.members
+                    .iter()
+                    .find(|member| member.user_id.as_deref() == Some(id))
+                    .and_then(|member| member.tenant_id.clone())
+            });
+            let from_chat = chat
+                .tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            self.teams.own_tenant_id = configured.or(from_member).or(from_chat);
+        }
+
+        let peer_member = chat.members.iter().find(|member| {
+            me_id
+                .map(|id| member.user_id.as_deref() != Some(id))
+                .unwrap_or(false)
+        });
+
+        let preview_peer = chat
+            .last_message_preview
+            .as_ref()
+            .and_then(|preview| preview.from.as_ref())
+            .and_then(|from| from.user.as_ref())
+            .filter(|user| {
+                me_id
+                    .map(|id| user.id.as_deref() != Some(id))
+                    .unwrap_or(false)
+            });
+
+        if let Some(name) = peer_member
+            .and_then(|member| member.display_name.as_deref())
+            .or_else(|| preview_peer.and_then(|user| user.display_name.as_deref()))
+            .or_else(|| peer_member.and_then(|member| member.email.as_deref()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.teams
+                .contact_names
+                .insert(chat.id.clone(), name.to_string());
+        }
+
+        let peer_id = peer_member
+            .and_then(|member| member.user_id.as_deref())
+            .or_else(|| preview_peer.and_then(|user| user.id.as_deref()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let learned_peer_id = peer_id.is_some_and(|id| {
+            let changed = self
+                .teams
+                .contact_user_ids
+                .insert(chat.id.clone(), id.to_string())
+                .as_deref()
+                != Some(id);
+            if changed {
+                tracing::debug!("Teams 1:1 peer id learned for {}: {}", chat.id, id);
+            }
+            changed
+        });
+
+        let peer_tenant = peer_member
+            .and_then(|member| member.tenant_id.as_deref())
+            .or_else(|| preview_peer.and_then(|user| user.tenant_id.as_deref()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let non_aad_member = peer_member
+            .and_then(|member| member.odata_type.as_deref())
+            .is_some_and(|kind| {
+                !kind.eq_ignore_ascii_case("#microsoft.graph.aadUserConversationMember")
+            });
+        let opaque_peer_id = peer_id.is_some_and(|id| !chats::looks_like_user_guid(id));
+
+        if non_aad_member || opaque_peer_id {
+            self.teams.external_chats.insert(chat.id.clone());
+            tracing::debug!(
+                "Teams 1:1 chat {} marked external: member_type={:?}, peer_id={:?}",
+                chat.id,
+                peer_member.and_then(|member| member.odata_type.as_deref()),
+                peer_id
+            );
+        } else if let (Some(own), Some(peer)) =
+            (self.teams.own_tenant_id.as_deref(), peer_tenant)
+        {
+            if own.eq_ignore_ascii_case(peer) {
+                self.teams.external_chats.remove(&chat.id);
+            } else {
+                self.teams.external_chats.insert(chat.id.clone());
+                tracing::debug!(
+                    "Teams 1:1 chat {} marked external: own tenant={}, peer tenant={}",
+                    chat.id,
+                    own,
+                    peer
+                );
+            }
+        }
+
+        learned_peer_id
+    }
+
+    fn remember_contacts_from_chats(&mut self, chats: &[Chat]) -> bool {
+        let mut learned_peer_id = false;
+        for chat in chats {
+            learned_peer_id |= self.remember_contact_from_chat(chat);
+        }
+        learned_peer_id
+    }
+
+    fn remember_contact_from_messages(
+        &mut self,
+        chat_id: &str,
+        messages: &[ChatMessage],
+    ) -> bool {
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+
+        if self.teams.own_tenant_id.is_none() {
+            self.teams.own_tenant_id = self.configured_tenant_id().map(str::to_string);
+        }
+
+        if self.teams.own_tenant_id.is_none() {
+            if let Some(tenant_id) = messages
+                .iter()
+                .filter_map(|message| message.from.as_ref()?.user.as_ref())
+                .find(|user| {
+                    me_id
+                        .map(|id| user.id.as_deref() == Some(id))
+                        .unwrap_or(false)
+                })
+                .and_then(|user| user.tenant_id.clone())
+            {
+                self.teams.own_tenant_id = Some(tenant_id);
+            }
+        }
+
+        let Some(peer) = messages
+            .iter()
+            .filter_map(|message| message.from.as_ref()?.user.as_ref())
+            .find(|user| {
+                me_id
+                    .map(|id| user.id.as_deref() != Some(id))
+                    .unwrap_or(false)
+            })
+        else {
+            return false;
+        };
+
+        if let Some(name) = peer
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.teams
+                .contact_names
+                .insert(chat_id.to_string(), name.to_string());
+        }
+
+        let learned_peer_id = peer
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|id| {
+                self.teams
+                    .contact_user_ids
+                    .insert(chat_id.to_string(), id.to_string())
+                    .as_deref()
+                    != Some(id)
+            });
+
+        let federated = peer
+            .user_identity_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("federatedUser"));
+
+        if federated {
+            self.teams.external_chats.insert(chat_id.to_string());
+        } else if let (Some(own), Some(peer_tenant)) = (
+            self.teams.own_tenant_id.as_deref(),
+            peer.tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ) {
+            if own.eq_ignore_ascii_case(peer_tenant) {
+                self.teams.external_chats.remove(chat_id);
+            } else {
+                self.teams.external_chats.insert(chat_id.to_string());
+            }
+        }
+
+        learned_peer_id
+    }
+
     fn load_contact_presences(&self, chats: &[Chat]) {
         if !self.session.config.presence_read {
             return;
         }
 
-        // Only one-to-one chats get a contact status. Collecting both members
-        // avoids depending on whether /me has completed before the chat list.
+        // Include both fresh member ids and ids learned from chat messages.
+        // Federated member objects sometimes omit fields that the message sender
+        // identity still supplies.
         let mut user_ids: Vec<String> = chats
             .iter()
             .filter(|chat| {
@@ -2581,6 +2835,8 @@ impl App {
             })
             .flat_map(|chat| chat.members.iter())
             .filter_map(|member| member.user_id.clone())
+            .chain(self.teams.contact_user_ids.values().cloned())
+            .filter(|id| chats::looks_like_user_guid(id))
             .collect();
         user_ids.sort();
         user_ids.dedup();
@@ -2592,15 +2848,51 @@ impl App {
         let s = self.session.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match people::presences(&s.graph, &user_ids).await {
-                Ok(items) => {
-                    let _ = tx.send(AppMessage::ContactPresences(items)).await;
+            let requested_ids = user_ids;
+            let mut items = match people::presences(&s.graph, &requested_ids).await {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::debug!(
+                        "batch contact presence refresh failed; trying direct lookups: {error:#}"
+                    );
+                    Vec::new()
                 }
-                Err(e) => {
-                    // Presence is optional UI decoration: never turn a 403 or
-                    // transient Graph failure into a broken Teams experience.
-                    tracing::warn!("contact presence refresh failed: {e:#}");
+            };
+
+            let mut returned: std::collections::HashSet<String> = items
+                .iter()
+                .filter_map(|presence| presence.id.clone())
+                .collect();
+
+            for user_id in requested_ids {
+                if returned.contains(&user_id) {
+                    continue;
                 }
+
+                match people::presence(&s.graph, &user_id).await {
+                    Ok(presence) => {
+                        tracing::debug!(
+                            "direct contact presence lookup succeeded for {user_id}: availability={:?} activity={:?}",
+                            presence.availability,
+                            presence.activity
+                        );
+                        if let Some(id) = presence.id.clone() {
+                            returned.insert(id);
+                        }
+                        items.push(presence);
+                    }
+                    Err(error) => {
+                        // This is expected for external users when cross-tenant
+                        // presence trust is not mutual.
+                        tracing::debug!(
+                            "direct contact presence lookup unavailable for {user_id}: {error:#}"
+                        );
+                    }
+                }
+            }
+
+            if !items.is_empty() {
+                let _ = tx.send(AppMessage::ContactPresences(items)).await;
             }
         });
     }
@@ -2614,7 +2906,13 @@ impl App {
             .iter()
             .filter_map(|chat| {
                 // Counts are intentionally limited to one-to-one chats.
-                chat.peer_user_id(Some(&me_id))?;
+                if !chat
+                    .chat_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+                {
+                    return None;
+                }
 
                 let latest_preview = chat.last_message_preview.as_ref()?;
                 let latest_id = latest_preview.id.as_deref()?;
@@ -2761,6 +3059,10 @@ impl App {
         match load_teams_conversation_cache(cache_root, chat_id) {
             Ok(Some((messages, next))) => {
                 let count = messages.len();
+                let learned_peer_id = self.remember_contact_from_messages(chat_id, &messages);
+                if learned_peer_id {
+                    self.load_contact_presences(&[]);
+                }
                 self.set_teams_messages(messages, next, ListUpdate::Replace);
                 tracing::debug!("Teams conversation cache hit for {chat_id}: {count} message(s)");
                 true
@@ -3414,6 +3716,11 @@ impl App {
                     u.best_email().unwrap_or("")
                 );
                 self.me = Some(u);
+                let chats = self.teams.chats.clone();
+                if !chats.is_empty() {
+                    self.remember_contacts_from_chats(&chats);
+                    self.load_contact_presences(&chats);
+                }
             }
             AppMessage::Folders(f) => {
                 // Folder loading is part of every network poll, so any successful
@@ -3559,6 +3866,7 @@ impl App {
             }
             AppMessage::Chats(c) => {
                 self.notify_for_chats(&c);
+                self.remember_contacts_from_chats(&c);
                 self.load_contact_presences(&c);
                 self.warm_teams_conversation_caches(&c);
 
@@ -3605,10 +3913,11 @@ impl App {
                 }
             }
             AppMessage::ContactPresences(items) => {
-                self.teams.contact_presences = items
-                    .into_iter()
-                    .filter_map(|presence| presence.id.clone().map(|id| (id, presence)))
-                    .collect();
+                for presence in items {
+                    if let Some(id) = presence.id.clone() {
+                        self.teams.contact_presences.insert(id, presence);
+                    }
+                }
             }
             AppMessage::ChatUnreadCount { chat_id, count } => {
                 if count == 0 {
@@ -3625,6 +3934,11 @@ impl App {
             } => {
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
                     let opened_now = self.teams.chat_open_pending_read.as_deref() == Some(&chat_id);
+                    let learned_peer_id =
+                        self.remember_contact_from_messages(&chat_id, &messages);
+                    if learned_peer_id {
+                        self.load_contact_presences(&[]);
+                    }
 
                     self.set_teams_messages(messages, next, mode);
                     self.persist_teams_conversation_cache(&chat_id);
@@ -3648,6 +3962,11 @@ impl App {
                 }
             }
             AppMessage::ChatCacheWarmed { chat_id, messages } => {
+                let learned_peer_id = self.remember_contact_from_messages(&chat_id, &messages);
+                if learned_peer_id {
+                    self.load_contact_presences(&[]);
+                }
+
                 let still_previewing = self.screen == Screen::Teams
                     && self.teams.mode == TeamsMode::Chats
                     && self.teams.focus == TeamsFocus::List

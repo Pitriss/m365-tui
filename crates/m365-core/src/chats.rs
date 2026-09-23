@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::graph::{DeltaPage, GraphClient};
-use crate::models::{Chat, ChatMessage};
+use crate::models::{Chat, ChatMessage, ConversationMember};
 use crate::util::base64_url_no_pad;
 use crate::util::html_escape;
 
@@ -15,7 +15,80 @@ pub async fn list_chats(graph: &GraphClient, top: u32) -> Result<Vec<Chat>> {
         "me/chats?$top={top}&$orderby=lastMessagePreview/createdDateTime desc\
          &$expand=members,lastMessagePreview"
     );
-    graph.get_page(&path).await
+    let mut chats: Vec<Chat> = graph.get_page(&path).await?;
+
+    // Federated chats can expose an opaque Teams identity (for example a
+    // non-GUID id) in the expanded roster/message sender. Presence endpoints,
+    // however, require the user's Entra object GUID. Refresh only suspicious
+    // 1:1 rosters through the federation-aware /members endpoint.
+    for chat in &mut chats {
+        let one_on_one = chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"));
+        let has_non_guid_user = chat
+            .members
+            .iter()
+            .filter_map(|member| member.user_id.as_deref())
+            .any(|id| !looks_like_user_guid(id));
+
+        if !one_on_one || !has_non_guid_user {
+            continue;
+        }
+
+        match list_members(graph, &chat.id).await {
+            Ok(members) if !members.is_empty() => {
+                tracing::debug!(
+                    "refreshed federated chat roster for {}: {} member(s)",
+                    chat.id,
+                    members.len()
+                );
+                chat.members = members;
+            }
+            Ok(_) => {
+                tracing::debug!("federated chat roster refresh returned no members for {}", chat.id);
+            }
+            Err(error) => {
+                // Keep the original expanded roster: naming/chat use must not
+                // fail merely because optional presence enrichment did.
+                tracing::debug!(
+                    "federated chat roster refresh failed for {}: {error:#}",
+                    chat.id
+                );
+            }
+        }
+    }
+
+    Ok(chats)
+}
+
+/// List the exact chat roster. This endpoint supports federation and returns
+/// aadUserConversationMember fields such as userId and tenantId when available.
+pub async fn list_members(
+    graph: &GraphClient,
+    chat_id: &str,
+) -> Result<Vec<ConversationMember>> {
+    graph
+        .get_collection(&format!("me/chats/{chat_id}/members"))
+        .await
+}
+
+pub fn looks_like_user_guid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 if byte == b'-' => {}
+            8 | 13 | 18 | 23 => return false,
+            _ if byte.is_ascii_hexdigit() => {}
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 /// List the first page of messages in a chat, newest first. Also returns the

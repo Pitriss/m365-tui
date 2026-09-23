@@ -200,6 +200,8 @@ pub struct Chat {
     #[serde(default)]
     pub chat_type: Option<String>,
     #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
     pub last_updated_date_time: Option<String>,
     #[serde(default)]
     pub members: Vec<ConversationMember>,
@@ -218,21 +220,69 @@ pub struct ChatViewpoint {
 
 impl Chat {
     /// A display label: the explicit topic, else the member names joined.
+    ///
+    /// Federated one-to-one chats can omit `members[].displayName`. In that
+    /// case, prefer the already-expanded last-message sender name before
+    /// falling back to the peer email or the raw chat type.
     pub fn label(&self, me_id: Option<&str>) -> String {
         if let Some(t) = self.topic.as_ref().filter(|t| !t.is_empty()) {
             return t.clone();
         }
+
+        let peer = |member: &&ConversationMember| {
+            me_id
+                .map(|id| member.user_id.as_deref() != Some(id))
+                .unwrap_or(true)
+        };
+
         let names: Vec<String> = self
             .members
             .iter()
-            .filter(|m| me_id.map(|id| m.user_id.as_deref() != Some(id)).unwrap_or(true))
-            .filter_map(|m| m.display_name.clone())
+            .filter(peer)
+            .filter_map(|m| m.display_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
             .collect();
-        if names.is_empty() {
-            self.chat_type.clone().unwrap_or_else(|| "chat".into())
-        } else {
-            names.join(", ")
+        if !names.is_empty() {
+            return names.join(", ");
         }
+
+        if self
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            if let Some(name) = self
+                .last_message_preview
+                .as_ref()
+                .and_then(|preview| preview.from.as_ref())
+                .and_then(|from| from.user.as_ref())
+                .filter(|user| {
+                    me_id
+                        .map(|id| user.id.as_deref() != Some(id))
+                        .unwrap_or(true)
+                })
+                .and_then(|user| user.display_name.as_deref())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                return name.to_string();
+            }
+
+            if let Some(email) = self
+                .members
+                .iter()
+                .filter(peer)
+                .filter_map(|member| member.email.as_deref())
+                .map(str::trim)
+                .find(|email| !email.is_empty())
+            {
+                return email.to_string();
+            }
+        }
+
+        self.chat_type.clone().unwrap_or_else(|| "chat".into())
     }
 
     /// Directory user id of the other participant in a one-to-one chat.
@@ -255,12 +305,16 @@ impl Chat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMember {
+    #[serde(rename = "@odata.type", default)]
+    pub odata_type: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
 }
@@ -322,6 +376,10 @@ pub struct Identity {
     pub id: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub user_identity_type: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// A Teams `chatMessage` (channel or chat).
@@ -858,6 +916,87 @@ pub struct Draft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_on_one_label_uses_last_message_sender_for_federated_peer() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-1",
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "userId": "me",
+                    "displayName": "Local User",
+                    "email": "me@example.com"
+                },
+                {
+                    "userId": "external-user"
+                }
+            ],
+            "lastMessagePreview": {
+                "id": "message-1",
+                "from": {
+                    "user": {
+                        "id": "external-user",
+                        "displayName": "External Person"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chat.label(Some("me")), "External Person");
+    }
+
+    #[test]
+    fn one_on_one_label_does_not_use_own_preview_name() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-2",
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "userId": "me",
+                    "displayName": "Local User",
+                    "email": "me@example.com"
+                },
+                {
+                    "userId": "external-user",
+                    "email": "external@example.net"
+                }
+            ],
+            "lastMessagePreview": {
+                "id": "message-2",
+                "from": {
+                    "user": {
+                        "id": "me",
+                        "displayName": "Local User"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chat.label(Some("me")), "external@example.net");
+    }
+
+    #[test]
+    fn one_on_one_label_keeps_chat_type_as_final_fallback() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-3",
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "userId": "me",
+                    "displayName": "Local User"
+                },
+                {
+                    "userId": "external-user"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(chat.label(Some("me")), "oneOnOne");
+    }
 
     /// The exact shape Graph returns for a reply in a chat.
     fn reply_message() -> ChatMessage {
