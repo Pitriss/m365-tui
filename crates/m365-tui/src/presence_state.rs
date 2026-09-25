@@ -481,6 +481,20 @@ mod tests {
             state.diagnostics(now).desired,
             SessionTarget::Present(previous)
         );
+
+        // A later ordinary Active sample must not erase the restored base.
+        state.on_activity(now + Duration::from_secs(2));
+        assert_eq!(
+            state.diagnostics(now).desired,
+            SessionTarget::Present(previous)
+        );
+
+        // A later ordinary Active sample must not erase the restored base.
+        state.on_activity(now + Duration::from_secs(2));
+        assert_eq!(
+            state.diagnostics(now).desired,
+            SessionTarget::Present(previous)
+        );
     }
 
     #[test]

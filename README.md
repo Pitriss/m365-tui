@@ -562,6 +562,12 @@ This also requires `Presence.ReadWrite`.
 
 The application refreshes the session while running and clears it when exiting.
 
+Application-session writes are serialized. m365-tui tracks the desired target
+separately from the last Graph-confirmed target, allows only one app-session
+write in flight, and reconciles any newer target after that write completes.
+F6 diagnostics show the manager mode, target, confirmed state, and current or
+retrying write.
+
 Application-session writes are serialized: only one Graph session write can be
 in flight at a time. If the desired state changes while a write is running,
 m365-tui waits for that write to finish and then converges to the newest target.
