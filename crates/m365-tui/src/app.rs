@@ -5605,6 +5605,37 @@ impl App {
         });
     }
 
+    fn hot_poll_new_messages<'a>(
+        messages: &'a [ChatMessage],
+        previous_message_id: Option<&str>,
+        newest_changed: bool,
+    ) -> Vec<&'a ChatMessage> {
+        if !newest_changed || messages.is_empty() {
+            return Vec::new();
+        }
+
+        // Graph does not guarantee the order of this endpoint strongly enough
+        // for notification sequencing. Reuse the conversation sort key so
+        // multiple arrivals are announced oldest -> newest.
+        let mut ordered: Vec<&ChatMessage> = messages.iter().collect();
+        ordered.sort_by_key(|message| sort_key(message));
+
+        if let Some(previous_message_id) = previous_message_id {
+            if let Some(previous_index) = ordered
+                .iter()
+                .position(|message| message.id == previous_message_id)
+            {
+                return ordered.into_iter().skip(previous_index + 1).collect();
+            }
+        }
+
+        // The baseline can fall out of PAGE_SIZE after a burst, or be absent
+        // when the hot state was created without a preview. Never replay a
+        // whole page of history in that case: keep the old safe behaviour and
+        // announce only the newest message.
+        ordered.into_iter().rev().take(1).collect()
+    }
+
     fn notify_for_hot_chat_message(&mut self, chat_id: &str, message: &ChatMessage) {
         if let Some(seen) = self.chat_seen.as_mut() {
             seen.insert(chat_id.to_string(), message.id.clone());
@@ -5711,16 +5742,20 @@ impl App {
             return;
         }
 
+        let previous_message_id = self
+            .teams_hot_chat_state
+            .get(&chat_id)
+            .and_then(|state| state.latest_message_id.clone());
         let newest = messages
             .iter()
             .max_by_key(|message| sort_key(message))
             .cloned();
         let changed = self.observe_teams_chat_page(&chat_id, &messages);
 
-        if changed {
-            if let Some(newest) = newest.as_ref() {
-                self.notify_for_hot_chat_message(&chat_id, newest);
-            }
+        for message in
+            Self::hot_poll_new_messages(&messages, previous_message_id.as_deref(), changed)
+        {
+            self.notify_for_hot_chat_message(&chat_id, message);
         }
 
         let previewing = self.screen == Screen::Teams
@@ -8061,7 +8096,8 @@ mod ntfy_snooze_poll_tests {
 
 #[cfg(test)]
 mod hot_poll_tests {
-    use super::{chat_poll_tier_from_age, teams_message_id_is_newer, ChatPollTier};
+    use super::{chat_poll_tier_from_age, teams_message_id_is_newer, App, ChatPollTier};
+    use m365_core::models::ChatMessage;
 
     #[test]
     fn message_id_tiebreak_is_monotonic() {
@@ -8069,6 +8105,60 @@ mod hot_poll_tests {
         assert!(!teams_message_id_is_newer("100", "101"));
         assert!(teams_message_id_is_newer("b", "a"));
         assert!(!teams_message_id_is_newer("a", "b"));
+    }
+
+    fn message(id: &str, created: &str) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "createdDateTime": created,
+            "body": {
+                "contentType": "text",
+                "content": id
+            }
+        }))
+        .expect("valid chat-message fixture")
+    }
+
+    #[test]
+    fn hot_poll_notifications_include_every_message_after_baseline() {
+        let messages = vec![
+            message("300", "2026-09-25T08:00:03Z"),
+            message("100", "2026-09-25T08:00:01Z"),
+            message("200", "2026-09-25T08:00:02Z"),
+        ];
+
+        let ids: Vec<&str> = App::hot_poll_new_messages(&messages, Some("100"), true)
+            .into_iter()
+            .map(|message| message.id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["200", "300"]);
+    }
+
+    #[test]
+    fn hot_poll_notification_missing_baseline_announces_only_newest() {
+        let messages = vec![
+            message("200", "2026-09-25T08:00:02Z"),
+            message("300", "2026-09-25T08:00:03Z"),
+            message("100", "2026-09-25T08:00:01Z"),
+        ];
+
+        let ids: Vec<&str> = App::hot_poll_new_messages(&messages, Some("missing"), true)
+            .into_iter()
+            .map(|message| message.id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["300"]);
+    }
+
+    #[test]
+    fn hot_poll_notification_does_nothing_without_newest_change() {
+        let messages = vec![
+            message("100", "2026-09-25T08:00:01Z"),
+            message("200", "2026-09-25T08:00:02Z"),
+        ];
+
+        assert!(App::hot_poll_new_messages(&messages, Some("100"), false).is_empty());
     }
 
     #[test]
