@@ -11,6 +11,7 @@
 //! configured. Anything else would greet a first-time user with a device-code
 //! prompt for asking what the flags are.
 
+mod activity;
 mod app;
 mod clipboard;
 mod content;

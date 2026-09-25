@@ -716,6 +716,55 @@ pub fn text(app: &App) -> String {
     }
     out.push(row("Skype Presence Service", "? not verified"));
     out.push(row("Skype Presence R/W", "? no Skype resource token"));
+
+    let activity = app.presence_activity_diagnostics();
+    out.push(row("Presence activity source", activity.requested));
+    out.push(row(
+        "Activity backend",
+        if activity.degraded {
+            format!("! {}", activity.backend)
+        } else {
+            format!("● {}", activity.backend)
+        },
+    ));
+    out.push(row("Session type", &activity.session_type));
+    out.push(row("Desktop state", activity.state));
+    out.push(row(
+        "Desktop idle",
+        activity
+            .idle_for
+            .map(|idle| format!("{:.1}s", idle.as_secs_f64()))
+            .unwrap_or_else(|| "unknown".into()),
+    ));
+    out.push(row(
+        "Screen locked",
+        match activity.locked {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        },
+    ));
+    out.push(row(
+        "Lock restore",
+        if app.presence_lock_restore_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    ));
+    if let Some(detail) = activity.detail.as_deref() {
+        out.push(row("Activity detail", detail));
+    }
+    out.push(row(
+        "Idle threshold",
+        format!(
+            "{}s",
+            app.session
+                .config
+                .presence_available_timeout_min
+                .saturating_mul(60)
+        ),
+    ));
     out.push(String::new());
 
     out.push("Runtime".into());

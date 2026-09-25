@@ -80,6 +80,29 @@ pub const PROFILE_PHOTO_SCOPE: &str = "User.ReadBasic.All";
 pub const DIRECTORY_PROFILE_SCOPE: &str = "User.Read.All";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceActivitySource {
+    Auto,
+    Desktop,
+    X11,
+    Wayland,
+    Logind,
+    App,
+}
+
+impl PresenceActivitySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Desktop => "desktop",
+            Self::X11 => "x11",
+            Self::Wayland => "wayland",
+            Self::Logind => "logind",
+            Self::App => "app",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeamsSystemEvents {
     Useful,
     All,
@@ -171,6 +194,11 @@ pub struct Config {
     /// Minutes of local inactivity before an automatic primary session becomes Away.
     /// Zero disables the automatic Away transition.
     pub presence_available_timeout_min: u64,
+    /// Local activity source used by automatic primary presence.
+    pub presence_activity_source: PresenceActivitySource,
+    /// Restore the pre-lock application presence after confirmed unlock activity.
+    /// Enabled by default; M365_PRESENCE_LOCK_RESTORE=0 disables it.
+    pub presence_lock_restore: bool,
     /// Download regular Teams image file attachments from SharePoint/OneDrive.
     pub teams_file_images: bool,
     /// Experimental direct Entra directory profile lookup for Teams contacts.
@@ -254,6 +282,14 @@ impl Config {
                 )?,
                 _ => 5,
             };
+        let presence_activity_source = parse_presence_activity_source(
+            std::env::var("M365_PRESENCE_ACTIVITY_SOURCE")
+                .ok()
+                .as_deref(),
+        )?;
+        let presence_lock_restore = parse_presence_lock_restore(
+            std::env::var("M365_PRESENCE_LOCK_RESTORE").ok().as_deref(),
+        )?;
 
         let scopes = match std::env::var("M365_SCOPES") {
             Ok(s) if !s.trim().is_empty() => s.split_whitespace().map(|s| s.to_string()).collect(),
@@ -361,6 +397,8 @@ impl Config {
             presence_read,
             presence_primary,
             presence_available_timeout_min,
+            presence_activity_source,
+            presence_lock_restore,
             teams_file_images,
             directory_profile,
             teams_image_cache_dir,
@@ -481,6 +519,35 @@ fn parse_calendar_notify(value: Option<&str>) -> Result<CalendarNotify> {
     }
 }
 
+fn parse_presence_activity_source(value: Option<&str>) -> Result<PresenceActivitySource> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(PresenceActivitySource::Auto),
+        Some(value) if value.eq_ignore_ascii_case("auto") => Ok(PresenceActivitySource::Auto),
+        Some(value) if value.eq_ignore_ascii_case("desktop") => {
+            Ok(PresenceActivitySource::Desktop)
+        }
+        Some(value) if value.eq_ignore_ascii_case("x11") => Ok(PresenceActivitySource::X11),
+        Some(value) if value.eq_ignore_ascii_case("wayland") => {
+            Ok(PresenceActivitySource::Wayland)
+        }
+        Some(value) if value.eq_ignore_ascii_case("logind") => {
+            Ok(PresenceActivitySource::Logind)
+        }
+        Some(value) if value.eq_ignore_ascii_case("app") => Ok(PresenceActivitySource::App),
+        Some(value) => anyhow::bail!(
+            "M365_PRESENCE_ACTIVITY_SOURCE must be one of: auto, desktop, x11, wayland, logind, app (got {value:?})"
+        ),
+    }
+}
+
+fn parse_presence_lock_restore(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(value) => anyhow::bail!("M365_PRESENCE_LOCK_RESTORE must be 0 or 1 (got {value:?})"),
+    }
+}
+
 fn parse_teams_system_events(value: Option<&str>) -> Result<TeamsSystemEvents> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok(TeamsSystemEvents::Useful),
@@ -560,6 +627,8 @@ mod tests {
             presence_read: false,
             presence_primary: false,
             presence_available_timeout_min: 5,
+            presence_activity_source: PresenceActivitySource::Auto,
+            presence_lock_restore: true,
             teams_file_images: false,
             directory_profile: false,
             teams_image_cache_dir: None,
@@ -570,6 +639,39 @@ mod tests {
             teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn parses_presence_activity_source() {
+        assert_eq!(
+            parse_presence_activity_source(None).unwrap(),
+            PresenceActivitySource::Auto
+        );
+        assert_eq!(
+            parse_presence_activity_source(Some(" X11 ")).unwrap(),
+            PresenceActivitySource::X11
+        );
+        assert_eq!(
+            parse_presence_activity_source(Some("wayland")).unwrap(),
+            PresenceActivitySource::Wayland
+        );
+        assert_eq!(
+            parse_presence_activity_source(Some("logind")).unwrap(),
+            PresenceActivitySource::Logind
+        );
+        assert_eq!(
+            parse_presence_activity_source(Some("app")).unwrap(),
+            PresenceActivitySource::App
+        );
+        assert!(parse_presence_activity_source(Some("keyboard")).is_err());
+    }
+
+    #[test]
+    fn parses_presence_lock_restore() {
+        assert!(parse_presence_lock_restore(None).unwrap());
+        assert!(parse_presence_lock_restore(Some("1")).unwrap());
+        assert!(!parse_presence_lock_restore(Some("0")).unwrap());
+        assert!(parse_presence_lock_restore(Some("true")).is_err());
     }
 
     #[test]

@@ -557,10 +557,45 @@ When primary presence is enabled:
 M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=5
 ```
 
-controls the number of minutes of local m365-tui inactivity before the
+controls the number of minutes of effective local inactivity before the
 application changes its own session from Available to Away.
 
-Any keypress or bracketed paste makes it Available again.
+By default, activity is detected from the desktop session as well as from
+keypresses/paste inside m365-tui:
+
+```dotenv
+M365_PRESENCE_ACTIVITY_SOURCE=auto
+```
+
+On X11, `auto` uses the XScreenSaver extension directly. No `xprintidle`
+process is required. On Wayland, the backend hierarchy already contains the
+`ext-idle-notify` path, but until that runtime path is tested m365-tui marks it
+as a prototype and conservatively falls back to systemd-logind
+`IdleHint`/`LockedHint`. F6 diagnostics show the selected backend and whether
+it is degraded.
+
+Available source values are `auto`, `desktop`, `x11`, `wayland`, `logind`,
+and `app`. `app` restores the historical behaviour where only input received
+by m365-tui resets the timer.
+
+A locked session temporarily overrides m365-tui's own automatic primary
+presence session to Away. Lock restore is enabled by default: m365-tui remembers
+the application-session presence that was active before the lock and, after
+unlock plus confirmed user activity, restores that saved presence. If no saved
+presence exists, it uses the normal automatic default for active use.
+
+To disable saving/restoring the pre-lock application presence, set:
+
+```dotenv
+M365_PRESENCE_LOCK_RESTORE=0
+```
+
+This setting changes only m365-tui's own presence session. Microsoft Graph still
+aggregates presence using its normal precedence, so a user-preferred status,
+Do Not Disturb, Busy/InAMeeting/InACall from other sessions/calendar context,
+or automatic Out of Office can remain the effective Teams presence instead of
+the restored application session. F6 reports `Lock restore` as `enabled` or
+`disabled`; it does not expose transient internal saved-state wording.
 
 Set:
 

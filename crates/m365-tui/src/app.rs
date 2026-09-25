@@ -976,8 +976,13 @@ pub struct App {
     presence_session_at: Option<std::time::Instant>,
     /// Whether Available/Away is currently managed by primary-presence mode.
     presence_primary_auto: bool,
-    /// Last local keyboard/paste activity used by the primary-presence timer.
+    /// Last effective local/desktop activity used by the primary-presence timer.
     presence_last_activity: std::time::Instant,
+    /// Desktop-session activity monitor (X11 now; Wayland prototype/fallback).
+    presence_activity: crate::activity::ActivityMonitor,
+    /// Our application-session state to restore after a temporary screen-lock
+    /// Away override. Graph still aggregates calendar/call/preferred states.
+    presence_lock_saved: Option<(&'static str, &'static str)>,
     /// Resident memory in KiB, refreshed on each tick.
     pub rss_kb: Option<u64>,
     /// Copy of `status` as of the last tick, plus how many ticks it has been
@@ -2077,6 +2082,8 @@ impl App {
             session.config.teams_poll_budget_rps,
             session.graph.throttle_generation(),
         );
+        let presence_activity =
+            crate::activity::ActivityMonitor::new(session.config.presence_activity_source);
 
         let mut app = Self {
             session,
@@ -2123,6 +2130,8 @@ impl App {
             presence_session_at: None,
             presence_primary_auto: false,
             presence_last_activity: std::time::Instant::now(),
+            presence_activity,
+            presence_lock_saved: None,
             rss_kb: read_rss_kb(),
             last_status: String::new(),
             status_ticks: 0,
@@ -2602,27 +2611,90 @@ impl App {
             return;
         }
 
-        self.presence_session = Some(("Available", "Available"));
-        self.presence_session_at = Some(std::time::Instant::now());
         self.presence_primary_auto = true;
-        self.presence_last_activity = std::time::Instant::now();
+        self.presence_lock_saved = None;
+        let timeout = self.presence_idle_timeout();
+        let snapshot = self.presence_activity.sample(timeout);
+        let now = std::time::Instant::now();
+        self.presence_last_activity = snapshot
+            .idle_for
+            .and_then(|idle| now.checked_sub(idle))
+            .unwrap_or(now);
 
+        let initial = if matches!(
+            snapshot.state,
+            crate::activity::ActivityState::Idle | crate::activity::ActivityState::Locked
+        ) {
+            ("Away", "Away")
+        } else {
+            ("Available", "Available")
+        };
+
+        self.presence_session = Some(initial);
+        self.presence_session_at = Some(now);
+
+        let s = self.session.clone();
+        let client_id = self.session.config.client_id.clone();
+        let (availability, activity) = initial;
+        self.spawn(async move {
+            people::set_session_presence(
+                &s.graph,
+                &client_id,
+                availability,
+                activity,
+                PRESENCE_SESSION_LEASE,
+            )
+            .await?;
+            Ok(AppMessage::Presence {
+                presence: people::my_presence(&s.graph).await?,
+                requested: Some(availability.to_string()),
+            })
+        });
+    }
+
+    fn presence_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.session
+                .config
+                .presence_available_timeout_min
+                .saturating_mul(60),
+        )
+    }
+
+    fn publish_primary_presence(&mut self, availability: &'static str, activity: &'static str) {
+        if self.presence_session == Some((availability, activity)) {
+            return;
+        }
+
+        self.presence_session = Some((availability, activity));
+        self.presence_session_at = Some(std::time::Instant::now());
         let s = self.session.clone();
         let client_id = self.session.config.client_id.clone();
         self.spawn(async move {
             people::set_session_presence(
                 &s.graph,
                 &client_id,
-                "Available",
-                "Available",
+                availability,
+                activity,
                 PRESENCE_SESSION_LEASE,
             )
             .await?;
             Ok(AppMessage::Presence {
                 presence: people::my_presence(&s.graph).await?,
-                requested: Some("Available".to_string()),
+                requested: Some(availability.to_string()),
             })
         });
+    }
+
+    fn presence_after_unlock_or_activity(&mut self) -> (&'static str, &'static str) {
+        if self.session.config.presence_lock_restore {
+            self.presence_lock_saved
+                .take()
+                .unwrap_or(("Available", "Available"))
+        } else {
+            self.presence_lock_saved = None;
+            ("Available", "Available")
+        }
     }
 
     /// Record local activity. If the automatic primary session had gone idle,
@@ -2633,28 +2705,8 @@ impl App {
         }
 
         self.presence_last_activity = std::time::Instant::now();
-        if self.presence_session == Some(("Available", "Available")) {
-            return;
-        }
-
-        self.presence_session = Some(("Available", "Available"));
-        self.presence_session_at = Some(std::time::Instant::now());
-        let s = self.session.clone();
-        let client_id = self.session.config.client_id.clone();
-        self.spawn(async move {
-            people::set_session_presence(
-                &s.graph,
-                &client_id,
-                "Available",
-                "Available",
-                PRESENCE_SESSION_LEASE,
-            )
-            .await?;
-            Ok(AppMessage::Presence {
-                presence: people::my_presence(&s.graph).await?,
-                requested: Some("Available".to_string()),
-            })
-        });
+        let desired = self.presence_after_unlock_or_activity();
+        self.publish_primary_presence(desired.0, desired.1);
     }
 
     /// Change the automatic primary session to Away after the configured period
@@ -2664,33 +2716,78 @@ impl App {
             return;
         }
 
-        let timeout_min = self.session.config.presence_available_timeout_min;
-        if timeout_min == 0
-            || self.presence_last_activity.elapsed()
-                < std::time::Duration::from_secs(timeout_min.saturating_mul(60))
-            || self.presence_session == Some(("Away", "Away"))
-        {
+        let timeout = self.presence_idle_timeout();
+        if timeout.is_zero() || self.presence_last_activity.elapsed() < timeout {
             return;
         }
 
-        self.presence_session = Some(("Away", "Away"));
-        self.presence_session_at = Some(std::time::Instant::now());
-        let s = self.session.clone();
-        let client_id = self.session.config.client_id.clone();
-        self.spawn(async move {
-            people::set_session_presence(
-                &s.graph,
-                &client_id,
-                "Away",
-                "Away",
-                PRESENCE_SESSION_LEASE,
-            )
-            .await?;
-            Ok(AppMessage::Presence {
-                presence: people::my_presence(&s.graph).await?,
-                requested: Some("Away".to_string()),
-            })
-        });
+        self.publish_primary_presence("Away", "Away");
+    }
+
+    fn refresh_presence_activity(&mut self) {
+        if !self.session.config.presence_primary || !self.presence_primary_auto {
+            return;
+        }
+
+        let timeout = self.presence_idle_timeout();
+        if timeout.is_zero() {
+            return;
+        }
+
+        let snapshot = self.presence_activity.sample(timeout);
+        let now = std::time::Instant::now();
+
+        match snapshot.state {
+            crate::activity::ActivityState::Active => {
+                if let Some(idle) = snapshot.idle_for {
+                    if let Some(candidate) = now.checked_sub(idle) {
+                        if candidate > self.presence_last_activity {
+                            self.presence_last_activity = candidate;
+                        }
+                    }
+                } else {
+                    // logind only says "not idle"; without an exact duration,
+                    // treat the session as recently active.
+                    self.presence_last_activity = now;
+                }
+
+                // Lock is a temporary override of our own app session. If lock
+                // restore is enabled, reuse the saved pre-lock application session.
+                // With no saved state (or restore disabled), use the normal automatic
+                // default for confirmed activity: Available/Available. Graph still
+                // applies higher-priority calendar/call/preferred presence normally.
+                let desired = self.presence_after_unlock_or_activity();
+                self.publish_primary_presence(desired.0, desired.1);
+            }
+            crate::activity::ActivityState::Locked => {
+                if self.session.config.presence_lock_restore {
+                    if self.presence_lock_saved.is_none() {
+                        self.presence_lock_saved = self.presence_session;
+                    }
+                } else {
+                    self.presence_lock_saved = None;
+                }
+                self.publish_primary_presence("Away", "Away");
+            }
+            crate::activity::ActivityState::Idle => {
+                // LockedHint may disappear before a real activity event. Keep
+                // the restore target pending until activity is confirmed.
+                self.publish_primary_presence("Away", "Away");
+            }
+            crate::activity::ActivityState::Unknown => {
+                // Backend unavailable: preserve the old app-local behaviour.
+                // Keep a pending lock restore until definite local activity.
+                self.update_primary_presence_idle();
+            }
+        }
+    }
+
+    pub fn presence_activity_diagnostics(&self) -> crate::activity::ActivityDiagnostics {
+        self.presence_activity.diagnostics()
+    }
+
+    pub fn presence_lock_restore_enabled(&self) -> bool {
+        self.session.config.presence_lock_restore
     }
 
     /// Apply a chosen status: record the sticky preference *and* publish this
@@ -2698,6 +2795,7 @@ impl App {
     /// visible when no Teams client is running.
     fn set_presence(&mut self, opt: &'static PresenceOption) {
         self.presence_primary_auto = false;
+        self.presence_lock_saved = None;
         self.presence_session = opt.session;
         self.presence_session_at = Some(std::time::Instant::now());
 
@@ -2753,6 +2851,7 @@ impl App {
         let primary =
             self.session.config.presence_primary && self.session.config.can_write_presence();
         self.presence_primary_auto = primary;
+        self.presence_lock_saved = None;
         self.presence_last_activity = std::time::Instant::now();
         self.presence_session = primary.then_some(("Available", "Available"));
         self.presence_session_at = primary.then_some(std::time::Instant::now());
@@ -5173,7 +5272,7 @@ impl App {
                     }
                     self.notice_until = None;
                 }
-                self.update_primary_presence_idle();
+                self.refresh_presence_activity();
                 self.expire_ntfy_snooze_if_due();
                 self.rss_kb = read_rss_kb();
                 // Clear a message once it has sat unchanged for a while, so the
