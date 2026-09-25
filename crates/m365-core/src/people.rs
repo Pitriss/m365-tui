@@ -82,6 +82,32 @@ pub async fn clear_preferred_presence(graph: &GraphClient) -> Result<()> {
         .await
 }
 
+/// Set the signed-in user's Teams presence status message.
+///
+/// The Graph API accepts only text content. Omitting expiryDateTime means the
+/// message remains until it is replaced or explicitly cleared.
+pub async fn set_status_message(graph: &GraphClient, user_id: &str, message: &str) -> Result<()> {
+    graph
+        .post_action(
+            &format!("users/{user_id}/presence/setStatusMessage"),
+            &json!({
+                "statusMessage": {
+                    "message": {
+                        "content": message,
+                        "contentType": "text"
+                    }
+                }
+            }),
+        )
+        .await
+}
+
+/// Clear the Teams presence status message by publishing empty text.
+pub async fn clear_status_message(graph: &GraphClient, user_id: &str) -> Result<()> {
+    set_status_message(graph, user_id, "").await
+}
+
+
 /// Relevant people for the signed-in user, optionally filtered by a search term
 /// (matches name or email).
 pub async fn relevant_people(graph: &GraphClient, search: Option<&str>) -> Result<Vec<Person>> {

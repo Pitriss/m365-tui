@@ -856,6 +856,13 @@ pub struct OutOfOfficeSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PresenceStatusMessage {
+    #[serde(default)]
+    pub message: Option<ItemBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Presence {
     #[serde(default)]
     pub id: Option<String>,
@@ -865,6 +872,22 @@ pub struct Presence {
     pub activity: Option<String>,
     #[serde(default)]
     pub out_of_office_settings: Option<OutOfOfficeSettings>,
+    #[serde(default)]
+    pub status_message: Option<PresenceStatusMessage>,
+}
+
+impl Presence {
+    /// User-authored Teams presence status message, if one is currently set.
+    pub fn status_message_text(&self) -> Option<&str> {
+        self.status_message
+            .as_ref()?
+            .message
+            .as_ref()?
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+    }
 }
 
 /// A mail attachment. Listing deliberately omits `contentBytes` — those are

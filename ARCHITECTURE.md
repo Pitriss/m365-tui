@@ -63,7 +63,7 @@ therefore opt-in rather than added to the defaults:
 | Scope | Flag | Without it |
 |---|---|---|
 | `Team.ReadBasic.All` | `M365_TEAMS_CHANNELS` | Channels are unavailable; chats work |
-| `Presence.ReadWrite` | `M365_PRESENCE_WRITE` | The status picker is read-only |
+| `Presence.ReadWrite` | `M365_PRESENCE_WRITE` | Own presence and status-message controls are read-only |
 
 Capabilities behind an opt-in scope check `Config::can_*` before calling, so the
 UI explains what's missing instead of surfacing a Graph 403.
@@ -501,6 +501,21 @@ Two places take data from anyone who can send you a message:
   outranks the app's session, and the session vocabulary is narrower than the
   preference one (`Busy` must be `InACall`, `DoNotDisturb` must be
   `Presenting`).
+- **Application-session presence is serialized.** Local presence management
+  tracks a desired target separately from the last Graph-confirmed target and
+  permits only one `setPresence`/`clearPresence` write at a time. State changes
+  that arrive while a write is in flight are reconciled after that write
+  completes. Failed writes retain the confirmed state and retry after a short
+  backoff; lease renewal uses the same serialized path.
+- **Idle and lock Away are temporary automatic overrides.** Automatic mode saves
+  the pre-idle application-session state before publishing Away and restores it
+  after confirmed activity. Lock uses the same principle. A zero idle timeout
+  disables inactivity-driven Away but intentionally does not disable lock
+  detection.
+- **Teams status messages are independent of presence-session state.** They use
+  Graph `setStatusMessage` with plain-text content and the same delegated
+  `Presence.ReadWrite` permission. m365-tui does not supply an expiry time, so
+  the message remains until changed or cleared.
 - **No call media.** Joining Teams audio/video is not a terminal capability.
 
 ## Releases

@@ -270,7 +270,8 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Links => "1-9 open · y copy · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
             Overlay::React => "1-7 react · Esc close",
-            Overlay::Presence => "1-6 set · c clear · Esc close",
+            Overlay::Presence => "1-6 set · m message · c clear message · a auto · Esc close",
+            Overlay::PresenceMessage(_) => "Enter set · Esc cancel",
             Overlay::NtfySnooze { .. } => "j/k choose · Enter apply · c/0 resume · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
@@ -2205,6 +2206,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  M365 TUI — keys\n\
  \n\
  Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · F6 diagnostics · F7 contact diagnostics · Ctrl+P palette · p presence · ? help · q quit\n\
+  Presence: p menu · 1-6 state · m set/edit status message · c clear message · a automatic\n\
  \n\
  NTFY:    F4 menu · j/k choose · Enter apply · c/0 resume now · Esc cancel\n\
           Snooze: 1h · 2h · 4h · 8h · 12h · 24h · Resume now\n\
@@ -2658,7 +2660,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             );
         }
         Overlay::Presence => {
-            let area = centered(46, 55, f.area());
+            let area = centered(64, 82, f.area());
             f.render_widget(Clear, area);
             let mut body = String::new();
             if let Some(a) = app
@@ -2666,21 +2668,62 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 .as_ref()
                 .and_then(|p| p.availability.as_deref())
             {
-                body.push_str(&format!("Current: {a}\n\n"));
+                body.push_str(&format!("Current: {a}\n"));
             }
+            let status_message = app
+                .my_presence
+                .as_ref()
+                .and_then(m365_core::models::Presence::status_message_text)
+                .map(|message| truncate(message, 48))
+                .unwrap_or_else(|| "(none)".to_string());
+            body.push_str(&format!("Status message: {status_message}\n\n"));
             for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
                 body.push_str(&format!("{}  {}\n", i + 1, opt.label));
             }
-            body.push_str("\nc  Clear (revert to automatic)\nEsc cancel");
             body.push_str(
-                "\n\nThis app publishes its own presence session, so the status\nshows even with no Teams client running. Quitting clears it.",
+                "\nm  Set/edit status message\nc  Clear status message\na  Clear presence (revert to automatic)\nEsc cancel",
             );
             if !app.session.config.can_write_presence() {
                 body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");
             }
             f.render_widget(
-                Paragraph::new(body).block(popup_block("Set presence")),
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .block(popup_block("Set presence")),
                 area,
+            );
+        }
+        Overlay::PresenceMessage(input) => {
+            let area = centered(72, 28, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Set Teams status message");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .split(inner);
+
+            f.render_widget(
+                Paragraph::new("Text shown as your Teams presence status message.\nNo expiry is set; use c in the presence menu to clear it."),
+                rows[0],
+            );
+
+            if let Some((x, y)) = render_line_field(f, rows[1], "> ", input, true) {
+                f.set_cursor_position((x, y));
+            }
+
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "Enter set · ←/→ move · Ctrl+←/→ word · Ctrl+W/U/K delete · Esc cancel",
+                    Style::default().fg(DIM),
+                )),
+                rows[2],
             );
         }
     }
@@ -3047,6 +3090,7 @@ mod tests {
                 availability: Some(availability.to_string()),
                 activity: Some(activity.to_string()),
                 out_of_office_settings: None,
+                status_message: None,
             }
         }
 

@@ -13,6 +13,7 @@
 
 mod activity;
 mod app;
+mod presence_state;
 mod clipboard;
 mod content;
 mod diagnostics;
@@ -271,7 +272,7 @@ async fn run_tui(session: Session) -> Result<()> {
 
     // Drop our presence session on the way out, otherwise the user would keep
     // showing the status we published for up to the session lease.
-    if app.presence_session.is_some() {
+    if app.presence_session_active_on_exit() {
         let client_id = app.session.config.client_id.clone();
         if let Err(e) =
             m365_core::people::clear_session_presence(&app.session.graph, &client_id).await

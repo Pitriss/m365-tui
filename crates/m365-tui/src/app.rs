@@ -27,6 +27,10 @@ use crate::diagnostics::{
 };
 use crate::editor::TextInput;
 use crate::navigation;
+use crate::presence_state::{
+    PresenceStateDiagnostics, PresenceStateManager, PresenceWrite, SessionTarget, WriteReason,
+    AVAILABLE, AWAY,
+};
 
 /// Messages sent from background tasks to the UI loop.
 #[derive(Debug)]
@@ -122,6 +126,20 @@ pub enum AppMessage {
     },
     /// Silent own-presence refresh used by ntfy `away` forwarding.
     PresenceRefresh(Presence),
+    /// Completion of a Teams presence status-message update.
+    PresenceStatusMessageUpdated {
+        presence: Presence,
+        cleared: bool,
+    },
+    /// Completion of one serialized write to this app's presence session.
+    PresenceSessionWriteFinished {
+        write: PresenceWrite,
+        requested: Option<String>,
+        presence: Option<Presence>,
+        success: bool,
+        error: Option<String>,
+        retry_preference: Option<PresencePreferenceAction>,
+    },
     /// Silent Microsoft 365 work-plan result used by `alwayswd` / `awaywd`.
     NtfyWorkPlan(bool),
     /// Fresh read-only data for the F6 diagnostics overlay.
@@ -261,6 +279,8 @@ pub enum Overlay {
     React,
     /// Presence (status) picker for the signed-in user.
     Presence,
+    /// Single-line editor for the Teams presence status message.
+    PresenceMessage(TextInput),
     /// Temporary pause for ntfy forwarding.
     NtfySnooze {
         sel: usize,
@@ -306,6 +326,16 @@ pub enum ListUpdate {
 
 /// Emoji reactions offered in the picker, keyed 1-7.
 pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresencePreferenceAction {
+    Set {
+        availability: &'static str,
+        activity: &'static str,
+        label: &'static str,
+    },
+    Clear,
+}
 
 /// A status the user can pick.
 pub struct PresenceOption {
@@ -970,19 +1000,14 @@ pub struct App {
     chat_unread_refresh_running: bool,
     /// Inbox message ids already seen, same baseline rule as `chat_seen`.
     mail_seen: Option<std::collections::HashSet<String>>,
-    /// The presence session this app is currently publishing, and when it was
-    /// last asserted — sessions expire, so they need renewing.
-    pub presence_session: Option<(&'static str, &'static str)>,
-    presence_session_at: Option<std::time::Instant>,
-    /// Whether Available/Away is currently managed by primary-presence mode.
-    presence_primary_auto: bool,
-    /// Last effective local/desktop activity used by the primary-presence timer.
-    presence_last_activity: std::time::Instant,
+    /// State and transitions for the application presence session published by
+    /// m365-tui. Graph's effective user presence remains separate in `my_presence`.
+    presence_state: PresenceStateManager,
     /// Desktop-session activity monitor (X11 now; Wayland prototype/fallback).
     presence_activity: crate::activity::ActivityMonitor,
-    /// Our application-session state to restore after a temporary screen-lock
-    /// Away override. Graph still aggregates calendar/call/preferred states.
-    presence_lock_saved: Option<(&'static str, &'static str)>,
+    /// Preferred-presence operation that must run immediately before the next
+    /// serialized app-session write. Newer user choices replace older queued ones.
+    presence_preference_pending: Option<PresencePreferenceAction>,
     /// Resident memory in KiB, refreshed on each tick.
     pub rss_kb: Option<u64>,
     /// Copy of `status` as of the last tick, plus how many ticks it has been
@@ -2084,6 +2109,7 @@ impl App {
         );
         let presence_activity =
             crate::activity::ActivityMonitor::new(session.config.presence_activity_source);
+        let presence_state = PresenceStateManager::new(session.config.presence_lock_restore);
 
         let mut app = Self {
             session,
@@ -2126,12 +2152,9 @@ impl App {
             teams_background_limiter,
             chat_unread_refresh_running: false,
             mail_seen: None,
-            presence_session: None,
-            presence_session_at: None,
-            presence_primary_auto: false,
-            presence_last_activity: std::time::Instant::now(),
+            presence_state,
             presence_activity,
-            presence_lock_saved: None,
+            presence_preference_pending: None,
             rss_kb: read_rss_kb(),
             last_status: String::new(),
             status_ticks: 0,
@@ -2254,6 +2277,30 @@ impl App {
                 people::my_presence(&s.graph).await?,
             ))
         });
+    }
+
+    fn apply_presence_result(&mut self, presence: Presence, requested: Option<String>) {
+        let effective = presence.availability.clone().unwrap_or_default();
+        self.status = match requested {
+            Some(req) if effective.eq_ignore_ascii_case(&req) => {
+                format!("presence set to {req}")
+            }
+            // e.g. requested Available, Teams reports AvailableIdle.
+            Some(req) if effective.to_lowercase().starts_with(&req.to_lowercase()) => {
+                format!("presence set to {req} (Teams reports {effective})")
+            }
+            // Chose "Appear offline": Offline is the expected outcome.
+            Some(req) if effective.eq_ignore_ascii_case("Offline") => {
+                format!("presence set to {req} (you appear Offline)")
+            }
+            // Graph settled on something else — usually another client or a
+            // higher-priority meeting/call/preferred state.
+            Some(req) => format!(
+                "presence set to {req}; Teams currently shows '{effective}' (a higher-priority state can override this app session)"
+            ),
+            None => format!("presence: {effective}"),
+        };
+        self.my_presence = Some(presence);
     }
 
     fn refresh_ntfy_work_plan(&self) {
@@ -2611,45 +2658,23 @@ impl App {
             return;
         }
 
-        self.presence_primary_auto = true;
-        self.presence_lock_saved = None;
         let timeout = self.presence_idle_timeout();
         let snapshot = self.presence_activity.sample(timeout);
         let now = std::time::Instant::now();
-        self.presence_last_activity = snapshot
+        let last_activity = snapshot
             .idle_for
             .and_then(|idle| now.checked_sub(idle))
             .unwrap_or(now);
-
-        let initial = if matches!(
-            snapshot.state,
-            crate::activity::ActivityState::Idle | crate::activity::ActivityState::Locked
-        ) {
-            ("Away", "Away")
+        let locked = snapshot.state == crate::activity::ActivityState::Locked;
+        let base = if snapshot.state == crate::activity::ActivityState::Idle && !timeout.is_zero() {
+            AWAY
         } else {
-            ("Available", "Available")
+            AVAILABLE
         };
 
-        self.presence_session = Some(initial);
-        self.presence_session_at = Some(now);
-
-        let s = self.session.clone();
-        let client_id = self.session.config.client_id.clone();
-        let (availability, activity) = initial;
-        self.spawn(async move {
-            people::set_session_presence(
-                &s.graph,
-                &client_id,
-                availability,
-                activity,
-                PRESENCE_SESSION_LEASE,
-            )
-            .await?;
-            Ok(AppMessage::Presence {
-                presence: people::my_presence(&s.graph).await?,
-                requested: Some(availability.to_string()),
-            })
-        });
+        self.presence_state
+            .start_automatic(base, last_activity, locked);
+        self.pump_presence_session_write();
     }
 
     fn presence_idle_timeout(&self) -> std::time::Duration {
@@ -2661,222 +2686,252 @@ impl App {
         )
     }
 
-    fn publish_primary_presence(&mut self, availability: &'static str, activity: &'static str) {
-        if self.presence_session == Some((availability, activity)) {
+    /// Start the next required app-session write, if no other presence write is
+    /// in flight. `presence_state` compares desired and confirmed state and also
+    /// decides when the lease needs renewal.
+    fn pump_presence_session_write(&mut self) {
+        let force_sync = self.presence_preference_pending.is_some();
+        let now = std::time::Instant::now();
+        let Some(write) = self
+            .presence_state
+            .next_write(now, PRESENCE_RENEW_AFTER, force_sync)
+        else {
             return;
-        }
+        };
 
-        self.presence_session = Some((availability, activity));
-        self.presence_session_at = Some(std::time::Instant::now());
+        let preference = self.presence_preference_pending.take();
+        let requested = match preference {
+            Some(PresencePreferenceAction::Set { label, .. }) => Some(label.to_string()),
+            Some(PresencePreferenceAction::Clear) => None,
+            None if write.reason == WriteReason::Sync => match write.target {
+                SessionTarget::Present((availability, _)) => Some(availability.to_string()),
+                SessionTarget::Absent => None,
+            },
+            None => None,
+        };
+
+        self.spawn_presence_session_write(write, preference, requested);
+    }
+
+    fn spawn_presence_session_write(
+        &self,
+        write: PresenceWrite,
+        preference: Option<PresencePreferenceAction>,
+        requested: Option<String>,
+    ) {
         let s = self.session.clone();
+        let tx = self.tx.clone();
         let client_id = self.session.config.client_id.clone();
-        self.spawn(async move {
-            people::set_session_presence(
-                &s.graph,
-                &client_id,
-                availability,
-                activity,
-                PRESENCE_SESSION_LEASE,
-            )
-            .await?;
-            Ok(AppMessage::Presence {
-                presence: people::my_presence(&s.graph).await?,
-                requested: Some(availability.to_string()),
-            })
+
+        tokio::spawn(async move {
+            if let Some(action) = preference {
+                let result = match action {
+                    PresencePreferenceAction::Set {
+                        availability,
+                        activity,
+                        ..
+                    } => people::set_preferred_presence(&s.graph, availability, activity).await,
+                    PresencePreferenceAction::Clear => {
+                        people::clear_preferred_presence(&s.graph).await
+                    }
+                };
+
+                if let Err(error) = result {
+                    let _ = tx
+                        .send(AppMessage::PresenceSessionWriteFinished {
+                            write,
+                            requested,
+                            presence: None,
+                            success: false,
+                            error: Some(format!("{error:#}")),
+                            retry_preference: Some(action),
+                        })
+                        .await;
+                    return;
+                }
+            }
+
+            let result = match write.target {
+                SessionTarget::Present((availability, activity)) => {
+                    people::set_session_presence(
+                        &s.graph,
+                        &client_id,
+                        availability,
+                        activity,
+                        PRESENCE_SESSION_LEASE,
+                    )
+                    .await
+                }
+                SessionTarget::Absent => people::clear_session_presence(&s.graph, &client_id).await,
+            };
+
+            if let Err(error) = result {
+                let _ = tx
+                    .send(AppMessage::PresenceSessionWriteFinished {
+                        write,
+                        requested,
+                        presence: None,
+                        success: false,
+                        error: Some(format!("{error:#}")),
+                        retry_preference: None,
+                    })
+                    .await;
+                return;
+            }
+
+            // Lease renewal is intentionally silent. State transitions still
+            // refresh Graph's effective presence for the tab bar/status message.
+            let (presence, error) = if write.reason == WriteReason::Renew && preference.is_none() {
+                (None, None)
+            } else {
+                match people::my_presence(&s.graph).await {
+                    Ok(presence) => (Some(presence), None),
+                    Err(error) => (None, Some(format!("presence readback failed: {error:#}"))),
+                }
+            };
+
+            let _ = tx
+                .send(AppMessage::PresenceSessionWriteFinished {
+                    write,
+                    requested,
+                    presence,
+                    success: true,
+                    error,
+                    retry_preference: None,
+                })
+                .await;
         });
     }
 
-    fn presence_after_unlock_or_activity(&mut self) -> (&'static str, &'static str) {
-        if self.session.config.presence_lock_restore {
-            self.presence_lock_saved
-                .take()
-                .unwrap_or(("Available", "Available"))
-        } else {
-            self.presence_lock_saved = None;
-            ("Available", "Available")
-        }
-    }
-
-    /// Record local activity. If the automatic primary session had gone idle,
-    /// immediately publish Available again.
+    /// Direct input received by m365-tui is a confirmed local activity event.
     fn note_presence_activity(&mut self) {
-        if !self.session.config.presence_primary || !self.presence_primary_auto {
-            return;
-        }
-
-        self.presence_last_activity = std::time::Instant::now();
-        let desired = self.presence_after_unlock_or_activity();
-        self.publish_primary_presence(desired.0, desired.1);
-    }
-
-    /// Change the automatic primary session to Away after the configured period
-    /// of local inactivity. The normal UI Tick provides the timer cadence.
-    fn update_primary_presence_idle(&mut self) {
-        if !self.session.config.presence_primary || !self.presence_primary_auto {
-            return;
-        }
-
-        let timeout = self.presence_idle_timeout();
-        if timeout.is_zero() || self.presence_last_activity.elapsed() < timeout {
-            return;
-        }
-
-        self.publish_primary_presence("Away", "Away");
+        let now = std::time::Instant::now();
+        self.presence_state.on_activity(now);
+        self.pump_presence_session_write();
     }
 
     fn refresh_presence_activity(&mut self) {
-        if !self.session.config.presence_primary || !self.presence_primary_auto {
+        if !self.session.config.presence_primary || !self.presence_state.is_automatic() {
             return;
         }
 
         let timeout = self.presence_idle_timeout();
-        if timeout.is_zero() {
-            return;
-        }
-
         let snapshot = self.presence_activity.sample(timeout);
         let now = std::time::Instant::now();
 
         match snapshot.state {
             crate::activity::ActivityState::Active => {
-                if let Some(idle) = snapshot.idle_for {
-                    if let Some(candidate) = now.checked_sub(idle) {
-                        if candidate > self.presence_last_activity {
-                            self.presence_last_activity = candidate;
-                        }
-                    }
-                } else {
-                    // logind only says "not idle"; without an exact duration,
-                    // treat the session as recently active.
-                    self.presence_last_activity = now;
-                }
-
-                // Lock is a temporary override of our own app session. If lock
-                // restore is enabled, reuse the saved pre-lock application session.
-                // With no saved state (or restore disabled), use the normal automatic
-                // default for confirmed activity: Available/Available. Graph still
-                // applies higher-priority calendar/call/preferred presence normally.
-                let desired = self.presence_after_unlock_or_activity();
-                self.publish_primary_presence(desired.0, desired.1);
+                let activity_at = snapshot
+                    .idle_for
+                    .and_then(|idle| now.checked_sub(idle))
+                    .unwrap_or(now);
+                self.presence_state.on_activity(activity_at);
             }
-            crate::activity::ActivityState::Locked => {
-                if self.session.config.presence_lock_restore {
-                    if self.presence_lock_saved.is_none() {
-                        self.presence_lock_saved = self.presence_session;
-                    }
-                } else {
-                    self.presence_lock_saved = None;
-                }
-                self.publish_primary_presence("Away", "Away");
-            }
+            crate::activity::ActivityState::Locked => self.presence_state.on_locked(),
             crate::activity::ActivityState::Idle => {
-                // LockedHint may disappear before a real activity event. Keep
-                // the restore target pending until activity is confirmed.
-                self.publish_primary_presence("Away", "Away");
+                // Timeout zero disables idle->Away, but lock detection remains active.
+                self.presence_state.on_idle(!timeout.is_zero());
             }
             crate::activity::ActivityState::Unknown => {
-                // Backend unavailable: preserve the old app-local behaviour.
-                // Keep a pending lock restore until definite local activity.
-                self.update_primary_presence_idle();
+                // Backend unavailable: retain the app-local timeout fallback.
+                self.presence_state.on_unknown(now, timeout);
             }
         }
+
+        self.pump_presence_session_write();
     }
 
     pub fn presence_activity_diagnostics(&self) -> crate::activity::ActivityDiagnostics {
         self.presence_activity.diagnostics()
     }
 
+    pub fn presence_state_diagnostics(&self) -> PresenceStateDiagnostics {
+        self.presence_state.diagnostics(std::time::Instant::now())
+    }
+
     pub fn presence_lock_restore_enabled(&self) -> bool {
         self.session.config.presence_lock_restore
     }
 
-    /// Apply a chosen status: record the sticky preference *and* publish this
-    /// app as a presence session, which is what actually makes the status
-    /// visible when no Teams client is running.
-    fn set_presence(&mut self, opt: &'static PresenceOption) {
-        self.presence_primary_auto = false;
-        self.presence_lock_saved = None;
-        self.presence_session = opt.session;
-        self.presence_session_at = Some(std::time::Instant::now());
+    pub fn presence_session_active_on_exit(&self) -> bool {
+        self.presence_state.may_have_remote_session()
+    }
+
+    fn open_presence_status_message_editor(&mut self) {
+        let current = self
+            .my_presence
+            .as_ref()
+            .and_then(Presence::status_message_text)
+            .unwrap_or_default();
+        self.overlay = Some(Overlay::PresenceMessage(TextInput::from(current)));
+    }
+
+    fn set_presence_status_message(&mut self, message: String) {
+        let message = message.trim().to_string();
+        if message.is_empty() {
+            self.clear_presence_status_message();
+            return;
+        }
+
+        let Some(user_id) = self.me.as_ref().map(|user| user.id.clone()) else {
+            self.status = "cannot set status message: signed-in user id is not loaded".into();
+            return;
+        };
 
         let s = self.session.clone();
-        let client_id = self.session.config.client_id.clone();
-        let (pref_av, pref_act) = opt.preferred;
-        let session = opt.session;
-        let label = opt.label;
+        self.status = "setting status message…".into();
         self.spawn(async move {
-            people::set_preferred_presence(&s.graph, pref_av, pref_act).await?;
-            match session {
-                Some((av, act)) => {
-                    people::set_session_presence(
-                        &s.graph,
-                        &client_id,
-                        av,
-                        act,
-                        PRESENCE_SESSION_LEASE,
-                    )
-                    .await?
-                }
-                // "Appear offline" means holding no session at all.
-                None => {
-                    let _ = people::clear_session_presence(&s.graph, &client_id).await;
-                }
-            }
-            Ok(AppMessage::Presence {
+            people::set_status_message(&s.graph, &user_id, &message).await?;
+            Ok(AppMessage::PresenceStatusMessageUpdated {
                 presence: people::my_presence(&s.graph).await?,
-                requested: Some(label.to_string()),
+                cleared: false,
             })
         });
     }
 
-    /// Re-assert the presence session before it lapses.
-    fn renew_presence_session(&mut self) {
-        let (Some((av, act)), Some(at)) = (self.presence_session, self.presence_session_at) else {
+    fn clear_presence_status_message(&mut self) {
+        let Some(user_id) = self.me.as_ref().map(|user| user.id.clone()) else {
+            self.status = "cannot clear status message: signed-in user id is not loaded".into();
             return;
         };
-        if at.elapsed() < PRESENCE_RENEW_AFTER {
-            return;
-        }
-        self.presence_session_at = Some(std::time::Instant::now());
+
         let s = self.session.clone();
-        let client_id = self.session.config.client_id.clone();
+        self.status = "clearing status message…".into();
         self.spawn(async move {
-            people::set_session_presence(&s.graph, &client_id, av, act, PRESENCE_SESSION_LEASE)
-                .await?;
-            Ok(AppMessage::Status(String::new()))
+            people::clear_status_message(&s.graph, &user_id).await?;
+            Ok(AppMessage::PresenceStatusMessageUpdated {
+                presence: people::my_presence(&s.graph).await?,
+                cleared: true,
+            })
         });
+    }
+
+    /// Apply a chosen status. Preferred presence and the app-session update are
+    /// performed by one serialized presence operation, preserving their order.
+    fn set_presence(&mut self, opt: &'static PresenceOption) {
+        self.presence_state.set_manual(opt.session);
+        let (availability, activity) = opt.preferred;
+        self.presence_preference_pending = Some(PresencePreferenceAction::Set {
+            availability,
+            activity,
+            label: opt.label,
+        });
+        self.pump_presence_session_write();
+    }
+
+    /// Lease renewal uses the same serializer as normal state transitions, so a
+    /// stale renewal can never overtake a newer lock/unlock/manual state.
+    fn renew_presence_session(&mut self) {
+        self.pump_presence_session_write();
     }
 
     fn clear_presence(&mut self) {
         let primary =
             self.session.config.presence_primary && self.session.config.can_write_presence();
-        self.presence_primary_auto = primary;
-        self.presence_lock_saved = None;
-        self.presence_last_activity = std::time::Instant::now();
-        self.presence_session = primary.then_some(("Available", "Available"));
-        self.presence_session_at = primary.then_some(std::time::Instant::now());
-
-        let s = self.session.clone();
-        let client_id = self.session.config.client_id.clone();
-        self.spawn(async move {
-            people::clear_preferred_presence(&s.graph).await?;
-            if primary {
-                people::set_session_presence(
-                    &s.graph,
-                    &client_id,
-                    "Available",
-                    "Available",
-                    PRESENCE_SESSION_LEASE,
-                )
-                .await?;
-            } else {
-                let _ = people::clear_session_presence(&s.graph, &client_id).await;
-            }
-            Ok(AppMessage::Presence {
-                presence: people::my_presence(&s.graph).await?,
-                requested: None,
-            })
-        });
+        self.presence_state
+            .clear_manual(primary, std::time::Instant::now());
+        self.presence_preference_pending = Some(PresencePreferenceAction::Clear);
+        self.pump_presence_session_write();
     }
 
     fn load_folders(&self) {
@@ -5176,31 +5231,48 @@ impl App {
             AppMessage::Presence {
                 presence,
                 requested,
-            } => {
-                let effective = presence.availability.clone().unwrap_or_default();
-                self.status = match requested {
-                    Some(req) if effective.eq_ignore_ascii_case(&req) => {
-                        format!("presence set to {req}")
-                    }
-                    // e.g. requested Available, Teams reports AvailableIdle.
-                    Some(req) if effective.to_lowercase().starts_with(&req.to_lowercase()) => {
-                        format!("presence set to {req} (Teams reports {effective})")
-                    }
-                    // Chose "Appear offline": Offline is the expected outcome.
-                    Some(req) if effective.eq_ignore_ascii_case("Offline") => {
-                        format!("presence set to {req} (you appear Offline)")
-                    }
-                    // Graph settled on something else — usually a Teams client
-                    // that is running and idle, which outranks our session.
-                    Some(req) => format!(
-                        "presence set to {req}; Teams currently shows '{effective}' (a signed-in Teams client can override this)"
-                    ),
-                    None => format!("presence: {effective}"),
-                };
-                self.my_presence = Some(presence);
-            }
+            } => self.apply_presence_result(presence, requested),
             AppMessage::PresenceRefresh(presence) => {
                 self.my_presence = Some(presence);
+            }
+            AppMessage::PresenceStatusMessageUpdated { presence, cleared } => {
+                self.my_presence = Some(presence);
+                self.status = if cleared {
+                    "status message cleared".into()
+                } else {
+                    "status message updated".into()
+                };
+            }
+            AppMessage::PresenceSessionWriteFinished {
+                write,
+                requested,
+                presence,
+                success,
+                error,
+                retry_preference,
+            } => {
+                self.presence_state
+                    .finish_write(write, success, std::time::Instant::now());
+
+                if self.presence_preference_pending.is_none() {
+                    self.presence_preference_pending = retry_preference;
+                }
+
+                if success {
+                    if let Some(presence) = presence {
+                        self.apply_presence_result(presence, requested);
+                    } else if let Some(error) = error {
+                        self.status = format!("presence session updated; {error}");
+                    }
+                } else {
+                    let error = error.unwrap_or_else(|| "unknown Graph error".into());
+                    tracing::warn!("presence session update failed: {error}");
+                    self.status = format!("presence update failed: {error}");
+                }
+
+                // A newer desired state may have arrived while this write was
+                // running. Start it only after the old write has completed.
+                self.pump_presence_session_write();
             }
             AppMessage::NtfyWorkPlan(working) => {
                 self.ntfy_working_now = Some(working);
@@ -5273,6 +5345,7 @@ impl App {
                     self.notice_until = None;
                 }
                 self.refresh_presence_activity();
+                self.pump_presence_session_write();
                 self.expire_ntfy_snooze_if_due();
                 self.rss_kb = read_rss_kb();
                 // Clear a message once it has sat unchanged for a while, so the
@@ -7668,7 +7741,23 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('c') => {
+                KeyCode::Char('m') => {
+                    if !self.session.config.can_write_presence() {
+                        self.status =
+                            "setting status message needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
+                    } else {
+                        self.open_presence_status_message_editor();
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('x') => {
+                    if !self.session.config.can_write_presence() {
+                        self.status =
+                            "clearing status message needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
+                    } else {
+                        self.clear_presence_status_message();
+                    }
+                }
+                KeyCode::Char('a') => {
                     if !self.session.config.can_write_presence() {
                         self.status =
                             "setting presence needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
@@ -7679,6 +7768,69 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Presence), // ignore other keys
             },
+            Some(Overlay::PresenceMessage(mut input)) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Enter => self.set_presence_status_message(input.text()),
+                    KeyCode::Backspace => {
+                        input.backspace();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Delete => {
+                        input.delete();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Left if ctrl => {
+                        input.word_left();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Right if ctrl => {
+                        input.word_right();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Left => {
+                        input.left();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Right => {
+                        input.right();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Home if ctrl => {
+                        input.start_of_text();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::End if ctrl => {
+                        input.end_of_text();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Home => {
+                        input.home();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::End => {
+                        input.end();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Char('w') if ctrl => {
+                        input.delete_word_before();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        input.delete_to_line_start();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Char('k') if ctrl => {
+                        input.delete_to_line_end();
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    KeyCode::Char(ch) if !ctrl => {
+                        input.insert(ch);
+                        self.overlay = Some(Overlay::PresenceMessage(input));
+                    }
+                    _ => self.overlay = Some(Overlay::PresenceMessage(input)),
+                }
+            }
             Some(Overlay::NtfySnooze { mut sel }) => {
                 let max = NTFY_SNOOZE_HOURS.len();
                 match key.code {
@@ -7828,6 +7980,11 @@ impl App {
             Some(Overlay::Search { mut query }) => {
                 query.push_str(text.trim());
                 self.overlay = Some(Overlay::Search { query });
+            }
+            Some(Overlay::PresenceMessage(mut input)) => {
+                let text = text.replace('\r', "").replace('\n', " ");
+                input.insert_str(&text);
+                self.overlay = Some(Overlay::PresenceMessage(input));
             }
             other => {
                 self.overlay = other;

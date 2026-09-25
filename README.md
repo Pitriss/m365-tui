@@ -534,6 +534,22 @@ Presence.ReadWrite
 
 Press `p` in the application to select a status.
 
+Inside the presence picker:
+
+| Key | Action |
+|---|---|
+| `1`-`6` | Set Available, Busy, Do not disturb, Be right back, Away, or Appear offline |
+| `m` | Set or edit the Teams status message |
+| `c` | Clear the Teams status message |
+| `x` | Alias for clearing the Teams status message |
+| `a` | Clear the manual preferred presence and return to automatic presence |
+
+The status message is separate from availability/activity presence. It uses the
+same `Presence.ReadWrite` delegated permission. m365-tui publishes plain text
+without an expiry time, so the message remains until it is changed or cleared.
+The presence picker shows the current server-side status-message text when it is
+available.
+
 #### Primary application presence
 
 m365-tui can also maintain its own active presence session:
@@ -545,6 +561,12 @@ M365_PRESENCE_PRIMARY=1
 This also requires `Presence.ReadWrite`.
 
 The application refreshes the session while running and clears it when exiting.
+
+Application-session writes are serialized: only one Graph session write can be
+in flight at a time. If the desired state changes while a write is running,
+m365-tui waits for that write to finish and then converges to the newest target.
+F6 diagnostics distinguish the app-session target, last confirmed state, and
+current/retrying write.
 
 A running Microsoft Teams client can still override or outrank the status
 published by m365-tui.
@@ -558,7 +580,9 @@ M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=5
 ```
 
 controls the number of minutes of effective local inactivity before the
-application changes its own session from Available to Away.
+application temporarily changes its own session to Away. The app-session state
+that was active before the idle transition is saved and restored after confirmed
+local activity returns.
 
 By default, activity is detected from the desktop session as well as from
 keypresses/paste inside m365-tui:
@@ -603,7 +627,9 @@ Set:
 M365_PRESENCE_AVAILABLE_TIMEOUT_MIN=0
 ```
 
-to disable the automatic Away transition.
+to disable the inactivity-driven Away transition. Screen-lock detection remains
+active even when the timeout is `0`, so a locked session still publishes Away
+for m365-tui's own application session.
 
 ### Calendar
 
@@ -746,7 +772,7 @@ Press `?` at any time outside the Teams composer to display the built-in help.
 | `F6` | Open generic diagnostics |
 | `F7` | Diagnose the selected Teams 1:1 contact |
 | `Ctrl+P` | Command palette |
-| `p` | Presence picker |
+| `p` | Presence and status-message picker |
 | `?` | Open help |
 | `y` | Copy focused message |
 | `Y` | Copy complete current view |

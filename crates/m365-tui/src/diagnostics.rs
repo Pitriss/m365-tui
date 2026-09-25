@@ -714,6 +714,29 @@ pub fn text(app: &App) -> String {
         }
         None => out.push(row("Graph presence", "? not loaded")),
     }
+    let managed = app.presence_state_diagnostics();
+    out.push(row("Presence manager", managed.mode.label()));
+    out.push(row("App session target", managed.desired.label()));
+    out.push(row(
+        "App session confirmed",
+        managed
+            .confirmed
+            .map(|target| target.label())
+            .unwrap_or_else(|| "unknown".into()),
+    ));
+    out.push(row(
+        "Presence write",
+        managed
+            .in_flight
+            .map(|write| write.label())
+            .unwrap_or_else(|| {
+                if managed.retry_waiting {
+                    "retry waiting".into()
+                } else {
+                    "idle".into()
+                }
+            }),
+    ));
     out.push(row("Skype Presence Service", "? not verified"));
     out.push(row("Skype Presence R/W", "? no Skype resource token"));
 
