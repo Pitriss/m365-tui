@@ -2,6 +2,7 @@
 //! 5xx backoff, one-shot 401 retry, `@odata.nextLink` pagination, and a delta
 //! helper.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,11 @@ pub struct GraphClient {
     http: reqwest::Client,
     auth: Arc<Authenticator>,
     base: String,
+    /// Monotonic counter incremented whenever Graph returns HTTP 429.
+    ///
+    /// Consumers use this as a pressure signal only; Graph's own Retry-After
+    /// handling remains authoritative for the request that was throttled.
+    throttle_generation: Arc<AtomicU64>,
 }
 
 /// A page of a delta query: the changed items plus the token used to fetch the
@@ -39,6 +45,7 @@ impl GraphClient {
                 .expect("building reqwest client"),
             auth,
             base: crate::config::graph_base(),
+            throttle_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -89,12 +96,16 @@ impl GraphClient {
                 continue;
             }
 
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
-            {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.throttle_generation.fetch_add(1, Ordering::Relaxed);
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 if attempt >= MAX_RETRIES {
                     let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("Graph request failed after {MAX_RETRIES} retries ({status}): {text}");
+                    anyhow::bail!(
+                        "Graph request failed after {MAX_RETRIES} retries ({status}): {text}"
+                    );
                 }
                 let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
                 attempt += 1;
@@ -110,6 +121,14 @@ impl GraphClient {
 
             return Ok(resp.bytes().await.context("reading Graph body")?.to_vec());
         }
+    }
+
+    /// Monotonic observation counter for Graph HTTP 429 responses.
+    ///
+    /// This deliberately exposes no quota guess: Graph has multiple overlapping
+    /// limits. It is only a conservative signal for optional background work.
+    pub fn throttle_generation(&self) -> u64 {
+        self.throttle_generation.load(Ordering::Relaxed)
     }
 
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -163,9 +182,7 @@ impl GraphClient {
 
     pub async fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
         let url = self.url(path);
-        let bytes = self
-            .send(reqwest::Method::POST, &url, Some(body))
-            .await?;
+        let bytes = self.send(reqwest::Method::POST, &url, Some(body)).await?;
         if bytes.is_empty() {
             // Some POSTs (e.g. sendMail) return 202 with no body.
             return serde_json::from_value(Value::Null).context("empty response");
@@ -219,8 +236,8 @@ impl GraphClient {
         let mut next = Some(self.url(path));
         while let Some(url) = next {
             let bytes = self.send(reqwest::Method::GET, &url, None).await?;
-            let page: ODataPage<T> = serde_json::from_slice(&bytes)
-                .context("deserializing Graph collection page")?;
+            let page: ODataPage<T> =
+                serde_json::from_slice(&bytes).context("deserializing Graph collection page")?;
             out.extend(page.value);
             next = page.next_link;
         }
@@ -237,8 +254,8 @@ impl GraphClient {
         let mut delta_link = None;
         while let Some(url) = next {
             let bytes = self.send(reqwest::Method::GET, &url, None).await?;
-            let page: ODataDeltaPage<T> = serde_json::from_slice(&bytes)
-                .context("deserializing Graph delta page")?;
+            let page: ODataDeltaPage<T> =
+                serde_json::from_slice(&bytes).context("deserializing Graph delta page")?;
             items.extend(page.value);
             delta_link = page.delta_link.or(delta_link);
             next = page.next_link;

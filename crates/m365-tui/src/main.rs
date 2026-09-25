@@ -27,7 +27,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, AppMessage, PushState, POLL_SECONDS};
+use app::{App, AppMessage, PushState, HOT_POLL_TICK_SECONDS, POLL_SECONDS};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
@@ -116,12 +116,13 @@ async fn main() -> Result<()> {
     // the normal Graph login/cache. It never writes the primary token cache and
     // requests no refresh token of its own.
     if matches!(&command, Command::TeamsConsentProbe) {
-        let result = teams_presence::consent_probe(&session.auth, |p| {
-            print_teams_consent_prompt(&p)
-        })
-        .await;
+        let result =
+            teams_presence::consent_probe(&session.auth, |p| print_teams_consent_prompt(&p)).await;
         print_diagnostic_step("Interactive consent", &result.interactive_consent);
-        print_diagnostic_step("Existing Graph refresh token", &result.existing_refresh_token);
+        print_diagnostic_step(
+            "Existing Graph refresh token",
+            &result.existing_refresh_token,
+        );
         println!("Primary Graph token cache: untouched");
         return Ok(());
     }
@@ -222,6 +223,24 @@ async fn run_tui(session: Session) -> Result<()> {
             loop {
                 ticker.tick().await;
                 if tick_tx.send(AppMessage::Tick).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Accelerated Teams polling has its own one-second local scheduler. The
+    // event itself performs no I/O; App decides which chats are due and all
+    // resulting GETs pass through the shared conservative Teams limiter.
+    {
+        let hot_poll_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(HOT_POLL_TICK_SECONDS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if hot_poll_tx.send(AppMessage::HotPollTick).await.is_err() {
                     break;
                 }
             }

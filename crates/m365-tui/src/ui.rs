@@ -9,11 +9,11 @@ use ratatui_image::{Resize, StatefulImage};
 
 use m365_core::models::SystemEventClass;
 
-use crate::diagnostics;
 use crate::app::{
-    filter_commands, App, CalendarView, Compose, OutlookFocus, Overlay, Screen, TeamsFocus,
-    TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
+    filter_commands, App, CalendarView, ChatPollTier, Compose, OutlookFocus, Overlay, Screen,
+    TeamsFocus, TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
 };
+use crate::diagnostics;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -277,9 +277,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::CalendarEvent => "o open meeting · Esc close",
             Overlay::ContactProfile => "j/k scroll · Esc close",
             Overlay::Diagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
-            Overlay::ContactDiagnostics => {
-                "c copy · l log · r refresh · j/k scroll · Esc close"
-            }
+            Overlay::ContactDiagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
             Overlay::Calendar => "Esc close",
             Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
         };
@@ -1439,6 +1437,20 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         Style::default()
                     };
                     let marker = if selected { "▏" } else { " " };
+                    let tier_style = if selected {
+                        selection_style
+                    } else {
+                        match app.teams_chat_poll_tier(&c.id) {
+                            ChatPollTier::Hot => Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                            ChatPollTier::Warm => Style::default().fg(ACCENT),
+                            ChatPollTier::Cool => {
+                                Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
+                            }
+                            ChatPollTier::Normal => Style::default(),
+                        }
+                    };
                     let label = app
                         .teams
                         .contact_names
@@ -1488,7 +1500,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                             inner_width.saturating_sub(label.chars().count() + suffix_width);
                         return ListItem::new(Line::from(vec![
                             Span::styled(marker, selection_style),
-                            Span::styled(label, selection_style),
+                            Span::styled(label, tier_style),
                             Span::styled(" ".repeat(padding), selection_style),
                             Span::styled(suffix, selection_style),
                         ]));
@@ -1522,7 +1534,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         Span::styled(marker, selection_style),
                         Span::styled(symbol, presence_style),
                         Span::styled(" ", selection_style),
-                        Span::styled(label, selection_style),
+                        Span::styled(label, tier_style),
                         Span::styled(" ".repeat(padding), selection_style),
                         Span::styled(suffix, selection_style),
                     ]))
@@ -2054,10 +2066,7 @@ fn contact_profile_lines(app: &App) -> Vec<Line<'static>> {
 
     if profile.loading {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Loading profile…",
-            Style::default().fg(DIM),
-        ));
+        lines.push(Line::styled("Loading profile…", Style::default().fg(DIM)));
     }
 
     lines
@@ -2149,9 +2158,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     if !line.starts_with(' ') {
                         return Line::from(Span::styled(
                             line.to_string(),
-                            Style::default()
-                                .fg(ACCENT)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                         ));
                     }
 
@@ -2163,7 +2170,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                         ('?', Color::DarkGray),
                     ]
                     .into_iter()
-                    .find_map(|(symbol, color)| line.find(symbol).map(|index| (symbol, color, index)));
+                    .find_map(|(symbol, color)| {
+                        line.find(symbol).map(|index| (symbol, color, index))
+                    });
 
                     if let Some((symbol, color, index)) = marker {
                         let end = index + symbol.len_utf8();
@@ -2208,9 +2217,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     if !line.starts_with(' ') {
                         return Line::from(Span::styled(
                             line.to_string(),
-                            Style::default()
-                                .fg(ACCENT)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                         ));
                     }
 
@@ -2266,17 +2273,13 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let avatar_width = (inner.width / 4).min(18);
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(avatar_width),
-                    Constraint::Min(1),
-                ])
+                .constraints([Constraint::Length(avatar_width), Constraint::Min(1)])
                 .split(inner);
             let avatar_area = columns[0];
             let text_area = columns[1];
 
             let lines = contact_profile_lines(app);
-            let (rows, _) =
-                crate::wrap::wrap_all(&lines, text_area.width.max(1) as usize);
+            let (rows, _) = crate::wrap::wrap_all(&lines, text_area.width.max(1) as usize);
             let max = (rows.len() as u16).saturating_sub(text_area.height);
             app.contact_profile_max_scroll.set(max);
             let scroll = app.contact_profile_scroll.min(max);
@@ -2287,12 +2290,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 if let Some(avatar) = profile.avatar.as_ref() {
                     if avatar_area.width > 0 && avatar_area.height > 0 {
                         if let Ok(mut state) = avatar.state.try_borrow_mut() {
-                            let bounds = Rect::new(
-                                0,
-                                0,
-                                avatar_area.width,
-                                avatar_area.height.clamp(1, 12),
-                            );
+                            let bounds =
+                                Rect::new(0, 0, avatar_area.width, avatar_area.height.clamp(1, 12));
                             let fitted = state.size_for(Resize::Fit(None), bounds);
                             if fitted.width > 0 && fitted.height > 0 {
                                 let image_area = Rect::new(

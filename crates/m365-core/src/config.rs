@@ -7,6 +7,19 @@ use anyhow::{Context, Result};
 /// Microsoft Graph base URL (v1.0 endpoint).
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
+/// Number of recently-active Teams chats accelerated by default.
+pub const TEAMS_HOT_CHATS_DEFAULT: usize = 6;
+/// Hard safety ceiling for accelerated Teams chats.
+pub const TEAMS_HOT_CHATS_MAX: usize = 16;
+/// Default request budget for optional/background Teams message GETs.
+pub const TEAMS_POLL_BUDGET_DEFAULT_RPS: f64 = 6.0;
+/// Runtime/configuration floor used after Graph throttling.
+pub const TEAMS_POLL_BUDGET_MIN_RPS: f64 = 0.5;
+/// Hard safety ceiling: 40% of the documented 20 rps per-app/per-tenant chat-message GET limit.
+pub const TEAMS_POLL_BUDGET_MAX_RPS: f64 = 8.0;
+/// Reject combinations that would make an accelerated chat slower than this.
+pub const TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS: f64 = 5.0;
+
 /// The Graph endpoint to talk to, overridable with `M365_GRAPH_BASE`.
 ///
 /// Pointing this at a local mock lets the app run on fabricated data — useful
@@ -171,6 +184,12 @@ pub struct Config {
     /// Automatically prefill persistent Teams conversation caches in the background.
     /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
     pub teams_cache_warmup: bool,
+    /// Maximum number of recently-active chats kept in accelerated polling.
+    /// Default 6, hard maximum 16.
+    pub teams_hot_chats: usize,
+    /// Shared rate budget for optional/background Teams message GETs.
+    /// This covers hot polling, unread counting and cold-cache warm-up.
+    pub teams_poll_budget_rps: f64,
     /// Which Teams system events are visible in conversations.
     /// Defaults to Useful; accepts useful, all, or none.
     pub teams_system_events: TeamsSystemEvents,
@@ -200,6 +219,21 @@ impl Config {
         let teams_cache_warmup = env_flag_default_on("M365_TEAMS_CACHE_WARMUP");
         let teams_system_events =
             parse_teams_system_events(std::env::var("M365_TEAMS_SYSTEM_EVENTS").ok().as_deref())?;
+        let teams_hot_chats = match std::env::var("M365_TEAMS_HOT_CHATS") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<usize>()
+                .context("M365_TEAMS_HOT_CHATS must be an integer")?,
+            _ => TEAMS_HOT_CHATS_DEFAULT,
+        };
+        let teams_poll_budget_rps = match std::env::var("M365_TEAMS_POLL_BUDGET_RPS") {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<f64>()
+                .context("M365_TEAMS_POLL_BUDGET_RPS must be a number")?,
+            _ => TEAMS_POLL_BUDGET_DEFAULT_RPS,
+        };
+        validate_teams_polling(teams_hot_chats, teams_poll_budget_rps)?;
         let teams_image_cache_max_mb = match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
             Ok(value) if !value.trim().is_empty() => {
                 let value = value.trim().parse::<u64>().context(
@@ -332,6 +366,8 @@ impl Config {
             teams_image_cache_dir,
             teams_image_cache_max_mb,
             teams_cache_warmup,
+            teams_hot_chats,
+            teams_poll_budget_rps,
             teams_system_events,
             meeting_opener,
         })
@@ -397,6 +433,25 @@ impl Config {
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
     }
+}
+
+fn validate_teams_polling(hot_chats: usize, budget_rps: f64) -> Result<()> {
+    anyhow::ensure!(
+        (1..=TEAMS_HOT_CHATS_MAX).contains(&hot_chats),
+        "M365_TEAMS_HOT_CHATS must be between 1 and {TEAMS_HOT_CHATS_MAX} (got {hot_chats})"
+    );
+    anyhow::ensure!(
+        budget_rps.is_finite()
+            && (TEAMS_POLL_BUDGET_MIN_RPS..=TEAMS_POLL_BUDGET_MAX_RPS).contains(&budget_rps),
+        "M365_TEAMS_POLL_BUDGET_RPS must be between {TEAMS_POLL_BUDGET_MIN_RPS} and {TEAMS_POLL_BUDGET_MAX_RPS} (got {budget_rps})"
+    );
+
+    let effective = hot_chats as f64 / budget_rps;
+    anyhow::ensure!(
+        effective <= TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS,
+        "M365_TEAMS_HOT_CHATS={hot_chats} with M365_TEAMS_POLL_BUDGET_RPS={budget_rps} implies about {effective:.2}s per accelerated chat at full load; maximum allowed is {TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS:.0}s"
+    );
+    Ok(())
 }
 
 fn parse_ntfy_mode(value: Option<&str>) -> Result<NtfyMode> {
@@ -510,6 +565,8 @@ mod tests {
             teams_image_cache_dir: None,
             teams_image_cache_max_mb: 256,
             teams_cache_warmup: true,
+            teams_hot_chats: TEAMS_HOT_CHATS_DEFAULT,
+            teams_poll_budget_rps: TEAMS_POLL_BUDGET_DEFAULT_RPS,
             teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
@@ -590,6 +647,20 @@ mod tests {
             TeamsSystemEvents::None
         );
         assert!(parse_teams_system_events(Some("usefull")).is_err());
+    }
+
+    #[test]
+    fn validates_teams_polling_limits_and_combinations() {
+        assert!(validate_teams_polling(6, 6.0).is_ok());
+        assert!(validate_teams_polling(16, 6.0).is_ok());
+        assert!(validate_teams_polling(16, 3.2).is_ok());
+
+        assert!(validate_teams_polling(0, 6.0).is_err());
+        assert!(validate_teams_polling(17, 6.0).is_err());
+        assert!(validate_teams_polling(6, 0.4).is_err());
+        assert!(validate_teams_polling(6, 8.1).is_err());
+        assert!(validate_teams_polling(16, 3.0).is_err());
+        assert!(validate_teams_polling(6, f64::NAN).is_err());
     }
 
     #[test]

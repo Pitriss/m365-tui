@@ -10,15 +10,13 @@ use std::io::IsTerminal;
 use anyhow::Context;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use m365_core::config::{NtfyMode, TeamsSystemEvents};
+use m365_core::config::{NtfyMode, TeamsSystemEvents, TEAMS_POLL_BUDGET_MIN_RPS};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
     Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Person, Presence,
     SystemEventClass, Team, User,
 };
-use m365_core::{
-    calendar, channels, chats, mail, people, teams_presence, work_plan, Session,
-};
+use m365_core::{calendar, channels, chats, mail, people, teams_presence, work_plan, Session};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
@@ -64,15 +62,35 @@ pub enum AppMessage {
         chat_id: String,
         count: usize,
     },
+    ChatUnreadRefreshDone,
     ChatMessages {
         chat_id: String,
         messages: Vec<ChatMessage>,
         next: Option<String>,
         mode: ListUpdate,
     },
+    ChatMessagesFailed {
+        chat_id: String,
+        mode: ListUpdate,
+        error: String,
+    },
+    ChatMessageSent {
+        chat_id: String,
+        status: String,
+    },
     ChatCacheWarmed {
         chat_id: String,
         messages: Vec<ChatMessage>,
+    },
+    /// Result of one rate-limited accelerated/background chat poll.
+    HotChatPollFinished {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        next: Option<String>,
+        error: Option<String>,
+    },
+    HotChatPollSkipped {
+        chat_id: String,
     },
     Teams(Vec<Team>),
     Channels {
@@ -131,6 +149,8 @@ pub enum AppMessage {
     Push(PushState),
     /// Lightweight timer: refresh memory usage and expire stale status text.
     Tick,
+    /// One-second local scheduler tick for accelerated Teams chats.
+    HotPollTick,
     /// Periodic tick: refresh the current view from the server.
     Poll,
 }
@@ -167,6 +187,57 @@ pub enum TeamsFocus {
     List,
     Messages,
     Composer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatPollTier {
+    Hot,
+    Warm,
+    Cool,
+    Normal,
+}
+
+impl ChatPollTier {
+    fn interval(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Hot => Some(std::time::Duration::from_secs(2)),
+            Self::Warm => Some(std::time::Duration::from_secs(5)),
+            Self::Cool => Some(std::time::Duration::from_secs(10)),
+            Self::Normal => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TeamsPollDiagnostics {
+    pub hot: usize,
+    pub warm: usize,
+    pub cool: usize,
+    pub normal: usize,
+    pub hot_pending: usize,
+    pub foreground_in_flight: usize,
+    pub runtime_budget_rps: f64,
+    pub reserved_chats: usize,
+}
+
+fn teams_message_id_is_newer(new_id: &str, old_id: &str) -> bool {
+    match (new_id.parse::<u64>(), old_id.parse::<u64>()) {
+        (Ok(new_id), Ok(old_id)) => new_id > old_id,
+        _ => new_id > old_id,
+    }
+}
+
+fn chat_poll_tier_from_age(age: std::time::Duration) -> ChatPollTier {
+    let seconds = age.as_secs();
+    if seconds <= TEAMS_HOT_AGE_SECONDS {
+        ChatPollTier::Hot
+    } else if seconds <= TEAMS_WARM_AGE_SECONDS {
+        ChatPollTier::Warm
+    } else if seconds <= TEAMS_COOL_AGE_SECONDS {
+        ChatPollTier::Cool
+    } else {
+        ChatPollTier::Normal
+    }
 }
 
 /// A transient full-screen/modal overlay.
@@ -392,7 +463,6 @@ pub struct ContactProfileState {
     pub loading: bool,
 }
 
-
 #[derive(Default)]
 pub struct OutlookState {
     pub folders: Vec<MailFolder>,
@@ -570,6 +640,285 @@ impl Default for TeamsState {
     }
 }
 
+struct TeamsHotChatState {
+    last_activity: std::time::Instant,
+    last_poll_started: Option<std::time::Instant>,
+    latest_message_id: Option<String>,
+    latest_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    hot_pending: bool,
+    foreground_in_flight: bool,
+}
+
+#[derive(Clone)]
+struct TeamsBackgroundLimiter {
+    configured_rps: f64,
+    state: std::sync::Arc<std::sync::Mutex<TeamsBackgroundBudgetState>>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+struct TeamsBackgroundBudgetState {
+    runtime_rps: f64,
+    tokens: f64,
+    last_refill: std::time::Instant,
+    last_recovery: std::time::Instant,
+    throttle_generation: u64,
+    reserved_chats: std::collections::HashSet<String>,
+    last_chat_request: std::collections::HashMap<String, std::time::Instant>,
+}
+
+struct TeamsChatReservation {
+    state: std::sync::Arc<std::sync::Mutex<TeamsBackgroundBudgetState>>,
+    chat_id: String,
+}
+
+impl Drop for TeamsChatReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.reserved_chats.remove(&self.chat_id);
+        }
+    }
+}
+
+struct TeamsBackgroundPermit {
+    _chat: TeamsChatReservation,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl TeamsBackgroundLimiter {
+    fn new(configured_rps: f64, throttle_generation: u64) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            configured_rps,
+            state: std::sync::Arc::new(std::sync::Mutex::new(TeamsBackgroundBudgetState {
+                runtime_rps: configured_rps,
+                tokens: TEAMS_BACKGROUND_CONCURRENCY as f64,
+                last_refill: now,
+                last_recovery: now,
+                throttle_generation,
+                reserved_chats: std::collections::HashSet::new(),
+                last_chat_request: std::collections::HashMap::new(),
+            })),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(TEAMS_BACKGROUND_CONCURRENCY)),
+        }
+    }
+
+    fn diagnostics_snapshot(&self) -> (f64, usize) {
+        let state = self
+            .state
+            .lock()
+            .expect("Teams background limiter mutex poisoned");
+        (state.runtime_rps, state.reserved_chats.len())
+    }
+
+    async fn reserve_chat(&self, chat_id: &str) -> TeamsChatReservation {
+        loop {
+            let reserved = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("Teams background limiter mutex poisoned");
+                if state.reserved_chats.contains(chat_id) {
+                    false
+                } else {
+                    state.reserved_chats.insert(chat_id.to_string());
+                    true
+                }
+            };
+
+            if reserved {
+                return TeamsChatReservation {
+                    state: self.state.clone(),
+                    chat_id: chat_id.to_string(),
+                };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_per_chat_interval(&self, chat_id: &str, min_interval: std::time::Duration) {
+        loop {
+            let now = std::time::Instant::now();
+            let wait = {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("Teams background limiter mutex poisoned");
+                state.last_chat_request.get(chat_id).and_then(|last| {
+                    let elapsed = now.duration_since(*last);
+                    (elapsed < min_interval).then(|| min_interval - elapsed)
+                })
+            };
+            match wait {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => return,
+            }
+        }
+    }
+
+    fn note_chat_request(&self, chat_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Teams background limiter mutex poisoned");
+        state
+            .last_chat_request
+            .insert(chat_id.to_string(), std::time::Instant::now());
+    }
+
+    fn chat_requested_since(&self, chat_id: &str, since: std::time::Instant) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("Teams background limiter mutex poisoned");
+        state
+            .last_chat_request
+            .get(chat_id)
+            .is_some_and(|last| *last > since)
+    }
+
+    async fn acquire_foreground_chat(&self, chat_id: &str) -> TeamsChatReservation {
+        let reservation = self.reserve_chat(chat_id).await;
+        self.wait_per_chat_interval(
+            chat_id,
+            std::time::Duration::from_secs(TEAMS_FOREGROUND_PER_CHAT_MIN_SECONDS),
+        )
+        .await;
+        self.note_chat_request(chat_id);
+        reservation
+    }
+
+    async fn acquire_inner(
+        &self,
+        graph: &m365_core::GraphClient,
+        chat_id: &str,
+        supersede_after: Option<std::time::Instant>,
+    ) -> Option<TeamsBackgroundPermit> {
+        // Background work earns a global slot/token before reserving a chat.
+        // Foreground open/F5 can therefore cut ahead while background work is
+        // merely queued for budget.
+        let global = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Teams background limiter semaphore closed");
+
+        loop {
+            let now = std::time::Instant::now();
+            let generation = graph.throttle_generation();
+
+            let wait = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("Teams background limiter mutex poisoned");
+
+                if generation != state.throttle_generation {
+                    state.throttle_generation = generation;
+                    state.runtime_rps = (state.runtime_rps * 0.5).max(TEAMS_POLL_BUDGET_MIN_RPS);
+                    state.tokens = state.tokens.min(1.0);
+                    state.last_recovery = now;
+                    tracing::warn!(
+                        "Graph throttling observed; Teams background budget reduced to {:.2} rps",
+                        state.runtime_rps
+                    );
+                } else if state.runtime_rps < self.configured_rps {
+                    let steps = now.duration_since(state.last_recovery).as_secs()
+                        / TEAMS_BACKGROUND_RECOVERY_SECONDS;
+                    if steps > 0 {
+                        state.runtime_rps = (state.runtime_rps
+                            + steps as f64 * TEAMS_BACKGROUND_RECOVERY_STEP_RPS)
+                            .min(self.configured_rps);
+                        state.last_recovery += std::time::Duration::from_secs(
+                            steps * TEAMS_BACKGROUND_RECOVERY_SECONDS,
+                        );
+                        tracing::debug!(
+                            "Teams background budget recovered to {:.2} rps",
+                            state.runtime_rps
+                        );
+                    }
+                }
+
+                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+                let runtime_rps = state.runtime_rps;
+                state.tokens =
+                    (state.tokens + elapsed * runtime_rps).min(TEAMS_BACKGROUND_CONCURRENCY as f64);
+                state.last_refill = now;
+
+                if state.tokens >= 1.0 {
+                    state.tokens -= 1.0;
+                    None
+                } else {
+                    let seconds = ((1.0 - state.tokens) / runtime_rps).max(0.01);
+                    Some(std::time::Duration::from_secs_f64(seconds))
+                }
+            };
+
+            match wait {
+                None => break,
+                Some(wait) => tokio::time::sleep(wait).await,
+            }
+        }
+
+        if supersede_after.is_some_and(|since| self.chat_requested_since(chat_id, since)) {
+            return None;
+        }
+
+        let min_interval = std::time::Duration::from_secs(TEAMS_BACKGROUND_PER_CHAT_MIN_SECONDS);
+        let reservation = loop {
+            self.wait_per_chat_interval(chat_id, min_interval).await;
+            let reservation = self.reserve_chat(chat_id).await;
+            let now = std::time::Instant::now();
+            let remaining = {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("Teams background limiter mutex poisoned");
+                state.last_chat_request.get(chat_id).and_then(|last| {
+                    let elapsed = now.duration_since(*last);
+                    (elapsed < min_interval).then(|| min_interval - elapsed)
+                })
+            };
+            if let Some(wait) = remaining {
+                drop(reservation);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            break reservation;
+        };
+
+        if supersede_after.is_some_and(|since| self.chat_requested_since(chat_id, since)) {
+            drop(reservation);
+            return None;
+        }
+
+        self.note_chat_request(chat_id);
+        Some(TeamsBackgroundPermit {
+            _chat: reservation,
+            _global: global,
+        })
+    }
+
+    async fn acquire(
+        &self,
+        graph: &m365_core::GraphClient,
+        chat_id: &str,
+    ) -> TeamsBackgroundPermit {
+        self.acquire_inner(graph, chat_id, None)
+            .await
+            .expect("non-supersedable Teams background request disappeared")
+    }
+
+    async fn acquire_hot(
+        &self,
+        graph: &m365_core::GraphClient,
+        chat_id: &str,
+        scheduled_at: std::time::Instant,
+    ) -> Option<TeamsBackgroundPermit> {
+        self.acquire_inner(graph, chat_id, Some(scheduled_at)).await
+    }
+}
+
 pub struct App {
     pub session: Session,
     pub tx: mpsc::Sender<AppMessage>,
@@ -613,6 +962,12 @@ pub struct App {
     /// open. `None` until the first chat list lands — the first sync must not
     /// fire a burst of notifications for history.
     chat_seen: Option<std::collections::HashMap<String, String>>,
+    /// Activity/rate state for accelerated Teams chats.
+    teams_hot_chat_state: std::collections::HashMap<String, TeamsHotChatState>,
+    /// Shared rate/concurrency limiter for optional Teams message GETs.
+    teams_background_limiter: TeamsBackgroundLimiter,
+    /// Prevent overlapping unread-count sweeps when Graph is slow/throttled.
+    chat_unread_refresh_running: bool,
     /// Inbox message ids already seen, same baseline rule as `chat_seen`.
     mail_seen: Option<std::collections::HashSet<String>>,
     /// The presence session this app is currently publishing, and when it was
@@ -698,6 +1053,21 @@ const CALENDAR_RANGES: &[i64] = &[7, 14, 30, 60, 90, 180, 365];
 /// Normal network poll cadence. The timer still ticks at this rate while
 /// App-level backoff decides whether another Graph poll is actually started.
 pub const POLL_SECONDS: u64 = 20;
+/// Local scheduler cadence for accelerated Teams polling.
+pub const HOT_POLL_TICK_SECONDS: u64 = 1;
+/// Activity ages defining the visual/polling tiers.
+const TEAMS_HOT_AGE_SECONDS: u64 = 2 * 60;
+const TEAMS_WARM_AGE_SECONDS: u64 = 5 * 60;
+const TEAMS_COOL_AGE_SECONDS: u64 = 15 * 60;
+/// Background Teams GETs are deliberately prevented from occupying all Graph work.
+const TEAMS_BACKGROUND_CONCURRENCY: usize = 2;
+/// Keep background GETs for one chat comfortably below the per-chat ceiling.
+const TEAMS_BACKGROUND_PER_CHAT_MIN_SECONDS: u64 = 2;
+/// Foreground refreshes may be quicker, but still avoid back-to-back per-chat GETs.
+const TEAMS_FOREGROUND_PER_CHAT_MIN_SECONDS: u64 = 1;
+/// After any observed Graph 429, recover the Teams background budget slowly.
+const TEAMS_BACKGROUND_RECOVERY_SECONDS: u64 = 30;
+const TEAMS_BACKGROUND_RECOVERY_STEP_RPS: f64 = 0.5;
 /// A successful Graph folder refresh older than this is visibly stale.
 pub const POLL_STALE_SECONDS: u64 = 2 * 60;
 /// Maximum poll retry interval after repeated late/failed poll health checks.
@@ -763,6 +1133,7 @@ const TEAMS_CONVERSATION_CACHE_DIR: &str = "conversations";
 const TEAMS_CONVERSATION_CACHE_VERSION: u64 = 1;
 const MAX_TEAMS_CONVERSATION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TEAMS_CACHED_MESSAGES: usize = 2000;
+static TEAMS_CACHE_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn teams_conversation_cache_key(chat_id: &str) -> String {
     fn update(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -866,8 +1237,9 @@ fn store_teams_conversation_cache(
         return Ok(());
     }
 
+    let temp_seq = TEAMS_CACHE_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp_path = cache_dir.join(format!(
-        "{}.json.tmp-{}",
+        "{}.json.tmp-{}-{temp_seq}",
         teams_conversation_cache_key(chat_id),
         std::process::id()
     ));
@@ -1701,6 +2073,10 @@ impl App {
         };
 
         let ntfy_snooze_until = load_ntfy_snooze_until(&session.config.token_cache_path);
+        let teams_background_limiter = TeamsBackgroundLimiter::new(
+            session.config.teams_poll_budget_rps,
+            session.graph.throttle_generation(),
+        );
 
         let mut app = Self {
             session,
@@ -1739,6 +2115,9 @@ impl App {
             push: PushState::Off,
             notified: std::collections::HashSet::new(),
             chat_seen: None,
+            teams_hot_chat_state: std::collections::HashMap::new(),
+            teams_background_limiter,
+            chat_unread_refresh_running: false,
             mail_seen: None,
             presence_session: None,
             presence_session_at: None,
@@ -1905,9 +2284,7 @@ impl App {
 
             let work_plan = work_plan::diagnostics(&s.graph, chrono::Utc::now())
                 .await
-                .map_err(|error| {
-                    m365_core::util::graph_error_summary(&format!("{error:#}"))
-                });
+                .map_err(|error| m365_core::util::graph_error_summary(&format!("{error:#}")));
 
             let _ = tx
                 .send(AppMessage::DiagnosticsLoaded(DiagnosticsRemote {
@@ -2864,6 +3241,7 @@ impl App {
         self.chat_cache_warmup_started = true;
         let s = self.session.clone();
         let tx = self.tx.clone();
+        let limiter = self.teams_background_limiter.clone();
 
         tokio::spawn(async move {
             for (chat_id, latest_id) in ordered {
@@ -2918,8 +3296,11 @@ impl App {
                     continue;
                 }
 
-                let (messages, _) = match chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await
-                {
+                let page = {
+                    let _permit = limiter.acquire(&s.graph, &chat_id).await;
+                    chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await
+                };
+                let (messages, _) = match page {
                     Ok(page) => page,
                     Err(error) => {
                         tracing::warn!(
@@ -3104,9 +3485,7 @@ impl App {
                 peer_member.and_then(|member| member.odata_type.as_deref()),
                 peer_id
             );
-        } else if let (Some(own), Some(peer)) =
-            (self.teams.own_tenant_id.as_deref(), peer_tenant)
-        {
+        } else if let (Some(own), Some(peer)) = (self.teams.own_tenant_id.as_deref(), peer_tenant) {
             if own.eq_ignore_ascii_case(peer) {
                 self.teams.external_chats.remove(&chat.id);
             } else {
@@ -3131,11 +3510,7 @@ impl App {
         learned_peer_id
     }
 
-    fn remember_contact_from_messages(
-        &mut self,
-        chat_id: &str,
-        messages: &[ChatMessage],
-    ) -> bool {
+    fn remember_contact_from_messages(&mut self, chat_id: &str, messages: &[ChatMessage]) -> bool {
         let me_id = self.me.as_ref().map(|me| me.id.as_str());
 
         if self.teams.own_tenant_id.is_none() {
@@ -3512,8 +3887,14 @@ impl App {
             .chat_unread_counts
             .retain(|id, _| candidate_ids.contains(id.as_str()));
 
+        if candidates.is_empty() || self.chat_unread_refresh_running {
+            return;
+        }
+        self.chat_unread_refresh_running = true;
+
         let s = self.session.clone();
         let tx = self.tx.clone();
+        let limiter = self.teams_background_limiter.clone();
         tokio::spawn(async move {
             for (chat_id, read_at) in candidates {
                 let read_at = match chrono::DateTime::parse_from_rfc3339(&read_at) {
@@ -3526,13 +3907,16 @@ impl App {
                 let mut first_page = true;
 
                 loop {
-                    let result = if first_page {
-                        first_page = false;
-                        chats::list_messages_created_desc(&s.graph, &chat_id, 50).await
-                    } else if let Some(link) = next.as_deref() {
-                        chats::list_messages_more(&s.graph, link).await
-                    } else {
-                        break;
+                    let result = {
+                        let _permit = limiter.acquire(&s.graph, &chat_id).await;
+                        if first_page {
+                            first_page = false;
+                            chats::list_messages_created_desc(&s.graph, &chat_id, 50).await
+                        } else if let Some(link) = next.as_deref() {
+                            chats::list_messages_more(&s.graph, link).await
+                        } else {
+                            break;
+                        }
                     };
 
                     let (messages, next_link) = match result {
@@ -3601,6 +3985,7 @@ impl App {
                     }
                 }
             }
+            let _ = tx.send(AppMessage::ChatUnreadRefreshDone).await;
         });
     }
 
@@ -3694,8 +4079,9 @@ impl App {
             return;
         }
 
-        // Preview is local-only. It is not an open conversation, must not be
-        // polled, and must never trigger mark-read.
+        // Preview selection is local-only: selecting a row never starts a
+        // request and never marks it read. A chat that independently qualifies
+        // for accelerated background polling may still refresh this preview.
         self.teams.preview_chat_id = Some(chat_id.clone());
         self.teams.open_chat_id = None;
         self.teams.open_channel = None;
@@ -3738,16 +4124,35 @@ impl App {
         );
     }
 
-    fn load_chat_messages(&self, chat_id: String, mode: ListUpdate) {
+    fn load_chat_messages(&mut self, chat_id: String, mode: ListUpdate) {
+        if !self.begin_teams_foreground_request(&chat_id) {
+            tracing::debug!(
+                "Teams foreground chat request already queued for {chat_id}; coalescing refresh"
+            );
+            return;
+        }
+
         let s = self.session.clone();
-        self.spawn(async move {
-            let (messages, next) = chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await?;
-            Ok(AppMessage::ChatMessages {
-                chat_id,
-                messages,
-                next,
-                mode,
-            })
+        let tx = self.tx.clone();
+        let limiter = self.teams_background_limiter.clone();
+        tokio::spawn(async move {
+            let chat_guard = limiter.acquire_foreground_chat(&chat_id).await;
+            let result = chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await;
+            drop(chat_guard);
+            let msg = match result {
+                Ok((messages, next)) => AppMessage::ChatMessages {
+                    chat_id,
+                    messages,
+                    next,
+                    mode,
+                },
+                Err(error) => AppMessage::ChatMessagesFailed {
+                    chat_id,
+                    mode,
+                    error: format!("{error:#}"),
+                },
+            };
+            let _ = tx.send(msg).await;
         });
     }
 
@@ -4186,14 +4591,31 @@ impl App {
         let s = self.session.clone();
 
         if let Some(chat_id) = self.teams.open_chat_id.clone() {
-            self.spawn(async move {
-                let (messages, next) = chats::list_messages_more(&s.graph, &next_link).await?;
-                Ok(AppMessage::ChatMessages {
-                    chat_id,
-                    messages,
-                    next,
-                    mode: ListUpdate::Append,
-                })
+            if !self.begin_teams_foreground_request(&chat_id) {
+                self.teams.loading_more = false;
+                self.status = "chat refresh already in progress".into();
+                return;
+            }
+            let tx = self.tx.clone();
+            let limiter = self.teams_background_limiter.clone();
+            tokio::spawn(async move {
+                let chat_guard = limiter.acquire_foreground_chat(&chat_id).await;
+                let result = chats::list_messages_more(&s.graph, &next_link).await;
+                drop(chat_guard);
+                let msg = match result {
+                    Ok((messages, next)) => AppMessage::ChatMessages {
+                        chat_id,
+                        messages,
+                        next,
+                        mode: ListUpdate::Append,
+                    },
+                    Err(error) => AppMessage::ChatMessagesFailed {
+                        chat_id,
+                        mode: ListUpdate::Append,
+                        error: format!("{error:#}"),
+                    },
+                };
+                let _ = tx.send(msg).await;
             });
         } else if let Some((team_id, channel_id)) = self.teams.open_channel.clone() {
             self.spawn(async move {
@@ -4239,11 +4661,14 @@ impl App {
         });
     }
 
-    fn send_chat_message(&self, chat_id: String, text: String) {
+    fn send_chat_message(&mut self, chat_id: String, text: String) {
         let s = self.session.clone();
         self.spawn(async move {
             chats::send_message(&s.graph, &chat_id, &text).await?;
-            Ok(AppMessage::Done("message sent".into()))
+            Ok(AppMessage::ChatMessageSent {
+                chat_id,
+                status: "message sent".into(),
+            })
         });
     }
 
@@ -4431,6 +4856,7 @@ impl App {
                 }
             }
             AppMessage::Chats(c) => {
+                self.sync_teams_hot_activity_from_chats(&c);
                 self.notify_for_chats(&c);
                 self.remember_contacts_from_chats(&c);
                 self.load_contact_presences(&c);
@@ -4487,13 +4913,9 @@ impl App {
                     if profile.chat_id == chat_id {
                         profile.person = person;
                         profile.loading = false;
-                        if let (Some(image), Some(picker)) =
-                            (avatar, self.image_picker.as_ref())
-                        {
+                        if let (Some(image), Some(picker)) = (avatar, self.image_picker.as_ref()) {
                             profile.avatar = Some(MailImage {
-                                state: std::cell::RefCell::new(
-                                    picker.new_resize_protocol(image),
-                                ),
+                                state: std::cell::RefCell::new(picker.new_resize_protocol(image)),
                             });
                         }
                     }
@@ -4513,16 +4935,23 @@ impl App {
                     self.teams.chat_unread_counts.insert(chat_id, count);
                 }
             }
+            AppMessage::ChatUnreadRefreshDone => {
+                self.chat_unread_refresh_running = false;
+            }
             AppMessage::ChatMessages {
                 chat_id,
                 messages,
                 next,
                 mode,
             } => {
+                if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+                    state.foreground_in_flight = false;
+                    state.last_poll_started = Some(std::time::Instant::now());
+                }
+                self.observe_teams_chat_page(&chat_id, &messages);
                 if self.teams.open_chat_id.as_deref() == Some(&chat_id) {
                     let opened_now = self.teams.chat_open_pending_read.as_deref() == Some(&chat_id);
-                    let learned_peer_id =
-                        self.remember_contact_from_messages(&chat_id, &messages);
+                    let learned_peer_id = self.remember_contact_from_messages(&chat_id, &messages);
                     if learned_peer_id {
                         self.load_contact_presences(&[]);
                     }
@@ -4546,6 +4975,39 @@ impl App {
                             self.teams.locally_read_through.insert(chat_id, latest_id);
                         }
                     }
+                }
+            }
+            AppMessage::ChatMessagesFailed {
+                chat_id,
+                mode,
+                error,
+            } => {
+                if mode == ListUpdate::Append {
+                    self.teams.loading_more = false;
+                }
+                if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+                    state.foreground_in_flight = false;
+                    state.last_poll_started = Some(std::time::Instant::now());
+                }
+                self.status = format!("error: {}", m365_core::util::graph_error_summary(&error));
+            }
+            AppMessage::ChatMessageSent { chat_id, status } => {
+                self.mark_teams_chat_active(&chat_id);
+                self.status = status;
+                self.refresh_current();
+            }
+            AppMessage::HotChatPollFinished {
+                chat_id,
+                messages,
+                next,
+                error,
+            } => {
+                self.apply_hot_chat_poll(chat_id, messages, next, error);
+            }
+            AppMessage::HotChatPollSkipped { chat_id } => {
+                if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+                    state.hot_pending = false;
+                    state.last_poll_started = Some(std::time::Instant::now());
                 }
             }
             AppMessage::ChatCacheWarmed { chat_id, messages } => {
@@ -4732,7 +5194,574 @@ impl App {
                 self.refresh_calendar_reminders_if_due();
                 self.check_calendar_reminders();
             }
+            AppMessage::HotPollTick => self.poll_hot_chats_if_due(),
             AppMessage::Poll => self.scheduled_poll(),
+        }
+    }
+
+    fn graph_message_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(value?)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc))
+    }
+
+    fn activity_instant_from_graph_time(
+        value: Option<chrono::DateTime<chrono::Utc>>,
+        now: std::time::Instant,
+    ) -> std::time::Instant {
+        let age_seconds = value
+            .map(|value| {
+                chrono::Utc::now()
+                    .signed_duration_since(value)
+                    .num_seconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(TEAMS_COOL_AGE_SECONDS + 1)
+            .min(TEAMS_COOL_AGE_SECONDS + 1);
+
+        now.checked_sub(std::time::Duration::from_secs(age_seconds))
+            .unwrap_or(now)
+    }
+
+    fn state_message_is_newer(
+        state: &TeamsHotChatState,
+        message_id: &str,
+        message_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> bool {
+        if state.latest_message_id.as_deref() == Some(message_id) {
+            return false;
+        }
+
+        match (message_at.as_ref(), state.latest_message_at.as_ref()) {
+            (Some(new), Some(old)) if new > old => true,
+            (Some(new), Some(old)) if new < old => false,
+            (Some(_), Some(_)) => match state.latest_message_id.as_deref() {
+                Some(old_id) => teams_message_id_is_newer(message_id, old_id),
+                None => true,
+            },
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => true,
+        }
+    }
+
+    fn sync_teams_hot_activity_from_chats(&mut self, chats: &[Chat]) {
+        let now = std::time::Instant::now();
+        let present: std::collections::HashSet<&str> =
+            chats.iter().map(|chat| chat.id.as_str()).collect();
+
+        for chat in chats {
+            let Some(preview) = chat.last_message_preview.as_ref() else {
+                continue;
+            };
+            let Some(message_id) = preview.id.as_deref() else {
+                continue;
+            };
+            let message_at = Self::graph_message_time(preview.created_date_time.as_deref());
+
+            match self.teams_hot_chat_state.get_mut(&chat.id) {
+                Some(state) if Self::state_message_is_newer(state, message_id, message_at) => {
+                    state.latest_message_id = Some(message_id.to_string());
+                    state.latest_message_at = message_at;
+                    state.last_activity = now;
+                    state.last_poll_started = Some(now);
+                }
+                Some(_) => {}
+                None => {
+                    self.teams_hot_chat_state.insert(
+                        chat.id.clone(),
+                        TeamsHotChatState {
+                            last_activity: Self::activity_instant_from_graph_time(message_at, now),
+                            // Do not burst immediately at startup; a recent chat
+                            // becomes due after its normal tier interval.
+                            last_poll_started: Some(now),
+                            latest_message_id: Some(message_id.to_string()),
+                            latest_message_at: message_at,
+                            hot_pending: false,
+                            foreground_in_flight: false,
+                        },
+                    );
+                }
+            }
+        }
+
+        self.teams_hot_chat_state.retain(|id, state| {
+            present.contains(id.as_str()) || state.hot_pending || state.foreground_in_flight
+        });
+    }
+
+    fn observe_teams_chat_page(&mut self, chat_id: &str, messages: &[ChatMessage]) -> bool {
+        let Some(newest) = messages.iter().max_by_key(|message| sort_key(message)) else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let message_at = Self::graph_message_time(newest.created_date_time.as_deref());
+
+        match self.teams_hot_chat_state.get_mut(chat_id) {
+            Some(state) if Self::state_message_is_newer(state, &newest.id, message_at) => {
+                state.latest_message_id = Some(newest.id.clone());
+                state.latest_message_at = message_at;
+                state.last_activity = now;
+                // This page itself was a message GET, so the next accelerated
+                // poll starts from now rather than trying to catch up.
+                state.last_poll_started = Some(now);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.teams_hot_chat_state.insert(
+                    chat_id.to_string(),
+                    TeamsHotChatState {
+                        last_activity: Self::activity_instant_from_graph_time(message_at, now),
+                        last_poll_started: Some(now),
+                        latest_message_id: Some(newest.id.clone()),
+                        latest_message_at: message_at,
+                        hot_pending: false,
+                        foreground_in_flight: false,
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    fn hot_page_differs_from_loaded_messages(&self, messages: &[ChatMessage]) -> bool {
+        if messages.is_empty() {
+            return false;
+        }
+
+        let loaded: std::collections::HashMap<&str, &ChatMessage> = self
+            .teams
+            .messages
+            .iter()
+            .map(|message| (message.id.as_str(), message))
+            .collect();
+
+        let current_page: Option<Vec<&ChatMessage>> = messages
+            .iter()
+            .map(|incoming| loaded.get(incoming.id.as_str()).copied())
+            .collect();
+        let Some(current_page) = current_page else {
+            return true;
+        };
+
+        match (
+            serde_json::to_vec(&current_page),
+            serde_json::to_vec(messages),
+        ) {
+            (Ok(current), Ok(incoming)) => current != incoming,
+            _ => true,
+        }
+    }
+
+    fn begin_teams_foreground_request(&mut self, chat_id: &str) -> bool {
+        self.ensure_teams_chat_poll_state(chat_id);
+        let Some(state) = self.teams_hot_chat_state.get_mut(chat_id) else {
+            return false;
+        };
+        if state.foreground_in_flight {
+            return false;
+        }
+        state.foreground_in_flight = true;
+        state.last_poll_started = Some(std::time::Instant::now());
+        true
+    }
+
+    fn ensure_teams_chat_poll_state(&mut self, chat_id: &str) {
+        if self.teams_hot_chat_state.contains_key(chat_id) {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let preview = self
+            .teams
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.last_message_preview.as_ref());
+        let latest_message_id = preview.and_then(|preview| preview.id.clone());
+        let latest_message_at = preview
+            .and_then(|preview| Self::graph_message_time(preview.created_date_time.as_deref()));
+        let last_activity = Self::activity_instant_from_graph_time(latest_message_at, now);
+
+        self.teams_hot_chat_state.insert(
+            chat_id.to_string(),
+            TeamsHotChatState {
+                last_activity,
+                last_poll_started: None,
+                latest_message_id,
+                latest_message_at,
+                hot_pending: false,
+                foreground_in_flight: false,
+            },
+        );
+    }
+
+    fn mark_teams_chat_active(&mut self, chat_id: &str) {
+        let now = std::time::Instant::now();
+        if let Some(state) = self.teams_hot_chat_state.get_mut(chat_id) {
+            state.last_activity = now;
+            state.last_poll_started = Some(now);
+            return;
+        }
+
+        self.teams_hot_chat_state.insert(
+            chat_id.to_string(),
+            TeamsHotChatState {
+                last_activity: now,
+                last_poll_started: Some(now),
+                latest_message_id: None,
+                latest_message_at: None,
+                hot_pending: false,
+                foreground_in_flight: false,
+            },
+        );
+    }
+
+    fn teams_chat_poll_tier_at(&self, chat_id: &str, now: std::time::Instant) -> ChatPollTier {
+        let Some(state) = self.teams_hot_chat_state.get(chat_id) else {
+            return ChatPollTier::Normal;
+        };
+        let tier = chat_poll_tier_from_age(now.duration_since(state.last_activity));
+        if tier == ChatPollTier::Normal {
+            return tier;
+        }
+
+        // HOT + WARM + COOL share the same top-N set. Tie-break by chat id so
+        // selection remains deterministic when two activities land together.
+        let ahead = self
+            .teams_hot_chat_state
+            .iter()
+            .filter(|(other_id, other)| {
+                chat_poll_tier_from_age(now.duration_since(other.last_activity))
+                    != ChatPollTier::Normal
+                    && (other.last_activity > state.last_activity
+                        || (other.last_activity == state.last_activity
+                            && other_id.as_str() < chat_id))
+            })
+            .count();
+
+        if ahead < self.session.config.teams_hot_chats {
+            tier
+        } else {
+            ChatPollTier::Normal
+        }
+    }
+
+    pub fn teams_chat_poll_tier(&self, chat_id: &str) -> ChatPollTier {
+        self.teams_chat_poll_tier_at(chat_id, std::time::Instant::now())
+    }
+
+    pub fn teams_poll_diagnostics(&self) -> TeamsPollDiagnostics {
+        let now = std::time::Instant::now();
+        let mut out = TeamsPollDiagnostics::default();
+
+        for chat in &self.teams.chats {
+            match self.teams_chat_poll_tier_at(&chat.id, now) {
+                ChatPollTier::Hot => out.hot += 1,
+                ChatPollTier::Warm => out.warm += 1,
+                ChatPollTier::Cool => out.cool += 1,
+                ChatPollTier::Normal => out.normal += 1,
+            }
+        }
+
+        for state in self.teams_hot_chat_state.values() {
+            if state.hot_pending {
+                out.hot_pending += 1;
+            }
+            if state.foreground_in_flight {
+                out.foreground_in_flight += 1;
+            }
+        }
+
+        let (runtime_budget_rps, reserved_chats) =
+            self.teams_background_limiter.diagnostics_snapshot();
+        out.runtime_budget_rps = runtime_budget_rps;
+        out.reserved_chats = reserved_chats;
+        out
+    }
+
+    fn poll_hot_chats_if_due(&mut self) {
+        let now = std::time::Instant::now();
+
+        // A slow/failed normal Graph poll wins. Teams accelerated polling is
+        // opportunistic background work and must yield to Mail/Calendar health.
+        if self.poll_health_pending || self.poll_backoff_until.is_some_and(|until| now < until) {
+            return;
+        }
+
+        let mut due: Vec<(std::time::Instant, String)> = self
+            .teams_hot_chat_state
+            .iter()
+            .filter_map(|(chat_id, state)| {
+                if state.hot_pending || state.foreground_in_flight {
+                    return None;
+                }
+
+                let tier = self.teams_chat_poll_tier_at(chat_id, now);
+                let interval = tier.interval()?;
+                let due_at = state
+                    .last_poll_started
+                    .map(|started| started + interval)
+                    .unwrap_or(now);
+
+                (now >= due_at).then(|| (due_at, chat_id.clone()))
+            })
+            .collect();
+
+        // Oldest due first. Each chat gets at most one pending hot task; the
+        // shared limiter controls actual HTTP concurrency and per-chat spacing.
+        due.sort_by_key(|(due_at, _)| *due_at);
+
+        for (_, chat_id) in due {
+            if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+                state.hot_pending = true;
+                state.last_poll_started = Some(now);
+            }
+            self.spawn_hot_chat_poll(chat_id, now);
+        }
+    }
+
+    fn spawn_hot_chat_poll(&self, chat_id: String, scheduled_at: std::time::Instant) {
+        let s = self.session.clone();
+        let tx = self.tx.clone();
+        let limiter = self.teams_background_limiter.clone();
+
+        tokio::spawn(async move {
+            let Some(permit) = limiter.acquire_hot(&s.graph, &chat_id, scheduled_at).await else {
+                let _ = tx.send(AppMessage::HotChatPollSkipped { chat_id }).await;
+                return;
+            };
+            let result = chats::list_messages(&s.graph, &chat_id, PAGE_SIZE).await;
+            drop(permit);
+
+            let message = match result {
+                Ok((messages, next)) => AppMessage::HotChatPollFinished {
+                    chat_id,
+                    messages,
+                    next,
+                    error: None,
+                },
+                Err(error) => AppMessage::HotChatPollFinished {
+                    chat_id,
+                    messages: Vec::new(),
+                    next: None,
+                    error: Some(format!("{error:#}")),
+                },
+            };
+            let _ = tx.send(message).await;
+        });
+    }
+
+    fn persist_teams_page_cache(&self, chat_id: &str, messages: &[ChatMessage]) {
+        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+            return;
+        };
+        if messages.is_empty() {
+            return;
+        }
+
+        let chat_id = chat_id.to_string();
+        let fresh = messages.to_vec();
+
+        tokio::spawn(async move {
+            let cache_chat_id = chat_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                // Cache files store newest-first. Merge the fresh newest page
+                // with older cached history so a hot poll never truncates a
+                // conversation the user previously paged through.
+                let mut newest_first = fresh;
+                if let Some((cached, _)) =
+                    load_teams_conversation_cache(&cache_root, &cache_chat_id)?
+                {
+                    let mut known: std::collections::HashSet<String> = newest_first
+                        .iter()
+                        .map(|message| message.id.clone())
+                        .collect();
+                    for message in cached {
+                        if known.insert(message.id.clone()) {
+                            newest_first.push(message);
+                        }
+                    }
+                }
+                newest_first.truncate(MAX_TEAMS_CACHED_MESSAGES);
+                newest_first.reverse();
+                store_teams_conversation_cache(&cache_root, &cache_chat_id, &newest_first)
+            })
+            .await
+            {
+                Ok(Ok(())) => {
+                    tracing::debug!("Teams hot-poll cache stored for {chat_id}");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!("Teams hot-poll cache write failed for {chat_id}: {error}");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Teams hot-poll cache writer task failed for {chat_id}: {error}"
+                    );
+                }
+            }
+        });
+    }
+
+    fn notify_for_hot_chat_message(&mut self, chat_id: &str, message: &ChatMessage) {
+        if let Some(seen) = self.chat_seen.as_mut() {
+            seen.insert(chat_id.to_string(), message.id.clone());
+        }
+
+        let my_id = self.me.as_ref().map(|me| me.id.clone());
+        let my_name = self.me.as_ref().and_then(|me| me.display_name.clone());
+        let from_id = message
+            .from
+            .as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|user| user.id.as_deref());
+
+        // Our own send still keeps the chat hot, but never creates unread state
+        // or a notification.
+        if from_id.is_some() && from_id == my_id.as_deref() {
+            return;
+        }
+        if message.deleted_date_time.is_some()
+            || message.author_id().is_none()
+            || message.is_system_event()
+        {
+            return;
+        }
+
+        let Some(chat) = self.teams.chats.iter().find(|chat| chat.id == chat_id) else {
+            return;
+        };
+        let one_on_one = chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"));
+        let chat_type = chat.chat_type.clone();
+        let fallback_label = chat.label(my_id.as_deref());
+        let open = self.teams.open_chat_id.as_deref() == Some(chat_id);
+
+        if !open {
+            if one_on_one {
+                let count = self
+                    .teams
+                    .chat_unread_counts
+                    .entry(chat_id.to_string())
+                    .or_insert(0);
+                *count = count.saturating_add(1).min(100);
+            }
+            if self.screen != Screen::Teams {
+                self.teams_unread = true;
+            }
+        }
+
+        if !self.notification_events_enabled() || !self.notified.insert(message.id.clone()) {
+            return;
+        }
+
+        let body = message
+            .body
+            .as_ref()
+            .and_then(|body| body.content.clone())
+            .unwrap_or_default();
+        let mentioned = crate::notify::mentions_me(
+            &message.mentions,
+            &body,
+            my_id.as_deref(),
+            my_name.as_deref(),
+        );
+        if !crate::notify::should_notify(chat_type.as_deref(), mentioned) {
+            return;
+        }
+
+        let who = message
+            .from
+            .as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|user| user.display_name.clone())
+            .unwrap_or(fallback_label);
+        let title = if mentioned {
+            format!("{who} mentioned you")
+        } else {
+            who
+        };
+        let plain = content::plain(&content::render_body(None, &body).text);
+        self.send_notification("Teams", title, plain);
+
+        if self.notified.len() > 1000 {
+            self.notified.clear();
+        }
+    }
+
+    fn apply_hot_chat_poll(
+        &mut self,
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        next: Option<String>,
+        error: Option<String>,
+    ) {
+        if let Some(state) = self.teams_hot_chat_state.get_mut(&chat_id) {
+            state.hot_pending = false;
+            // Never catch up missed intervals after a queued/slow request.
+            state.last_poll_started = Some(std::time::Instant::now());
+        }
+
+        if let Some(error) = error {
+            tracing::debug!("Teams hot poll failed for {chat_id}: {error}");
+            return;
+        }
+
+        let newest = messages
+            .iter()
+            .max_by_key(|message| sort_key(message))
+            .cloned();
+        let changed = self.observe_teams_chat_page(&chat_id, &messages);
+
+        if changed {
+            if let Some(newest) = newest.as_ref() {
+                self.notify_for_hot_chat_message(&chat_id, newest);
+            }
+        }
+
+        let previewing = self.screen == Screen::Teams
+            && self.teams.mode == TeamsMode::Chats
+            && self.teams.focus == TeamsFocus::List
+            && self.teams.open_chat_id.is_none()
+            && self.teams.preview_chat_id.as_deref() == Some(&chat_id);
+        let open = self.teams.open_chat_id.as_deref() == Some(&chat_id);
+        let page_content_changed =
+            (open || previewing) && self.hot_page_differs_from_loaded_messages(&messages);
+        let view_latest_id = self
+            .teams
+            .messages
+            .last()
+            .map(|message| message.id.as_str());
+        let page_latest_id = newest.as_ref().map(|message| message.id.as_str());
+        let view_needs_refresh = (open || previewing)
+            && (self.teams.messages.is_empty() || view_latest_id != page_latest_id);
+
+        if open || previewing {
+            if changed || view_needs_refresh || page_content_changed {
+                let learned_peer_id = self.remember_contact_from_messages(&chat_id, &messages);
+                if learned_peer_id {
+                    self.load_contact_presences(&[]);
+                }
+                self.set_teams_messages(messages, next, ListUpdate::Merge);
+                self.persist_teams_conversation_cache(&chat_id);
+            }
+
+            if open && self.teams.chat_open_pending_read.as_deref() == Some(&chat_id) {
+                self.teams.chat_open_pending_read = None;
+                self.teams.chat_unread_counts.remove(&chat_id);
+                self.mark_teams_chat_read(chat_id.clone());
+                if let Some(latest_id) = page_latest_id {
+                    self.teams
+                        .locally_read_through
+                        .insert(chat_id.clone(), latest_id.to_string());
+                }
+            }
+        } else if changed {
+            self.persist_teams_page_cache(&chat_id, &messages);
         }
     }
 
@@ -4785,7 +5814,17 @@ impl App {
         self.poll_health_pending = true;
         self.poll_retry_interval_secs = POLL_SECONDS;
         self.poll_backoff_until = None;
+        let accelerated_open_chat = self
+            .teams
+            .open_chat_id
+            .clone()
+            .filter(|id| self.teams_chat_poll_tier(id) != ChatPollTier::Normal);
         self.poll();
+        if let Some(id) = accelerated_open_chat {
+            // Manual F5 is foreground work. It bypasses the background token
+            // budget but still shares the per-chat in-flight coalescing guard.
+            self.load_chat_messages(id, ListUpdate::Merge);
+        }
     }
 
     /// Refresh the current view from the server. Driven by a periodic timer so
@@ -4802,10 +5841,14 @@ impl App {
         if let Some(f) = self.outlook.folders.get(self.outlook.folder_sel) {
             self.load_messages(f.id.clone(), ListUpdate::Merge);
         }
-        // Teams: refresh chat list + whichever conversation is open.
+        // Teams: refresh the chat list. An accelerated open chat is already
+        // covered by the hot scheduler, so do not add a duplicate message GET
+        // every 20 seconds.
         self.load_chats();
         if let Some(id) = self.teams.open_chat_id.clone() {
-            self.load_chat_messages(id, ListUpdate::Merge);
+            if self.teams_chat_poll_tier(&id) == ChatPollTier::Normal {
+                self.load_chat_messages(id, ListUpdate::Merge);
+            }
         }
         if let Some((t, c)) = self.teams.open_channel.clone() {
             self.load_channel_messages(t, c, ListUpdate::Merge);
@@ -6142,8 +7185,7 @@ impl App {
                 }
             }
             KeyCode::Char('g')
-                if self.teams.mode == TeamsMode::Chats
-                    && self.teams.focus == TeamsFocus::List =>
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
             {
                 self.open_selected_contact_profile();
             }
@@ -6280,7 +7322,10 @@ impl App {
                 self.status = format!("replying to {author}…");
                 self.spawn(async move {
                     chats::send_reply(&s.graph, &chat_id, &original, &text).await?;
-                    Ok(AppMessage::Done("reply sent".into()))
+                    Ok(AppMessage::ChatMessageSent {
+                        chat_id,
+                        status: "reply sent".into(),
+                    })
                 });
             }
             // Channels have a real replies collection, so the reply threads.
@@ -6428,8 +7473,7 @@ impl App {
                 let max = self.contact_profile_max_scroll.get();
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.contact_profile_scroll =
-                            self.contact_profile_scroll.saturating_sub(1);
+                        self.contact_profile_scroll = self.contact_profile_scroll.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.contact_profile_scroll =
@@ -7012,6 +8056,53 @@ mod ntfy_snooze_poll_tests {
         assert!(!path.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hot_poll_tests {
+    use super::{chat_poll_tier_from_age, teams_message_id_is_newer, ChatPollTier};
+
+    #[test]
+    fn message_id_tiebreak_is_monotonic() {
+        assert!(teams_message_id_is_newer("101", "100"));
+        assert!(!teams_message_id_is_newer("100", "101"));
+        assert!(teams_message_id_is_newer("b", "a"));
+        assert!(!teams_message_id_is_newer("a", "b"));
+    }
+
+    #[test]
+    fn activity_age_maps_to_expected_poll_tier() {
+        use std::time::Duration;
+
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(0)),
+            ChatPollTier::Hot
+        );
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(120)),
+            ChatPollTier::Hot
+        );
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(121)),
+            ChatPollTier::Warm
+        );
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(300)),
+            ChatPollTier::Warm
+        );
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(301)),
+            ChatPollTier::Cool
+        );
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(900)),
+            ChatPollTier::Cool
+        );
+        assert_eq!(
+            chat_poll_tier_from_age(Duration::from_secs(901)),
+            ChatPollTier::Normal
+        );
     }
 }
 
