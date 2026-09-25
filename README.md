@@ -508,9 +508,15 @@ The indicators are:
 | `◐` | Away / Be right back |
 | `×` | Do not disturb / Presenting |
 | `○` | Offline / unknown |
+| `◒` | Out of office |
 
 The marker on the selected chat remains colour-coded and is rendered on a small
 dark badge so the status remains visible against the selected-row background.
+
+When a one-to-one contact is currently out of office, m365-tui also shows the
+Out of Office message returned by Microsoft Graph in a one-line banner above
+the composer. The same message is available in the contact profile (`g`).
+This uses the existing presence lookup and does not require another permission.
 
 #### Set your own presence
 

@@ -20,9 +20,7 @@ pub struct User {
 
 impl User {
     pub fn best_email(&self) -> Option<&str> {
-        self.mail
-            .as_deref()
-            .or(self.user_principal_name.as_deref())
+        self.mail.as_deref().or(self.user_principal_name.as_deref())
     }
 }
 
@@ -555,11 +553,7 @@ impl ChatMessage {
         self.body
             .as_ref()
             .and_then(|body| body.content.as_deref())
-            .is_some_and(|content| {
-                content
-                    .to_ascii_lowercase()
-                    .contains("<systemeventmessage")
-            })
+            .is_some_and(|content| content.to_ascii_lowercase().contains("<systemeventmessage"))
     }
 
     /// Classify and humanize a Teams system event without changing the raw
@@ -661,11 +655,9 @@ impl ChatMessage {
                 with_initiator("Call started".to_string(), detail),
                 None,
             ),
-            "callEndedEventMessageDetail" => (
-                SystemEventClass::Noise,
-                "Call ended".to_string(),
-                None,
-            ),
+            "callEndedEventMessageDetail" => {
+                (SystemEventClass::Noise, "Call ended".to_string(), None)
+            }
             "membersJoinedEventMessageDetail" => (
                 SystemEventClass::Noise,
                 format!(
@@ -855,6 +847,15 @@ pub struct ScoredEmailAddress {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OutOfOfficeSettings {
+    #[serde(default)]
+    pub is_out_of_office: Option<bool>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Presence {
     #[serde(default)]
     pub id: Option<String>,
@@ -862,6 +863,8 @@ pub struct Presence {
     pub availability: Option<String>,
     #[serde(default)]
     pub activity: Option<String>,
+    #[serde(default)]
+    pub out_of_office_settings: Option<OutOfOfficeSettings>,
 }
 
 /// A mail attachment. Listing deliberately omits `contentBytes` — those are
@@ -1056,7 +1059,9 @@ mod tests {
 
     #[test]
     fn reads_the_quoted_message_from_a_reference_attachment() {
-        let q = reply_message().quoted().expect("reply should carry a quote");
+        let q = reply_message()
+            .quoted()
+            .expect("reply should carry a quote");
         assert_eq!(q.author, "Alex Rivera");
         assert_eq!(q.preview, "Sounds good to me");
         assert_eq!(q.message_id, "1785858892876");

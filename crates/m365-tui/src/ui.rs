@@ -1374,6 +1374,81 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
 // Teams
 // ---------------------------------------------------------------------------
 
+fn presence_is_out_of_office(presence: &m365_core::models::Presence) -> bool {
+    presence
+        .out_of_office_settings
+        .as_ref()
+        .and_then(|settings| settings.is_out_of_office)
+        .unwrap_or(false)
+        || presence
+            .activity
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("outOfOffice"))
+        || presence
+            .availability
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("outOfOffice"))
+}
+
+fn compact_presence_message(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    let looks_like_html = raw.contains("<p")
+        || raw.contains("<br")
+        || raw.contains("</")
+        || raw.contains("<div")
+        || raw.contains("<span");
+
+    let text = if looks_like_html {
+        let rendered = crate::content::render_body(Some("html"), raw);
+        crate::content::plain(&rendered.text)
+    } else {
+        raw.to_string()
+    };
+
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn presence_out_of_office_message(presence: &m365_core::models::Presence) -> Option<String> {
+    if !presence_is_out_of_office(presence) {
+        return None;
+    }
+
+    Some(
+        presence
+            .out_of_office_settings
+            .as_ref()
+            .and_then(|settings| settings.message.as_deref())
+            .map(compact_presence_message)
+            .unwrap_or_default(),
+    )
+}
+
+fn open_chat_out_of_office(app: &App) -> Option<String> {
+    let chat_id = app.teams.open_chat_id.as_deref()?;
+    let chat = app.teams.chats.iter().find(|chat| chat.id == chat_id)?;
+    if !chat
+        .chat_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+    {
+        return None;
+    }
+
+    let me_id = app.me.as_ref().map(|me| me.id.as_str());
+    let user_id = app
+        .teams
+        .contact_user_ids
+        .get(chat_id)
+        .map(String::as_str)
+        .or_else(|| chat.peer_user_id(me_id))?;
+    let presence = app.teams.contact_presences.get(user_id)?;
+    presence_out_of_office_message(presence)
+}
+
 fn contact_presence_marker(
     presence: Option<&m365_core::models::Presence>,
 ) -> (&'static str, Color) {
@@ -1386,7 +1461,9 @@ fn contact_presence_marker(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if activity == "presenting" || availability == "donotdisturb" {
+    if activity == "outofoffice" || availability == "outofoffice" {
+        ("◒", Color::LightMagenta)
+    } else if activity == "presenting" || availability == "donotdisturb" {
         ("×", Color::Red)
     } else if activity == "inacall" || activity == "inameeting" || availability.starts_with("busy")
     {
@@ -1407,6 +1484,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let me_id = app.me.as_ref().map(|m| m.id.as_str());
+    let out_of_office = open_chat_out_of_office(app);
 
     // Left list: chats or channels
     //
@@ -1586,10 +1664,12 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     // One extra row while a reply is being composed, for the quoted banner.
     let reply_row = u16::from(app.teams.replying_to.is_some());
+    let oof_row = u16::from(out_of_office.is_some());
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
+            Constraint::Length(oof_row),
             Constraint::Length(composer_rows + reply_row + 2),
         ])
         .split(cols[1]);
@@ -1791,9 +1871,27 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "Message"
     };
+    if let Some(message) = out_of_office.as_deref() {
+        let value = if message.is_empty() {
+            "Out of office".to_string()
+        } else {
+            format!("OOO: {message}")
+        };
+        let value = truncate(&value, right[1].width.max(1) as usize);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                value,
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            right[1],
+        );
+    }
+
     let composer_block = panel_block(title, composing);
-    let mut composer_inner = composer_block.inner(right[1]);
-    f.render_widget(composer_block, right[1]);
+    let mut composer_inner = composer_block.inner(right[2]);
+    f.render_widget(composer_block, right[2]);
 
     // Show what's being replied to, so the quote isn't a surprise on send.
     if let Some(idx) = app.teams.replying_to {
@@ -2017,6 +2115,17 @@ fn contact_profile_lines(app: &App) -> Vec<Line<'static>> {
             _ => None,
         };
         contact_profile_field(&mut lines, "Status:", status);
+        if let Some(message) = presence_out_of_office_message(presence) {
+            contact_profile_field(
+                &mut lines,
+                "Out of office:",
+                Some(if message.is_empty() {
+                    "active".to_string()
+                } else {
+                    message
+                }),
+            );
+        }
     }
 
     if let Some(person) = profile.person.as_ref() {
@@ -2925,7 +3034,7 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{contact_presence_marker, day_label, local_time};
+    use super::{contact_presence_marker, day_label, local_time, presence_out_of_office_message};
     use ratatui::style::Color;
 
     #[test]
@@ -2937,6 +3046,7 @@ mod tests {
                 id: None,
                 availability: Some(availability.to_string()),
                 activity: Some(activity.to_string()),
+                out_of_office_settings: None,
             }
         }
 
@@ -2972,6 +3082,38 @@ mod tests {
             contact_presence_marker(Some(&presence("Offline", "Offline"))),
             ("○", Color::DarkGray)
         );
+        assert_eq!(
+            contact_presence_marker(Some(&presence("OutOfOffice", "OutOfOffice"))),
+            ("◒", Color::LightMagenta)
+        );
+    }
+
+    #[test]
+    fn out_of_office_message_comes_from_presence_settings() {
+        let active: m365_core::models::Presence = serde_json::from_value(serde_json::json!({
+            "availability": "Available",
+            "activity": "OutOfOffice",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": true,
+                "message": "<p>Back on Monday</p>"
+            }
+        }))
+        .unwrap();
+        let inactive: m365_core::models::Presence = serde_json::from_value(serde_json::json!({
+            "availability": "Available",
+            "activity": "Available",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": false,
+                "message": "This must stay hidden"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            presence_out_of_office_message(&active).as_deref(),
+            Some("Back on Monday")
+        );
+        assert_eq!(presence_out_of_office_message(&inactive), None);
     }
 
     #[test]
