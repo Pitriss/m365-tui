@@ -561,22 +561,27 @@ pub fn conversation_lines(
 
         let when = local_time(m.created_date_time.as_deref());
         let mut day_changed = false;
-        if let Some(when) = when {
-            let day = when.date_naive();
-            if last_day != Some(day) {
-                let first_day = last_day.is_none();
-                if !first_day {
-                    lines.push(Line::from(""));
+        // A deleted message may still be kept in the Graph page/cache so the UI
+        // can show "(message deleted)", but it must not create or keep a day
+        // separator by itself.
+        if message_has_day_context(m) {
+            if let Some(when) = when {
+                let day = when.date_naive();
+                if last_day != Some(day) {
+                    let first_day = last_day.is_none();
+                    if !first_day {
+                        lines.push(Line::from(""));
+                    }
+                    // The normal Teams pane already has a pinned/sticky date row.
+                    // Suppress only the first inline separator there so a freshly
+                    // opened conversation does not show the same date twice.
+                    // Copy mode has no sticky row and asks to keep it.
+                    if show_first_day_separator || !first_day {
+                        lines.push(day_separator(&day_label(day)));
+                    }
+                    last_day = Some(day);
+                    day_changed = true;
                 }
-                // The normal Teams pane already has a pinned/sticky date row.
-                // Suppress only the first inline separator there so a freshly
-                // opened conversation does not show the same date twice.
-                // Copy mode has no sticky row and asks to keep it.
-                if show_first_day_separator || !first_day {
-                    lines.push(day_separator(&day_label(day)));
-                }
-                last_day = Some(day);
-                day_changed = true;
             }
         }
         // Record the start *after* any separator, so scrolling to a message
@@ -1780,6 +1785,9 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .saturating_sub(pane_h)
         .min(rows.len().saturating_sub(pane_h)) as u16;
 
+    // Always clear the pinned date row first. When the last live message for a
+    // day disappears, sticky_day_label() intentionally returns None.
+    f.render_widget(Clear, pane[0]);
     if let Some(label) = sticky_day_label(app, &msg_rows, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
@@ -2943,21 +2951,43 @@ fn day_label(day: chrono::NaiveDate) -> String {
     }
 }
 
+/// Whether a Teams message is allowed to establish a Today/Yesterday/date
+/// context. Deleted messages can still render their tombstone row, but a day
+/// containing no live messages must not leave an orphan separator.
+fn message_has_day_context(message: &m365_core::models::ChatMessage) -> bool {
+    message.deleted_date_time.is_none()
+}
+
 /// Day label for the message currently at the top of the visible area — the
-/// content of the pinned header. `starts` is ascending, so the topmost visible
-/// message is the last one starting at or above the scroll offset.
+/// content of the pinned header. Hidden messages still have entries in `starts`
+/// so message indices remain aligned with `app.teams.messages`; they must not be
+/// allowed to keep a stale day marker on screen.
 fn sticky_day_label(app: &App, starts: &[usize], scroll: u16) -> Option<String> {
-    let idx = topmost_message_index(starts, scroll);
+    let idx = topmost_visible_message_index(starts, scroll, |idx| {
+        app.teams.messages.get(idx).is_some_and(|message| {
+            message_has_day_context(message) && app.teams_message_visible(message)
+        })
+    })?;
     let when = local_time(app.teams.messages.get(idx)?.created_date_time.as_deref())?;
     Some(day_label(when.date_naive()))
 }
 
-/// Index of the message occupying the top of the visible area.
-fn topmost_message_index(starts: &[usize], scroll: u16) -> usize {
+/// Index of the rendered message occupying the top of the visible area.
+///
+/// `conversation_lines()` keeps one `starts` entry per raw message so selection
+/// indices stay aligned. Filtered messages can therefore share a start offset
+/// with a visible neighbour; `visible` prevents such an entry from becoming the
+/// source of the sticky day header.
+fn topmost_visible_message_index(
+    starts: &[usize],
+    scroll: u16,
+    mut visible: impl FnMut(usize) -> bool,
+) -> Option<usize> {
     starts
         .iter()
-        .rposition(|&s| s <= scroll as usize)
-        .unwrap_or(0)
+        .enumerate()
+        .rev()
+        .find_map(|(idx, &start)| (start <= scroll as usize && visible(idx)).then_some(idx))
 }
 
 fn day_separator(label: &str) -> Line<'static> {
@@ -3194,19 +3224,66 @@ mod tests {
     }
 
     #[test]
-    fn sticky_header_tracks_topmost_message() {
-        use super::topmost_message_index;
-        // Three messages beginning at lines 0, 5 and 12.
+    fn deleted_message_does_not_anchor_day_marker() {
+        let live: m365_core::models::ChatMessage =
+            serde_json::from_value(serde_json::json!({
+                "id": "live",
+                "createdDateTime": "2026-09-29T10:00:00Z",
+                "body": { "contentType": "text", "content": "hello" }
+            }))
+            .unwrap();
+        let deleted: m365_core::models::ChatMessage =
+            serde_json::from_value(serde_json::json!({
+                "id": "deleted",
+                "createdDateTime": "2026-09-29T10:00:00Z",
+                "deletedDateTime": "2026-09-30T07:00:00Z",
+                "body": { "contentType": "text", "content": "" }
+            }))
+            .unwrap();
+
+        assert!(super::message_has_day_context(&live));
+        assert!(!super::message_has_day_context(&deleted));
+    }
+
+    #[test]
+    fn sticky_header_tracks_topmost_visible_message() {
+        use super::topmost_visible_message_index;
+
+        // Three rendered messages beginning at rows 0, 5 and 12.
         let starts = [0usize, 5, 12];
-        assert_eq!(topmost_message_index(&starts, 0), 0);
-        assert_eq!(topmost_message_index(&starts, 4), 0); // still inside msg 0
-        assert_eq!(topmost_message_index(&starts, 5), 1); // exactly at msg 1
-        assert_eq!(topmost_message_index(&starts, 11), 1);
-        assert_eq!(topmost_message_index(&starts, 12), 2);
-        assert_eq!(topmost_message_index(&starts, 99), 2); // clamped past the end
-                                                           // A separator above the first message must not select a negative index.
-        assert_eq!(topmost_message_index(&[3, 9], 0), 0);
-        assert_eq!(topmost_message_index(&[], 7), 0);
+        assert_eq!(topmost_visible_message_index(&starts, 0, |_| true), Some(0));
+        assert_eq!(topmost_visible_message_index(&starts, 4, |_| true), Some(0));
+        assert_eq!(topmost_visible_message_index(&starts, 5, |_| true), Some(1));
+        assert_eq!(
+            topmost_visible_message_index(&starts, 11, |_| true),
+            Some(1)
+        );
+        assert_eq!(
+            topmost_visible_message_index(&starts, 12, |_| true),
+            Some(2)
+        );
+        assert_eq!(
+            topmost_visible_message_index(&starts, 99, |_| true),
+            Some(2)
+        );
+
+        // A filtered slot may share the same row with the next rendered
+        // message. It must never supply the pinned date.
+        let starts = [0usize, 0, 7];
+        let visible = [false, true, true];
+        assert_eq!(
+            topmost_visible_message_index(&starts, 0, |idx| visible[idx]),
+            Some(1)
+        );
+
+        // If no message represented by the row map is visible, there is no
+        // sticky day marker at all.
+        let hidden = [false, false, false];
+        assert_eq!(
+            topmost_visible_message_index(&starts, 99, |idx| hidden[idx]),
+            None
+        );
+        assert_eq!(topmost_visible_message_index(&[], 7, |_| true), None);
     }
 
     #[test]
