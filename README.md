@@ -45,6 +45,8 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - Optional Teams/channel browsing.
 - Server-side read-state synchronization with other Teams clients.
 - Per-chat unread counts.
+- Server-side chat archive/restore with an Archive drawer and optional Stay
+  archived re-hide behavior.
 - Adaptive HOT/WARM/COOL polling for recently active chats, with a shared
   Microsoft Graph request budget.
 - Replies and emoji reactions.
@@ -936,7 +938,9 @@ In the reading pane, `j`/`k` scroll rather than changing the selected message.
 | Key | Action |
 |---|---|
 | `j` / `k` | Move through chats and show local cached preview |
-| `Enter` / `l` | Open selected conversation |
+| `Enter` / `l` | Open selected conversation; toggle the Archive drawer when its row is selected |
+| `x` | Archive or restore the selected chat |
+| `X` | Toggle Stay archived for an already archived chat |
 | `t` | Toggle chats / Teams channels |
 | `i` / `a` | Open selected chat and start writing |
 
@@ -945,6 +949,10 @@ server. When a persistent cache exists, m365-tui displays the cached conversatio
 and cached images locally.
 
 Opening the conversation performs normal Graph refresh and read-state handling.
+
+A chat with Stay archived enabled must first have Stay archived disabled with
+`X` before `x` can restore it. The Archive drawer's expanded/collapsed state is
+persisted when persistent UI state is enabled.
 
 #### Conversation
 
@@ -1402,6 +1410,7 @@ It contains data such as:
 image cache
 conversation cache
 UI state
+Stay archived state
 ```
 
 ### Conversation cache
@@ -1421,7 +1430,8 @@ application falls back to Graph when the chat is opened.
 ### UI state
 
 Persistent UI state remembers information such as the previous screen,
-Calendar view, and last Teams conversation.
+Calendar view, last Teams conversation, and whether the Teams Archive drawer was
+expanded or collapsed.
 
 Restoring cached content does not by itself have to perform the same operations
 as actively opening a conversation.

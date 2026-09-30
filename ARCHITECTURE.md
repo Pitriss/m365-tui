@@ -153,6 +153,30 @@ available, and finally reads UPS presence. Names, email addresses, raw IDs,
 access/refresh/Skype tokens, MRIs, tenant IDs, and raw service responses are
 intentionally excluded from the rendered/exported snapshot.
 
+## Persistent local state
+
+`M365_CACHE_DIR` is the common root for persistent Teams/UI state. The historical
+`M365_TEAMS_IMAGE_CACHE_DIR` remains a deprecated fallback so existing
+configurations keep working. Resolution is deliberately simple:
+
+1. `M365_CACHE_DIR`
+2. `M365_TEAMS_IMAGE_CACHE_DIR`
+3. no persistent Teams/UI state when neither is set
+
+When both are present, the new variable wins. Compatibility warnings are kept
+out of the alternate-screen TUI and are printed only after it exits. The
+application does not rewrite `.env`, move cache data, or invent an implicit
+`~/.cache/m365-tui` root.
+
+The authentication token cache is separate. `M365_TOKEN_CACHE` retains its own
+existing default and is not redirected by `M365_CACHE_DIR`.
+
+The common root currently holds decoded Teams images, cached chat
+conversations, UI state, and `stay-archived.json`. UI state includes the
+selected screen/calendar view, last Teams chat, and the Archive drawer's
+expanded/collapsed state. Without a configured common root these features either
+fall back to process-local state or remain disabled as appropriate.
+
 ## The UI loop
 
 The terminal thread never blocks on the network. Key handlers spawn tokio tasks;
@@ -334,6 +358,30 @@ hot-poll notifications.
 F6 exposes the configured chat limit, configured and runtime request budgets,
 current HOT/WARM/COOL/NORMAL counts, pending hot tasks, foreground work and
 currently reserved background chats.
+
+### Teams Archive and Stay archived
+
+Archive uses the server-side Teams hidden state exposed through
+`viewpoint.isHidden`. The `x` action calls `hideForUser` or `unhideForUser`, and
+the chat list renders hidden chats below a dedicated Archive drawer.
+
+Stay archived is intentionally a hybrid local/server feature. A chat belongs in
+the local Archive view when either Graph reports it hidden or its chat id is in
+the local Stay archived set. `X` can enable that set only for an already hidden
+chat; disabling it does not itself unhide the chat.
+
+Teams may clear the server hidden state when a new message arrives. Normal
+message handling therefore runs first: unread state, notifications, cache
+updates and HOT/WARM/COOL activity are processed normally. Only afterwards does
+the app queue a low-priority `hideForUser` maintenance request for a Stay
+archived chat that Graph currently reports visible.
+
+The re-hide uses the shared Teams background limiter. Failure does not replay
+message processing; the hide is retried on a later chat refresh.
+
+When the common persistent root is configured, the Stay archived set is stored
+in `stay-archived.json`. Without it, Stay archived remains available but is
+process-local.
 
 ### Why a tunnel is needed at all
 
