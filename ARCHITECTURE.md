@@ -265,11 +265,75 @@ cheap layout runs per frame.
 
 Two independent mechanisms, so the app is never dependent on the tunnel:
 
-1. **Polling** — a 20-second timer refreshes the current view. Always on.
-   The status bar reports normal progress, overdue time, and `STALE`; if a
-   scheduled poll is still outstanding, application-level polling backs off up
-   to five minutes rather than stacking additional request waves.
+1. **Polling** — a 20-second application timer refreshes the current view.
+   Recently active Teams chats additionally use the adaptive message scheduler
+   described below. The status bar reports normal poll progress, overdue time,
+   and `STALE`; if a scheduled application poll is still outstanding,
+   application-level polling backs off up to five minutes rather than stacking
+   additional request waves.
 2. **Push** — Graph change notifications, when a tunnel is configured.
+
+### Adaptive Teams polling
+
+Recently active chats are assigned from message activity to four tiers:
+
+| Tier | Activity age | Target message interval |
+|---|---:|---:|
+| HOT | `<= 120s` | 2s |
+| WARM | `<= 300s` | 5s |
+| COOL | `<= 900s` | 10s |
+| NORMAL | `> 900s` | no accelerated task |
+
+HOT, WARM and COOL share a single most-recently-active top-N set controlled by
+`M365_TEAMS_HOT_CHATS` (default 6, maximum 16). A chat outside that top-N is
+treated as NORMAL even when its activity age would otherwise qualify for an
+accelerated tier. Startup state is seeded from `lastMessagePreview` timestamps;
+later newer chat-list previews, newer fetched messages, and locally sent
+messages advance `last_activity`.
+
+The adaptive scheduler ticks locally once per second, but a chat is queued only
+when its tier interval is due. It never starts another background task while the
+same chat already has hot or foreground work in flight, and it does not try to
+catch up missed intervals after a slow request.
+
+Background Teams message GETs share a token budget configured by
+`M365_TEAMS_POLL_BUDGET_RPS` (default 6 rps, accepted range 0.5-8 rps). The
+same limiter is used by accelerated polling, unread counting, and cold-cache
+warm-up. Configuration is rejected when `hot_chats / budget_rps` would exceed
+5 seconds at full load. At runtime there are at most two concurrent background
+Teams GETs, and background message GETs for one chat are spaced by at least two
+seconds.
+
+Foreground conversation work is intentionally favoured. Opening/refreshing a
+chat uses a per-chat foreground reservation and does not wait for the background
+token budget; its minimum same-chat spacing is one second. Manual `F5` also
+refreshes an accelerated open chat as foreground work. If such a request
+supersedes an already queued hot poll, the stale background task is discarded
+before issuing a duplicate GET.
+
+Adaptive polling is opportunistic. While the normal application poll is waiting
+for its health response or is in application-level backoff, no new hot work is
+scheduled. Graph-level throttling is handled centrally through `Retry-After`.
+A newly observed 429 generation additionally halves the Teams runtime background
+budget, never below 0.5 rps; while no newer throttle is observed it recovers by
+0.5 rps every 30 seconds until it reaches the configured budget.
+
+A successful hot poll updates the tracked newest message and, when useful, the
+visible conversation or preview. Persistent conversation cache updates merge the
+newest page with older cached history before truncation, so accelerated polling
+cannot replace previously loaded history with only the newest page.
+
+Notification delivery uses the same policy and message-id deduplication as the
+normal Teams path. With a known baseline, all newly arrived messages from the
+fetched page are processed oldest-to-newest. If the previous message is no
+longer present in the page (or no baseline exists), only the newest message is
+processed, avoiding accidental replay of an entire page of history. Messages
+sent by the signed-in user, deleted messages and system events do not create
+hot-poll notifications.
+
+F6 exposes the configured chat limit, configured and runtime request budgets,
+current HOT/WARM/COOL/NORMAL counts, pending hot tasks, foreground work and
+currently reserved background chats.
 
 ### Why a tunnel is needed at all
 

@@ -45,6 +45,8 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - Optional Teams/channel browsing.
 - Server-side read-state synchronization with other Teams clients.
 - Per-chat unread counts.
+- Adaptive HOT/WARM/COOL polling for recently active chats, with a shared
+  Microsoft Graph request budget.
 - Replies and emoji reactions.
 - Presence indicators for contacts in one-to-one chats.
 - Optional control of your own Teams presence.
@@ -106,8 +108,8 @@ unchanged unless this command is explicitly invoked.
   (Skype-resource token -> authz/Skype token -> Middle Tier MRI lookup -> UPS)
   without exporting names, email addresses, raw IDs, tokens, MRIs, or tenant IDs.
 - Shows account/token health, Microsoft 365 work-plan hours and time zones,
-  actual Graph token scopes, optional feature state, presence, push/cache and
-  terminal integration state.
+  actual Graph token scopes, optional feature state, presence, push/cache,
+  adaptive Teams polling tiers/budget/work, and terminal integration state.
 - `r` refreshes live diagnostics.
 - `c` exports the same plain-text snapshot to a native clipboard helper
   (`wl-copy`, `xclip`, `xsel`, or `pbcopy`). If none is usable, the snapshot is
@@ -481,6 +483,60 @@ event types are not silently discarded.
 System-event rows are selectable for reading but cannot be replied to or reacted
 to.
 
+#### Adaptive chat polling
+
+The normal application poll runs every 20 seconds, but recently active Teams
+chats use a separate adaptive message scheduler so active conversations update
+faster without continuously polling every chat.
+
+| Tier | Activity age | Target message poll interval |
+|---|---:|---:|
+| HOT | up to 2 minutes | 2 seconds |
+| WARM | up to 5 minutes | 5 seconds |
+| COOL | up to 15 minutes | 10 seconds |
+| NORMAL | older than 15 minutes | normal 20-second application refresh; an open NORMAL conversation is refreshed with that poll |
+
+HOT, WARM and COOL share one most-recently-active top-N set. Configure its size
+with:
+
+```dotenv
+M365_TEAMS_HOT_CHATS=6
+```
+
+The default is 6 accelerated chats and the hard maximum is 16. Despite the
+historical variable name, this limit is shared by all HOT, WARM and COOL chats,
+not only the HOT tier.
+
+The shared background request budget is configured with:
+
+```dotenv
+M365_TEAMS_POLL_BUDGET_RPS=6
+```
+
+The default is 6 requests/s and the accepted range is 0.5-8 requests/s. The same
+budget is shared with Teams unread-count and cold-cache warm-up message GETs.
+Configuration is rejected when the selected chat count and request budget would
+imply more than about 5 seconds per accelerated chat at full load.
+
+Chat activity advances when m365-tui observes a newer message through the chat
+list or a message-page fetch, and when a message is sent from m365-tui. At
+startup, existing chats are seeded from the timestamp of their latest known
+message instead of being made artificially HOT.
+
+Foreground work takes priority over background polling. Opening or explicitly
+refreshing a conversation is not held behind the background token budget, and
+`F5` can refresh an accelerated open chat immediately. Background work also
+yields while the normal Graph poll is late or backing off.
+
+Accelerated polls use the normal Teams notification policy. When a known message
+baseline is still present, multiple newly arrived messages are processed
+oldest-to-newest. If that baseline is missing, only the newest message is
+announced so a burst or short page cannot replay old history.
+
+F6 diagnostics show the configured and current runtime Teams polling budget,
+the number of chats in each HOT/WARM/COOL/NORMAL tier, and pending/foreground
+polling work.
+
 ### Presence
 
 #### Show contact presence
@@ -509,6 +565,10 @@ The indicators are:
 | `×` | Do not disturb / Presenting |
 | `○` | Offline / unknown |
 | `◒` | Out of office |
+
+Out of office takes precedence over ordinary availability for the contact
+marker. A contact whose Graph availability/activity are `Offline` still uses
+the `◒` marker while `outOfOfficeSettings.isOutOfOffice` is active.
 
 The marker on the selected chat remains colour-coded and is rendered on a small
 dark badge so the status remains visible against the selected-row background.

@@ -1453,6 +1453,7 @@ fn open_chat_out_of_office(app: &App) -> Option<String> {
 fn contact_presence_marker(
     presence: Option<&m365_core::models::Presence>,
 ) -> (&'static str, Color) {
+    let out_of_office = presence.is_some_and(presence_is_out_of_office);
     let availability = presence
         .and_then(|p| p.availability.as_deref())
         .unwrap_or("")
@@ -1462,7 +1463,7 @@ fn contact_presence_marker(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if activity == "outofoffice" || availability == "outofoffice" {
+    if out_of_office {
         ("◒", Color::LightMagenta)
     } else if activity == "presenting" || availability == "donotdisturb" {
         ("×", Color::Red)
@@ -3128,6 +3129,25 @@ mod tests {
         );
         assert_eq!(
             contact_presence_marker(Some(&presence("OutOfOffice", "OutOfOffice"))),
+            ("◒", Color::LightMagenta)
+        );
+    }
+
+    #[test]
+    fn contact_presence_marker_keeps_ooo_when_contact_is_offline() {
+        let presence: m365_core::models::Presence =
+            serde_json::from_value(serde_json::json!({
+                "availability": "Offline",
+                "activity": "Offline",
+                "outOfOfficeSettings": {
+                    "isOutOfOffice": true,
+                    "message": "Back tomorrow"
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(
+            contact_presence_marker(Some(&presence)),
             ("◒", Color::LightMagenta)
         );
     }
