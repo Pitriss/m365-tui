@@ -60,6 +60,10 @@ pub enum AppMessage {
         chat_id: String,
         hidden: bool,
     },
+    StayArchivedRehideFinished {
+        chat_id: String,
+        error: Option<String>,
+    },
     ContactPresences(Vec<Presence>),
     ContactProfileLoaded {
         chat_id: String,
@@ -551,6 +555,7 @@ struct UiState {
     calendar_days: i64,
     calendar_view: CalendarView,
     teams_chat_id: Option<String>,
+    teams_archive_expanded: bool,
 }
 
 impl Default for UiState {
@@ -560,6 +565,7 @@ impl Default for UiState {
             calendar_days: DEFAULT_CALENDAR_DAYS,
             calendar_view: CalendarView::Agenda,
             teams_chat_id: None,
+            teams_archive_expanded: false,
         }
     }
 }
@@ -583,6 +589,11 @@ pub struct TeamsState {
     /// active chats, one Archive drawer row, then archived chats when expanded.
     pub chat_sel: usize,
     pub archive_expanded: bool,
+    /// Chats that remain in the local Archive drawer even when Teams
+    /// automatically unhides them after a new message.
+    pub stay_archived: std::collections::HashSet<String>,
+    /// Automatic hideForUser calls currently queued/running for Stay archived.
+    stay_archived_rehide_in_flight: std::collections::HashSet<String>,
     /// Presence by directory user id for one-to-one chat contacts.
     pub contact_presences: std::collections::HashMap<String, Presence>,
     /// Last known display name by one-to-one chat id. Federated chat member
@@ -644,6 +655,8 @@ impl Default for TeamsState {
             chats: Vec::new(),
             chat_sel: 0,
             archive_expanded: false,
+            stay_archived: std::collections::HashSet::new(),
+            stay_archived_rehide_in_flight: std::collections::HashSet::new(),
             contact_presences: std::collections::HashMap::new(),
             contact_names: std::collections::HashMap::new(),
             contact_user_ids: std::collections::HashMap::new(),
@@ -685,19 +698,42 @@ pub fn teams_chat_is_hidden(chat: &Chat) -> bool {
         .unwrap_or(false)
 }
 
-fn teams_active_chat_count(chats: &[Chat]) -> usize {
-    chats.iter().filter(|chat| !teams_chat_is_hidden(chat)).count()
+fn teams_chat_is_archived(
+    chat: &Chat,
+    stay_archived: &std::collections::HashSet<String>,
+) -> bool {
+    teams_chat_is_hidden(chat) || stay_archived.contains(&chat.id)
 }
 
-fn teams_archived_chat_count(chats: &[Chat]) -> usize {
-    chats.iter().filter(|chat| teams_chat_is_hidden(chat)).count()
+fn teams_active_chat_count(
+    chats: &[Chat],
+    stay_archived: &std::collections::HashSet<String>,
+) -> usize {
+    chats
+        .iter()
+        .filter(|chat| !teams_chat_is_archived(chat, stay_archived))
+        .count()
 }
 
-fn teams_chat_row_count(chats: &[Chat], archive_expanded: bool) -> usize {
-    teams_active_chat_count(chats)
+fn teams_archived_chat_count(
+    chats: &[Chat],
+    stay_archived: &std::collections::HashSet<String>,
+) -> usize {
+    chats
+        .iter()
+        .filter(|chat| teams_chat_is_archived(chat, stay_archived))
+        .count()
+}
+
+fn teams_chat_row_count(
+    chats: &[Chat],
+    stay_archived: &std::collections::HashSet<String>,
+    archive_expanded: bool,
+) -> usize {
+    teams_active_chat_count(chats, stay_archived)
         + 1
         + if archive_expanded {
-            teams_archived_chat_count(chats)
+            teams_archived_chat_count(chats, stay_archived)
         } else {
             0
         }
@@ -705,16 +741,17 @@ fn teams_chat_row_count(chats: &[Chat], archive_expanded: bool) -> usize {
 
 fn teams_chat_index_for_row(
     chats: &[Chat],
+    stay_archived: &std::collections::HashSet<String>,
     archive_expanded: bool,
     row: usize,
 ) -> Option<usize> {
-    let active_count = teams_active_chat_count(chats);
+    let active_count = teams_active_chat_count(chats, stay_archived);
 
     if row < active_count {
         return chats
             .iter()
             .enumerate()
-            .filter(|(_, chat)| !teams_chat_is_hidden(chat))
+            .filter(|(_, chat)| !teams_chat_is_archived(chat, stay_archived))
             .nth(row)
             .map(|(index, _)| index);
     }
@@ -726,32 +763,49 @@ fn teams_chat_index_for_row(
     chats
         .iter()
         .enumerate()
-        .filter(|(_, chat)| teams_chat_is_hidden(chat))
+        .filter(|(_, chat)| teams_chat_is_archived(chat, stay_archived))
         .nth(row.saturating_sub(active_count + 1))
         .map(|(index, _)| index)
 }
 
 fn teams_chat_row_for_id(
     chats: &[Chat],
+    stay_archived: &std::collections::HashSet<String>,
     archive_expanded: bool,
     chat_id: &str,
 ) -> Option<usize> {
     let chat = chats.iter().find(|chat| chat.id == chat_id)?;
-    if teams_chat_is_hidden(chat) {
+    if teams_chat_is_archived(chat, stay_archived) {
         if !archive_expanded {
             return None;
         }
         let hidden_position = chats
             .iter()
-            .filter(|candidate| teams_chat_is_hidden(candidate))
+            .filter(|candidate| teams_chat_is_archived(candidate, stay_archived))
             .position(|candidate| candidate.id == chat_id)?;
-        Some(teams_active_chat_count(chats) + 1 + hidden_position)
+        Some(teams_active_chat_count(chats, stay_archived) + 1 + hidden_position)
     } else {
         chats
             .iter()
-            .filter(|candidate| !teams_chat_is_hidden(candidate))
+            .filter(|candidate| !teams_chat_is_archived(candidate, stay_archived))
             .position(|candidate| candidate.id == chat_id)
     }
+}
+
+fn teams_stay_archived_rehide_candidates(
+    chats: &[Chat],
+    stay_archived: &std::collections::HashSet<String>,
+    in_flight: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    chats
+        .iter()
+        .filter(|chat| {
+            stay_archived.contains(&chat.id)
+                && !teams_chat_is_hidden(chat)
+                && !in_flight.contains(&chat.id)
+        })
+        .map(|chat| chat.id.clone())
+        .collect()
 }
 
 struct TeamsHotChatState {
@@ -1190,6 +1244,8 @@ const POLL_BACKOFF_MAX_SECONDS: u64 = 5 * 60;
 pub const NTFY_SNOOZE_HOURS: &[u64] = &[1, 2, 4, 8, 12, 24];
 const NTFY_SNOOZE_STATE_FILE: &str = "ntfy-snooze";
 const UI_STATE_FILE: &str = "ui-state";
+const STAY_ARCHIVED_STATE_FILE: &str = "stay-archived.json";
+const STAY_ARCHIVED_STATE_VERSION: u64 = 1;
 const CALENDAR_MONTH_MIN_WIDTH: u16 = 68;
 const CALENDAR_MONTH_MIN_HEIGHT: u16 = 23;
 const MAX_MAIL_IMAGE_HEIGHT: u32 = 1200;
@@ -1514,6 +1570,9 @@ fn load_ui_state(cache_dir: Option<&std::path::Path>) -> UiState {
                 let value = value.trim();
                 state.teams_chat_id = (!value.is_empty()).then(|| value.to_string());
             }
+            "teams_archive_expanded" => {
+                state.teams_archive_expanded = value.trim().eq_ignore_ascii_case("true");
+            }
             _ => {}
         }
     }
@@ -1527,6 +1586,7 @@ fn store_ui_state(
     calendar_days: i64,
     calendar_view: CalendarView,
     teams_chat_id: Option<&str>,
+    teams_archive_expanded: bool,
 ) -> std::io::Result<()> {
     create_private_cache_dir(cache_dir)?;
 
@@ -1539,8 +1599,9 @@ fn store_ui_state(
         CalendarView::Agenda => "agenda",
         CalendarView::Month => "month",
     };
-    let mut data =
-        format!("screen={screen}\ncalendar_days={calendar_days}\ncalendar_view={calendar_view}\n");
+    let mut data = format!(
+        "screen={screen}\ncalendar_days={calendar_days}\ncalendar_view={calendar_view}\nteams_archive_expanded={teams_archive_expanded}\n"
+    );
     if let Some(chat_id) = teams_chat_id.filter(|value| !value.is_empty()) {
         data.push_str("teams_chat_id=");
         data.push_str(chat_id);
@@ -1550,6 +1611,89 @@ fn store_ui_state(
     let temp_path = cache_dir.join(format!("{UI_STATE_FILE}.tmp-{}", std::process::id()));
 
     write_private_cache_file(&temp_path, data.as_bytes())?;
+    if final_path.exists() {
+        std::fs::remove_file(&final_path)?;
+    }
+    std::fs::rename(temp_path, final_path)
+}
+
+fn load_stay_archived(
+    cache_dir: Option<&std::path::Path>,
+) -> std::collections::HashSet<String> {
+    let Some(cache_dir) = cache_dir else {
+        return std::collections::HashSet::new();
+    };
+
+    let path = cache_dir.join(STAY_ARCHIVED_STATE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::collections::HashSet::new();
+        }
+        Err(error) => {
+            tracing::warn!(
+                "could not read Stay archived state {}: {error}",
+                path.display()
+            );
+            return std::collections::HashSet::new();
+        }
+    };
+
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                "could not parse Stay archived state {}: {error}",
+                path.display()
+            );
+            return std::collections::HashSet::new();
+        }
+    };
+
+    if value.get("version").and_then(serde_json::Value::as_u64)
+        != Some(STAY_ARCHIVED_STATE_VERSION)
+    {
+        tracing::warn!(
+            "unsupported Stay archived state version in {}",
+            path.display()
+        );
+        return std::collections::HashSet::new();
+    }
+
+    value
+        .get("chats")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|chat_id| !chat_id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn store_stay_archived(
+    cache_dir: &std::path::Path,
+    stay_archived: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    create_private_cache_dir(cache_dir)?;
+
+    let mut chats: Vec<&str> = stay_archived.iter().map(String::as_str).collect();
+    chats.sort_unstable();
+
+    let value = serde_json::json!({
+        "version": STAY_ARCHIVED_STATE_VERSION,
+        "chats": chats,
+    });
+    let bytes = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+
+    let final_path = cache_dir.join(STAY_ARCHIVED_STATE_FILE);
+    let temp_path = cache_dir.join(format!(
+        "{STAY_ARCHIVED_STATE_FILE}.tmp-{}",
+        std::process::id()
+    ));
+
+    write_private_cache_file(&temp_path, &bytes)?;
     if final_path.exists() {
         std::fs::remove_file(&final_path)?;
     }
@@ -2137,6 +2281,7 @@ fn calendar_event_intersects_month(event: &CalEvent, month_offset: i32) -> bool 
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
         let mut ui_state = load_ui_state(session.config.teams_image_cache_dir.as_deref());
+        let stay_archived = load_stay_archived(session.config.teams_image_cache_dir.as_deref());
         let month_view_fallback =
             ui_state.calendar_view == CalendarView::Month && !calendar_month_view_available();
         if month_view_fallback {
@@ -2183,6 +2328,8 @@ impl App {
             focus: TeamsFocus::List,
             preview_chat_id,
             last_chat_id,
+            archive_expanded: ui_state.teams_archive_expanded,
+            stay_archived,
             ..TeamsState::default()
         };
 
@@ -2311,11 +2458,27 @@ impl App {
             self.calendar.days,
             self.calendar.view,
             self.teams.last_chat_id.as_deref(),
+            self.teams.archive_expanded,
         ) {
             tracing::warn!(
                 "could not persist UI state in {}: {error}",
                 cache_dir.display()
             );
+        }
+    }
+
+    fn persist_stay_archived(&self) -> Option<String> {
+        let cache_dir = self.session.config.teams_image_cache_dir.as_deref()?;
+
+        match store_stay_archived(cache_dir, &self.teams.stay_archived) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(
+                    "could not persist Stay archived state in {}: {error}",
+                    cache_dir.display()
+                );
+                Some(error.to_string())
+            }
         }
     }
 
@@ -4299,20 +4462,37 @@ impl App {
     }
 
     pub fn teams_archive_count(&self) -> usize {
-        teams_archived_chat_count(&self.teams.chats)
+        teams_archived_chat_count(&self.teams.chats, &self.teams.stay_archived)
     }
 
     pub fn teams_archive_row(&self) -> usize {
-        teams_active_chat_count(&self.teams.chats)
+        teams_active_chat_count(&self.teams.chats, &self.teams.stay_archived)
     }
 
     pub fn teams_chat_row_count(&self) -> usize {
-        teams_chat_row_count(&self.teams.chats, self.teams.archive_expanded)
+        teams_chat_row_count(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            self.teams.archive_expanded,
+        )
     }
 
     pub fn teams_chat_at_row(&self, row: usize) -> Option<&Chat> {
-        teams_chat_index_for_row(&self.teams.chats, self.teams.archive_expanded, row)
-            .and_then(|index| self.teams.chats.get(index))
+        teams_chat_index_for_row(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            self.teams.archive_expanded,
+            row,
+        )
+        .and_then(|index| self.teams.chats.get(index))
+    }
+
+    pub fn teams_chat_is_archived(&self, chat: &Chat) -> bool {
+        teams_chat_is_archived(chat, &self.teams.stay_archived)
+    }
+
+    pub fn teams_chat_is_stay_archived(&self, chat_id: &str) -> bool {
+        self.teams.stay_archived.contains(chat_id)
     }
 
     fn teams_selected_chat(&self) -> Option<&Chat> {
@@ -4320,7 +4500,12 @@ impl App {
     }
 
     fn teams_chat_row_for_id(&self, chat_id: &str) -> Option<usize> {
-        teams_chat_row_for_id(&self.teams.chats, self.teams.archive_expanded, chat_id)
+        teams_chat_row_for_id(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            self.teams.archive_expanded,
+            chat_id,
+        )
     }
 
     fn selected_chat_tenant_id(&self, chat: &Chat) -> Option<String> {
@@ -4353,7 +4538,13 @@ impl App {
         };
 
         let chat_id = chat.id.clone();
-        let hidden = !teams_chat_is_hidden(chat);
+        let server_hidden = teams_chat_is_hidden(chat);
+        if server_hidden && self.teams.stay_archived.contains(&chat_id) {
+            self.status =
+                "Stay archived is enabled; press X to disable it before restoring".into();
+            return;
+        }
+        let hidden = !server_hidden;
         let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
             self.status = "still loading your profile".into();
             return;
@@ -4374,6 +4565,119 @@ impl App {
             chats::set_hidden(&s.graph, &chat_id, &user_id, &tenant_id, hidden).await?;
             Ok(AppMessage::ChatVisibilityChanged { chat_id, hidden })
         });
+    }
+
+    fn toggle_selected_teams_chat_stay_archived(&mut self) {
+        let Some(chat) = self.teams_selected_chat() else {
+            self.status = "Archive is a drawer; select an archived chat first".into();
+            return;
+        };
+
+        let chat_id = chat.id.clone();
+        let server_hidden = teams_chat_is_hidden(chat);
+        let was_enabled = self.teams.stay_archived.contains(&chat_id);
+
+        if !was_enabled && !server_hidden {
+            self.status = "archive the chat with x before enabling Stay archived".into();
+            return;
+        }
+
+        let previous_row = self.teams.chat_sel;
+        let enabled = if was_enabled {
+            self.teams.stay_archived.remove(&chat_id);
+            false
+        } else {
+            self.teams.stay_archived.insert(chat_id.clone());
+            self.teams.archive_expanded = true;
+            true
+        };
+
+        let persistence_error = self.persist_stay_archived();
+        self.teams.chat_sel = self
+            .teams_chat_row_for_id(&chat_id)
+            .unwrap_or(previous_row.min(self.teams_chat_row_count().saturating_sub(1)));
+
+        let persistent = self.session.config.teams_image_cache_dir.is_some();
+        self.status = if enabled {
+            if persistent {
+                "Stay archived enabled".into()
+            } else {
+                "Stay archived enabled for this run".into()
+            }
+        } else if server_hidden {
+            "Stay archived disabled; chat remains archived until restored with x".into()
+        } else {
+            "Stay archived disabled".into()
+        };
+
+        if let Some(error) = persistence_error {
+            self.status = format!("{}; persistence failed: {error}", self.status);
+        }
+
+        if self.screen == Screen::Teams
+            && self.teams.mode == TeamsMode::Chats
+            && self.teams.focus == TeamsFocus::List
+        {
+            self.preview_selected_teams_chat();
+        }
+    }
+
+    fn rehide_stay_archived_chats(&mut self) {
+        let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            return;
+        };
+
+        let candidates = teams_stay_archived_rehide_candidates(
+            &self.teams.chats,
+            &self.teams.stay_archived,
+            &self.teams.stay_archived_rehide_in_flight,
+        );
+
+        let jobs: Vec<(String, String)> = candidates
+            .into_iter()
+            .filter_map(|chat_id| {
+                let chat = self.teams.chats.iter().find(|chat| chat.id == chat_id)?;
+                self.selected_chat_tenant_id(chat)
+                    .map(|tenant_id| (chat_id, tenant_id))
+            })
+            .collect();
+
+        for (chat_id, tenant_id) in jobs {
+            if !self
+                .teams
+                .stay_archived_rehide_in_flight
+                .insert(chat_id.clone())
+            {
+                continue;
+            }
+
+            let s = self.session.clone();
+            let tx = self.tx.clone();
+            let limiter = self.teams_background_limiter.clone();
+            let task_chat_id = chat_id.clone();
+            let task_user_id = user_id.clone();
+
+            tokio::spawn(async move {
+                let permit = limiter.acquire(&s.graph, &task_chat_id).await;
+                let result = chats::set_hidden(
+                    &s.graph,
+                    &task_chat_id,
+                    &task_user_id,
+                    &tenant_id,
+                    true,
+                )
+                .await;
+                drop(permit);
+
+                let error = result.err().map(|error| format!("{error:#}"));
+                let _ = tx
+                    .send(AppMessage::StayArchivedRehideFinished {
+                        chat_id: task_chat_id,
+                        error,
+                    })
+                    .await;
+            });
+        }
     }
 
     fn preview_selected_teams_chat(&mut self) {
@@ -5213,18 +5517,6 @@ impl App {
                     .or_else(|| self.teams.open_chat_id.clone())
                     .or(selected_chat_id);
 
-                if let Some(id) = visible_id.as_deref() {
-                    if self
-                        .teams
-                        .chats
-                        .iter()
-                        .find(|chat| chat.id == id)
-                        .is_some_and(teams_chat_is_hidden)
-                    {
-                        self.teams.archive_expanded = true;
-                    }
-                }
-
                 self.teams.chat_sel = visible_id
                     .as_deref()
                     .and_then(|id| self.teams_chat_row_for_id(id))
@@ -5239,6 +5531,12 @@ impl App {
                 {
                     self.preview_selected_teams_chat();
                 }
+
+                // Teams automatically unhides a hidden chat when a new message
+                // arrives. Keep the local Archive view stable, process all
+                // normal chat state first, then restore the server hide state
+                // as low-priority maintenance work.
+                self.rehide_stay_archived_chats();
             }
             AppMessage::ChatVisibilityChanged { chat_id, hidden } => {
                 let previous_row = self.teams.chat_sel;
@@ -5266,6 +5564,27 @@ impl App {
                 }
 
                 self.load_chats();
+            }
+            AppMessage::StayArchivedRehideFinished { chat_id, error } => {
+                self.teams
+                    .stay_archived_rehide_in_flight
+                    .remove(&chat_id);
+
+                if let Some(error) = error {
+                    tracing::warn!(
+                        "Stay archived re-hide failed for {chat_id}: {error}"
+                    );
+                    self.status = "Stay archived re-hide failed; will retry".into();
+                } else {
+                    if let Some(chat) =
+                        self.teams.chats.iter_mut().find(|chat| chat.id == chat_id)
+                    {
+                        chat.viewpoint
+                            .get_or_insert_with(Default::default)
+                            .is_hidden = Some(true);
+                    }
+                    tracing::debug!("Stay archived re-hide completed for {chat_id}");
+                }
             }
             AppMessage::ContactProfileLoaded {
                 chat_id,
@@ -7613,6 +7932,11 @@ impl App {
             {
                 self.toggle_selected_teams_chat_hidden();
             }
+            KeyCode::Char('X')
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
+            {
+                self.toggle_selected_teams_chat_stay_archived();
+            }
             KeyCode::Char('g')
                 if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
             {
@@ -7705,6 +8029,7 @@ impl App {
                     } else {
                         "Archive closed".into()
                     };
+                    self.persist_ui_state();
                 } else if let Some(c) = self.teams_selected_chat() {
                     self.open_teams_chat(c.id.clone());
                 }
@@ -8873,36 +9198,171 @@ mod tests {
             chat("active-b", false),
             chat("hidden-b", true),
         ];
+        let stay_archived = std::collections::HashSet::new();
 
-        assert_eq!(super::teams_active_chat_count(&chats), 2);
-        assert_eq!(super::teams_archived_chat_count(&chats), 2);
-        assert_eq!(super::teams_chat_row_count(&chats, false), 3);
-        assert_eq!(super::teams_chat_index_for_row(&chats, false, 0), Some(0));
-        assert_eq!(super::teams_chat_index_for_row(&chats, false, 1), Some(2));
+        assert_eq!(super::teams_active_chat_count(&chats, &stay_archived), 2);
         assert_eq!(
-            super::teams_chat_index_for_row(&chats, false, 2),
+            super::teams_archived_chat_count(&chats, &stay_archived),
+            2
+        );
+        assert_eq!(
+            super::teams_chat_row_count(&chats, &stay_archived, false),
+            3
+        );
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, &stay_archived, false, 0),
+            Some(0)
+        );
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, &stay_archived, false, 1),
+            Some(2)
+        );
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, &stay_archived, false, 2),
             None,
             "drawer row is not a chat"
         );
 
-        assert_eq!(super::teams_chat_row_count(&chats, true), 5);
         assert_eq!(
-            super::teams_chat_index_for_row(&chats, true, 2),
+            super::teams_chat_row_count(&chats, &stay_archived, true),
+            5
+        );
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, &stay_archived, true, 2),
             None,
             "drawer remains between active and archived rows"
         );
-        assert_eq!(super::teams_chat_index_for_row(&chats, true, 3), Some(1));
-        assert_eq!(super::teams_chat_index_for_row(&chats, true, 4), Some(3));
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, &stay_archived, true, 3),
+            Some(1)
+        );
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, &stay_archived, true, 4),
+            Some(3)
+        );
 
         assert_eq!(
-            super::teams_chat_row_for_id(&chats, true, "hidden-a"),
+            super::teams_chat_row_for_id(&chats, &stay_archived, true, "hidden-a"),
             Some(3)
         );
         assert_eq!(
-            super::teams_chat_row_for_id(&chats, false, "hidden-a"),
+            super::teams_chat_row_for_id(&chats, &stay_archived, false, "hidden-a"),
             None,
             "hidden chat has no visible row while drawer is closed"
         );
+    }
+
+    #[test]
+    fn stay_archived_keeps_server_visible_chat_in_archive_rows() {
+        let chat = |id: &str, hidden: bool| -> m365_core::models::Chat {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "chatType": "group",
+                "viewpoint": { "isHidden": hidden }
+            }))
+            .unwrap()
+        };
+
+        let chats = vec![
+            chat("active", false),
+            chat("stay", false),
+            chat("hidden", true),
+        ];
+        let stay_archived =
+            std::collections::HashSet::from(["stay".to_string()]);
+
+        assert_eq!(super::teams_active_chat_count(&chats, &stay_archived), 1);
+        assert_eq!(
+            super::teams_archived_chat_count(&chats, &stay_archived),
+            2
+        );
+        assert_eq!(
+            super::teams_chat_row_for_id(&chats, &stay_archived, true, "stay"),
+            Some(2)
+        );
+
+        let in_flight = std::collections::HashSet::new();
+        assert_eq!(
+            super::teams_stay_archived_rehide_candidates(
+                &chats,
+                &stay_archived,
+                &in_flight
+            ),
+            vec!["stay".to_string()]
+        );
+
+        let in_flight =
+            std::collections::HashSet::from(["stay".to_string()]);
+        assert!(
+            super::teams_stay_archived_rehide_candidates(
+                &chats,
+                &stay_archived,
+                &in_flight
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stay_archived_state_round_trips() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "m365-tui-stay-archived-{}-{nonce}",
+            std::process::id()
+        ));
+
+        let expected = std::collections::HashSet::from([
+            "19:first@thread.v2".to_string(),
+            "19:second@thread.v2".to_string(),
+        ]);
+
+        super::store_stay_archived(&dir, &expected).unwrap();
+        assert_eq!(super::load_stay_archived(Some(&dir)), expected);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ui_state_round_trips_archive_drawer_state() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "m365-tui-ui-state-archive-{}-{nonce}",
+            std::process::id()
+        ));
+
+        super::store_ui_state(
+            &dir,
+            super::Screen::Teams,
+            super::DEFAULT_CALENDAR_DAYS,
+            super::CalendarView::Agenda,
+            Some("19:test@thread.v2"),
+            true,
+        )
+        .unwrap();
+
+        let state = super::load_ui_state(Some(&dir));
+        assert!(state.teams_archive_expanded);
+
+        super::store_ui_state(
+            &dir,
+            super::Screen::Teams,
+            super::DEFAULT_CALENDAR_DAYS,
+            super::CalendarView::Agenda,
+            Some("19:test@thread.v2"),
+            false,
+        )
+        .unwrap();
+
+        let state = super::load_ui_state(Some(&dir));
+        assert!(!state.teams_archive_expanded);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

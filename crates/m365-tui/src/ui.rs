@@ -10,7 +10,7 @@ use ratatui_image::{Resize, StatefulImage};
 use m365_core::models::SystemEventClass;
 
 use crate::app::{
-    filter_commands, teams_chat_is_hidden, App, CalendarView, ChatPollTier, Compose,
+    filter_commands, App, CalendarView, ChatPollTier, Compose,
     OutlookFocus, Overlay, Screen, TeamsFocus, TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS,
     POLL_STALE_SECONDS,
 };
@@ -295,7 +295,7 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · Enter open/drawer · x archive/restore · g profile · t chats/channels",
+            TeamsFocus::List => "j/k move · Enter open/drawer · x archive/restore · X stay · g profile · t chats/channels",
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
@@ -1524,7 +1524,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                 .teams
                 .chats
                 .iter()
-                .filter(|chat| !teams_chat_is_hidden(chat))
+                .filter(|chat| !app.teams_chat_is_archived(chat))
                 .map(Some)
                 .collect();
             chat_rows.push(None);
@@ -1533,7 +1533,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     app.teams
                         .chats
                         .iter()
-                        .filter(|chat| teams_chat_is_hidden(chat))
+                        .filter(|chat| app.teams_chat_is_archived(chat))
                         .map(Some),
                 );
             }
@@ -1573,7 +1573,13 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                         ]));
                     };
 
-                    let marker = if selected { "▏" } else { " " };
+                    let marker = if app.teams_chat_is_stay_archived(&c.id) {
+                        "S"
+                    } else if selected {
+                        "▏"
+                    } else {
+                        " "
+                    };
                     let tier_style = if selected {
                         selection_style
                     } else {
@@ -1588,15 +1594,12 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                             ChatPollTier::Normal => Style::default(),
                         }
                     };
-                    let mut label = app
+                    let label = app
                         .teams
                         .contact_names
                         .get(&c.id)
                         .cloned()
                         .unwrap_or_else(|| c.label(me_id));
-                    if teams_chat_is_hidden(c) {
-                        label = format!("  {label}");
-                    }
                     let one_on_one = c
                         .chat_type
                         .as_deref()
@@ -1644,7 +1647,10 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     }
 
                     let presence = user_id.and_then(|id| app.teams.contact_presences.get(id));
-                    let (symbol, color) = contact_presence_marker(presence);
+                    let (symbol, color) = match presence {
+                        Some(presence) => contact_presence_marker(Some(presence)),
+                        None => ("×", Color::DarkGray),
+                    };
                     let prefix_width = 2usize;
                     let label_width = inner_width.saturating_sub(prefix_width + suffix_width);
                     let label = truncate(&label, label_width);
@@ -2283,7 +2289,8 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
           f forward · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
- Teams:   t chats/channels · g profile on chat · g newest in messages · e react\n\
+ Teams:   t chats/channels · x archive/restore · X toggle Stay archived\n\
+          g profile on chat · g newest in messages · e react\n\
           a/i type message · r reply to selected · Enter send\n\
  \n\
  Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\

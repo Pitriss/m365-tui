@@ -483,6 +483,23 @@ event types are not silently discarded.
 System-event rows are selectable for reading but cannot be replied to or reacted
 to.
 
+#### Archive and Stay archived
+
+In the Teams chat list, `x` uses the server-side Teams hide/unhide state. Hidden
+chats live below the `Archive` drawer and can be restored with `x`.
+
+Teams normally unhides a hidden chat when a new message arrives. On an archived
+chat, `X` (Shift+x) toggles **Stay archived**. A Stay archived chat remains in the
+local Archive drawer while the new message is still processed normally: unread
+state, notifications, conversation cache, and HOT/WARM/COOL activity all update.
+After that processing completes, m365-tui queues a low-priority `hideForUser`
+request to restore the server-side hidden state.
+
+When persistent Teams storage is not configured, Stay archived is intentionally
+memory-only and lasts until m365-tui exits. When persistent storage is enabled,
+the selected chat ids are stored in `stay-archived.json` under the configured
+Teams cache root.
+
 #### Adaptive chat polling
 
 The normal application poll runs every 20 seconds, but recently active Teams
@@ -766,12 +783,14 @@ The directory is now the common root for:
 - Teams image cache
 - cached chat conversations
 - persistent UI state
+- Stay archived chat ids
 
 Without this variable:
 
 - Teams images are cached only in RAM,
 - persistent chat conversation cache is disabled,
-- persistent UI state is disabled.
+- persistent UI state is disabled,
+- Stay archived still works, but only for the current process.
 
 On Unix, cache directories and files are created with restrictive permissions.
 
