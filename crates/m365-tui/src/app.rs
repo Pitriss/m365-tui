@@ -56,6 +56,10 @@ pub enum AppMessage {
     Calendar(Vec<CalEvent>),
     CalendarReminders(Vec<CalEvent>),
     Chats(Vec<Chat>),
+    ChatVisibilityChanged {
+        chat_id: String,
+        hidden: bool,
+    },
     ContactPresences(Vec<Presence>),
     ContactProfileLoaded {
         chat_id: String,
@@ -575,7 +579,10 @@ pub struct TeamsImageKey {
 pub struct TeamsState {
     pub mode: TeamsMode,
     pub chats: Vec<Chat>,
+    /// Selection in the virtual chat list:
+    /// active chats, one Archive drawer row, then archived chats when expanded.
     pub chat_sel: usize,
+    pub archive_expanded: bool,
     /// Presence by directory user id for one-to-one chat contacts.
     pub contact_presences: std::collections::HashMap<String, Presence>,
     /// Last known display name by one-to-one chat id. Federated chat member
@@ -636,6 +643,7 @@ impl Default for TeamsState {
             mode: TeamsMode::Chats,
             chats: Vec::new(),
             chat_sel: 0,
+            archive_expanded: false,
             contact_presences: std::collections::HashMap::new(),
             contact_names: std::collections::HashMap::new(),
             contact_user_ids: std::collections::HashMap::new(),
@@ -667,6 +675,82 @@ impl Default for TeamsState {
             composer: TextInput::new(),
             focus: TeamsFocus::List,
         }
+    }
+}
+
+pub fn teams_chat_is_hidden(chat: &Chat) -> bool {
+    chat.viewpoint
+        .as_ref()
+        .and_then(|viewpoint| viewpoint.is_hidden)
+        .unwrap_or(false)
+}
+
+fn teams_active_chat_count(chats: &[Chat]) -> usize {
+    chats.iter().filter(|chat| !teams_chat_is_hidden(chat)).count()
+}
+
+fn teams_archived_chat_count(chats: &[Chat]) -> usize {
+    chats.iter().filter(|chat| teams_chat_is_hidden(chat)).count()
+}
+
+fn teams_chat_row_count(chats: &[Chat], archive_expanded: bool) -> usize {
+    teams_active_chat_count(chats)
+        + 1
+        + if archive_expanded {
+            teams_archived_chat_count(chats)
+        } else {
+            0
+        }
+}
+
+fn teams_chat_index_for_row(
+    chats: &[Chat],
+    archive_expanded: bool,
+    row: usize,
+) -> Option<usize> {
+    let active_count = teams_active_chat_count(chats);
+
+    if row < active_count {
+        return chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| !teams_chat_is_hidden(chat))
+            .nth(row)
+            .map(|(index, _)| index);
+    }
+
+    if row == active_count || !archive_expanded {
+        return None;
+    }
+
+    chats
+        .iter()
+        .enumerate()
+        .filter(|(_, chat)| teams_chat_is_hidden(chat))
+        .nth(row.saturating_sub(active_count + 1))
+        .map(|(index, _)| index)
+}
+
+fn teams_chat_row_for_id(
+    chats: &[Chat],
+    archive_expanded: bool,
+    chat_id: &str,
+) -> Option<usize> {
+    let chat = chats.iter().find(|chat| chat.id == chat_id)?;
+    if teams_chat_is_hidden(chat) {
+        if !archive_expanded {
+            return None;
+        }
+        let hidden_position = chats
+            .iter()
+            .filter(|candidate| teams_chat_is_hidden(candidate))
+            .position(|candidate| candidate.id == chat_id)?;
+        Some(teams_active_chat_count(chats) + 1 + hidden_position)
+    } else {
+        chats
+            .iter()
+            .filter(|candidate| !teams_chat_is_hidden(candidate))
+            .position(|candidate| candidate.id == chat_id)
     }
 }
 
@@ -2364,7 +2448,7 @@ impl App {
             return;
         }
 
-        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+        let Some(chat) = self.teams_selected_chat() else {
             self.status = "select a Teams contact first".into();
             return;
         };
@@ -3359,9 +3443,7 @@ impl App {
             return;
         };
 
-        let selected_id = chats_list
-            .get(self.teams.chat_sel)
-            .map(|chat| chat.id.clone());
+        let selected_id = self.teams_selected_chat().map(|chat| chat.id.clone());
         let last_chat_id = self.teams.last_chat_id.clone();
 
         let mut ordered: Vec<(String, Option<String>)> = Vec::new();
@@ -3543,16 +3625,11 @@ impl App {
     }
 
     fn remember_contact_from_chat(&mut self, chat: &Chat) -> bool {
-        if !chat
-            .chat_type
-            .as_deref()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
-        {
-            return false;
-        }
-
         let me_id = self.me.as_ref().map(|me| me.id.as_str());
 
+        // The hideForUser/unhideForUser actions need our tenant id for every
+        // chat type, so learn it before restricting the contact-specific work
+        // below to one-to-one chats.
         if self.teams.own_tenant_id.is_none() {
             let configured = self.configured_tenant_id().map(str::to_string);
             let from_member = me_id.and_then(|id| {
@@ -3568,6 +3645,14 @@ impl App {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
             self.teams.own_tenant_id = configured.or(from_member).or(from_chat);
+        }
+
+        if !chat
+            .chat_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+        {
+            return false;
         }
 
         let peer_member = chat.members.iter().find(|member| {
@@ -3751,7 +3836,7 @@ impl App {
             return;
         }
 
-        let Some(chat) = self.teams.chats.get(self.teams.chat_sel) else {
+        let Some(chat) = self.teams_selected_chat() else {
             self.status = "select a Teams contact first".into();
             return;
         };
@@ -4213,18 +4298,94 @@ impl App {
         });
     }
 
+    pub fn teams_archive_count(&self) -> usize {
+        teams_archived_chat_count(&self.teams.chats)
+    }
+
+    pub fn teams_archive_row(&self) -> usize {
+        teams_active_chat_count(&self.teams.chats)
+    }
+
+    pub fn teams_chat_row_count(&self) -> usize {
+        teams_chat_row_count(&self.teams.chats, self.teams.archive_expanded)
+    }
+
+    pub fn teams_chat_at_row(&self, row: usize) -> Option<&Chat> {
+        teams_chat_index_for_row(&self.teams.chats, self.teams.archive_expanded, row)
+            .and_then(|index| self.teams.chats.get(index))
+    }
+
+    fn teams_selected_chat(&self) -> Option<&Chat> {
+        self.teams_chat_at_row(self.teams.chat_sel)
+    }
+
+    fn teams_chat_row_for_id(&self, chat_id: &str) -> Option<usize> {
+        teams_chat_row_for_id(&self.teams.chats, self.teams.archive_expanded, chat_id)
+    }
+
+    fn selected_chat_tenant_id(&self, chat: &Chat) -> Option<String> {
+        let me_id = self.me.as_ref().map(|me| me.id.as_str());
+
+        self.configured_tenant_id()
+            .map(str::to_string)
+            .or_else(|| {
+                me_id.and_then(|id| {
+                    chat.members
+                        .iter()
+                        .find(|member| member.user_id.as_deref() == Some(id))
+                        .and_then(|member| member.tenant_id.clone())
+                })
+            })
+            .or_else(|| self.teams.own_tenant_id.clone())
+            .or_else(|| {
+                chat.tenant_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+    }
+
+    fn toggle_selected_teams_chat_hidden(&mut self) {
+        let Some(chat) = self.teams_selected_chat() else {
+            self.status = "Archive is a drawer; select a chat to archive or restore".into();
+            return;
+        };
+
+        let chat_id = chat.id.clone();
+        let hidden = !teams_chat_is_hidden(chat);
+        let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            self.status = "still loading your profile".into();
+            return;
+        };
+        let Some(tenant_id) = self.selected_chat_tenant_id(chat) else {
+            self.status = "could not determine tenant id for Teams archive action".into();
+            return;
+        };
+
+        self.status = if hidden {
+            "archiving Teams chat…".into()
+        } else {
+            "restoring Teams chat…".into()
+        };
+
+        let s = self.session.clone();
+        self.spawn(async move {
+            chats::set_hidden(&s.graph, &chat_id, &user_id, &tenant_id, hidden).await?;
+            Ok(AppMessage::ChatVisibilityChanged { chat_id, hidden })
+        });
+    }
+
     fn preview_selected_teams_chat(&mut self) {
         if self.teams.mode != TeamsMode::Chats || self.teams.focus != TeamsFocus::List {
             return;
         }
 
-        let Some(chat_id) = self
-            .teams
-            .chats
-            .get(self.teams.chat_sel)
-            .map(|chat| chat.id.clone())
-        else {
+        let Some(chat_id) = self.teams_selected_chat().map(|chat| chat.id.clone()) else {
             self.teams.preview_chat_id = None;
+            self.teams.open_chat_id = None;
+            self.teams.open_channel = None;
+            self.teams.chat_open_pending_read = None;
             self.clear_teams_conversation_view();
             return;
         };
@@ -5010,6 +5171,10 @@ impl App {
                 }
             }
             AppMessage::Chats(c) => {
+                let selected_chat_id = self.teams_selected_chat().map(|chat| chat.id.clone());
+                let archive_selected = !self.teams.chats.is_empty()
+                    && self.teams.chat_sel == self.teams_archive_row();
+
                 self.sync_teams_hot_activity_from_chats(&c);
                 self.notify_for_chats(&c);
                 self.remember_contacts_from_chats(&c);
@@ -5021,12 +5186,6 @@ impl App {
                     .open_chat_id
                     .as_deref()
                     .and_then(|open_id| c.iter().position(|chat| chat.id == open_id));
-                let visible_index = self
-                    .teams
-                    .preview_chat_id
-                    .as_deref()
-                    .and_then(|preview_id| c.iter().position(|chat| chat.id == preview_id))
-                    .or(open_index);
 
                 if self.screen == Screen::Teams && self.teams.focus == TeamsFocus::Messages {
                     if let Some(index) = open_index {
@@ -5046,9 +5205,32 @@ impl App {
 
                 self.refresh_chat_unread_counts(&c);
                 self.teams.chats = c;
-                self.teams.chat_sel = visible_index
+
+                let visible_id = self
+                    .teams
+                    .preview_chat_id
+                    .clone()
+                    .or_else(|| self.teams.open_chat_id.clone())
+                    .or(selected_chat_id);
+
+                if let Some(id) = visible_id.as_deref() {
+                    if self
+                        .teams
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == id)
+                        .is_some_and(teams_chat_is_hidden)
+                    {
+                        self.teams.archive_expanded = true;
+                    }
+                }
+
+                self.teams.chat_sel = visible_id
+                    .as_deref()
+                    .and_then(|id| self.teams_chat_row_for_id(id))
+                    .or_else(|| archive_selected.then(|| self.teams_archive_row()))
                     .unwrap_or(self.teams.chat_sel)
-                    .min(self.teams.chats.len().saturating_sub(1));
+                    .min(self.teams_chat_row_count().saturating_sub(1));
 
                 if self.screen == Screen::Teams
                     && self.teams.mode == TeamsMode::Chats
@@ -5057,6 +5239,33 @@ impl App {
                 {
                     self.preview_selected_teams_chat();
                 }
+            }
+            AppMessage::ChatVisibilityChanged { chat_id, hidden } => {
+                let previous_row = self.teams.chat_sel;
+                if let Some(chat) = self.teams.chats.iter_mut().find(|chat| chat.id == chat_id) {
+                    chat.viewpoint
+                        .get_or_insert_with(Default::default)
+                        .is_hidden = Some(hidden);
+                }
+
+                self.status = if hidden {
+                    "Teams chat archived".into()
+                } else {
+                    "Teams chat restored".into()
+                };
+
+                self.teams.chat_sel = self
+                    .teams_chat_row_for_id(&chat_id)
+                    .unwrap_or(previous_row.min(self.teams_chat_row_count().saturating_sub(1)));
+
+                if self.screen == Screen::Teams
+                    && self.teams.mode == TeamsMode::Chats
+                    && self.teams.focus == TeamsFocus::List
+                {
+                    self.preview_selected_teams_chat();
+                }
+
+                self.load_chats();
             }
             AppMessage::ContactProfileLoaded {
                 chat_id,
@@ -7316,6 +7525,10 @@ impl App {
             }
             KeyCode::Tab => {
                 if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+                    if self.teams_selected_chat().is_none() {
+                        self.status = "open Archive with Enter, or select a chat first".into();
+                        return;
+                    }
                     if let Some(chat_id) = self.teams.preview_chat_id.clone() {
                         self.open_teams_chat(chat_id);
                         return;
@@ -7355,6 +7568,10 @@ impl App {
             }
             KeyCode::Char('i') | KeyCode::Char('a') => {
                 if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+                    if self.teams_selected_chat().is_none() {
+                        self.status = "open Archive with Enter, or select a chat first".into();
+                        return;
+                    }
                     if let Some(chat_id) = self.teams.preview_chat_id.clone() {
                         self.open_teams_chat(chat_id);
                     }
@@ -7390,6 +7607,11 @@ impl App {
                 } else {
                     self.overlay = Some(Overlay::React);
                 }
+            }
+            KeyCode::Char('x')
+                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
+            {
+                self.toggle_selected_teams_chat_hidden();
             }
             KeyCode::Char('g')
                 if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
@@ -7453,7 +7675,8 @@ impl App {
         }
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
-                self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams.chats.len());
+                self.teams.chat_sel =
+                    step(self.teams.chat_sel, delta, self.teams_chat_row_count());
                 self.preview_selected_teams_chat();
             }
             (TeamsMode::Channels, TeamsFocus::List) => {
@@ -7472,7 +7695,17 @@ impl App {
     fn teams_enter(&mut self) {
         match self.teams.mode {
             TeamsMode::Chats => {
-                if let Some(c) = self.teams.chats.get(self.teams.chat_sel) {
+                if self.teams.chat_sel == self.teams_archive_row() {
+                    self.teams.archive_expanded = !self.teams.archive_expanded;
+                    self.teams.preview_chat_id = None;
+                    self.teams.open_chat_id = None;
+                    self.clear_teams_conversation_view();
+                    self.status = if self.teams.archive_expanded {
+                        format!("Archive opened ({} chat(s))", self.teams_archive_count())
+                    } else {
+                        "Archive closed".into()
+                    };
+                } else if let Some(c) = self.teams_selected_chat() {
                     self.open_teams_chat(c.id.clone());
                 }
             }
@@ -8621,6 +8854,55 @@ mod tests {
         let sample = "Name:\tm365\nVmPeak:\t  123456 kB\nVmRSS:\t   24680 kB\nThreads:\t9\n";
         assert_eq!(parse_vmrss(sample), Some(24680));
         assert_eq!(parse_vmrss("no such field"), None);
+    }
+
+    #[test]
+    fn teams_archive_drawer_rows_map_active_and_hidden_chats() {
+        let chat = |id: &str, hidden: bool| -> m365_core::models::Chat {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "chatType": "group",
+                "viewpoint": { "isHidden": hidden }
+            }))
+            .unwrap()
+        };
+
+        let chats = vec![
+            chat("active-a", false),
+            chat("hidden-a", true),
+            chat("active-b", false),
+            chat("hidden-b", true),
+        ];
+
+        assert_eq!(super::teams_active_chat_count(&chats), 2);
+        assert_eq!(super::teams_archived_chat_count(&chats), 2);
+        assert_eq!(super::teams_chat_row_count(&chats, false), 3);
+        assert_eq!(super::teams_chat_index_for_row(&chats, false, 0), Some(0));
+        assert_eq!(super::teams_chat_index_for_row(&chats, false, 1), Some(2));
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, false, 2),
+            None,
+            "drawer row is not a chat"
+        );
+
+        assert_eq!(super::teams_chat_row_count(&chats, true), 5);
+        assert_eq!(
+            super::teams_chat_index_for_row(&chats, true, 2),
+            None,
+            "drawer remains between active and archived rows"
+        );
+        assert_eq!(super::teams_chat_index_for_row(&chats, true, 3), Some(1));
+        assert_eq!(super::teams_chat_index_for_row(&chats, true, 4), Some(3));
+
+        assert_eq!(
+            super::teams_chat_row_for_id(&chats, true, "hidden-a"),
+            Some(3)
+        );
+        assert_eq!(
+            super::teams_chat_row_for_id(&chats, false, "hidden-a"),
+            None,
+            "hidden chat has no visible row while drawer is closed"
+        );
     }
 
     #[test]

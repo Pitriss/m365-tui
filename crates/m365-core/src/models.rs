@@ -209,9 +209,11 @@ pub struct Chat {
     pub viewpoint: Option<ChatViewpoint>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatViewpoint {
+    #[serde(default)]
+    pub is_hidden: Option<bool>,
     #[serde(default)]
     pub last_message_read_date_time: Option<String>,
 }

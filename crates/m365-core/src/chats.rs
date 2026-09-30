@@ -124,6 +124,36 @@ pub async fn mark_read(
         .await
 }
 
+/// Hide or unhide a chat for the signed-in user.
+///
+/// This is the server-side Teams archive state surfaced by
+/// `chat.viewpoint.isHidden` in the list-chats response.
+pub async fn set_hidden(
+    graph: &GraphClient,
+    chat_id: &str,
+    user_id: &str,
+    tenant_id: &str,
+    hidden: bool,
+) -> Result<()> {
+    let action = if hidden {
+        "hideForUser"
+    } else {
+        "unhideForUser"
+    };
+
+    graph
+        .post_action(
+            &format!("chats/{chat_id}/{action}"),
+            &json!({
+                "user": {
+                    "id": user_id,
+                    "tenantId": tenant_id
+                }
+            }),
+        )
+        .await
+}
+
 /// List messages newest-first by creation time. Used for unread counting so
 /// paging can stop as soon as the chat viewpoint is reached.
 pub async fn list_messages_created_desc(

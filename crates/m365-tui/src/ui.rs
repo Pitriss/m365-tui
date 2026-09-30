@@ -10,8 +10,9 @@ use ratatui_image::{Resize, StatefulImage};
 use m365_core::models::SystemEventClass;
 
 use crate::app::{
-    filter_commands, App, CalendarView, ChatPollTier, Compose, OutlookFocus, Overlay, Screen,
-    TeamsFocus, TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
+    filter_commands, teams_chat_is_hidden, App, CalendarView, ChatPollTier, Compose,
+    OutlookFocus, Overlay, Screen, TeamsFocus, TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS,
+    POLL_STALE_SECONDS,
 };
 use crate::diagnostics;
 
@@ -294,7 +295,7 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k preview cache · l/Enter open · g profile · t chats/channels",
+            TeamsFocus::List => "j/k move · Enter open/drawer · x archive/restore · g profile · t chats/channels",
             TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
             TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
         },
@@ -1519,12 +1520,28 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             let selected_bg = if focused { ACCENT } else { Color::Gray };
             let inner_width = cols[0].width.saturating_sub(3) as usize;
 
-            let items: Vec<ListItem> = app
+            let mut chat_rows: Vec<Option<&m365_core::models::Chat>> = app
                 .teams
                 .chats
                 .iter()
+                .filter(|chat| !teams_chat_is_hidden(chat))
+                .map(Some)
+                .collect();
+            chat_rows.push(None);
+            if app.teams.archive_expanded {
+                chat_rows.extend(
+                    app.teams
+                        .chats
+                        .iter()
+                        .filter(|chat| teams_chat_is_hidden(chat))
+                        .map(Some),
+                );
+            }
+
+            let items: Vec<ListItem> = chat_rows
+                .into_iter()
                 .enumerate()
-                .map(|(index, c)| {
+                .map(|(index, row)| {
                     let selected = index == app.teams.chat_sel;
                     let selection_style = if selected {
                         Style::default()
@@ -1534,6 +1551,28 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     } else {
                         Style::default()
                     };
+
+                    let Some(c) = row else {
+                        let marker = if selected { "▏" } else { " " };
+                        let arrow = if app.teams.archive_expanded { "▾" } else { "▸" };
+                        let label = format!("{arrow} Archive [{}]", app.teams_archive_count());
+                        let label = truncate(&label, inner_width);
+                        let padding = inner_width.saturating_sub(label.chars().count());
+                        let style = if selected {
+                            selection_style
+                        } else {
+                            Style::default()
+                                .fg(DIM)
+                                .add_modifier(Modifier::BOLD)
+                        };
+
+                        return ListItem::new(Line::from(vec![
+                            Span::styled(marker, selection_style),
+                            Span::styled(label, style),
+                            Span::styled(" ".repeat(padding), selection_style),
+                        ]));
+                    };
+
                     let marker = if selected { "▏" } else { " " };
                     let tier_style = if selected {
                         selection_style
@@ -1549,12 +1588,15 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                             ChatPollTier::Normal => Style::default(),
                         }
                     };
-                    let label = app
+                    let mut label = app
                         .teams
                         .contact_names
                         .get(&c.id)
                         .cloned()
                         .unwrap_or_else(|| c.label(me_id));
+                    if teams_chat_is_hidden(c) {
+                        label = format!("  {label}");
+                    }
                     let one_on_one = c
                         .chat_type
                         .as_deref()
@@ -1588,9 +1630,6 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     };
                     let suffix_width = suffix.chars().count();
 
-                    // Group/meeting chats have no presence. One-to-one chats keep
-                    // a fixed two-cell presence prefix even when the external
-                    // user's presence cannot be retrieved, so names never shift.
                     if !app.session.config.presence_read || !one_on_one {
                         let label_width = inner_width.saturating_sub(suffix_width);
                         let label = truncate(&label, label_width);
@@ -1612,8 +1651,6 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     let padding = inner_width
                         .saturating_sub(prefix_width + label.chars().count() + suffix_width);
                     let presence_style = if selected {
-                        // A one-cell dark badge gives the presence colour strong
-                        // contrast against the cyan/gray selected-row background.
                         let selected_color = match color {
                             Color::Red => Color::LightRed,
                             Color::Yellow => Color::LightYellow,
