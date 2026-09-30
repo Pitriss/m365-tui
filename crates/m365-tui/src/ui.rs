@@ -1433,8 +1433,18 @@ fn presence_out_of_office_message(presence: &m365_core::models::Presence) -> Opt
     )
 }
 
-fn open_chat_out_of_office(app: &App) -> Option<String> {
-    let chat_id = app.teams.open_chat_id.as_deref()?;
+fn teams_ooo_chat_id<'a>(
+    open_chat_id: Option<&'a str>,
+    preview_chat_id: Option<&'a str>,
+) -> Option<&'a str> {
+    open_chat_id.or(preview_chat_id)
+}
+
+fn visible_chat_out_of_office(app: &App) -> Option<String> {
+    let chat_id = teams_ooo_chat_id(
+        app.teams.open_chat_id.as_deref(),
+        app.teams.preview_chat_id.as_deref(),
+    )?;
     let chat = app.teams.chats.iter().find(|chat| chat.id == chat_id)?;
     if !chat
         .chat_type
@@ -1491,7 +1501,10 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let me_id = app.me.as_ref().map(|m| m.id.as_str());
-    let out_of_office = open_chat_out_of_office(app);
+    // Show the same OOO banner while browsing cached chat previews as after
+    // opening the conversation. Presence is already refreshed for the chat list,
+    // so this stays local and does not add a Graph request on j/k navigation.
+    let out_of_office = visible_chat_out_of_office(app);
 
     // Left list: chats or channels
     //
@@ -3110,6 +3123,19 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::{contact_presence_marker, day_label, local_time, presence_out_of_office_message};
     use ratatui::style::Color;
+
+    #[test]
+    fn teams_ooo_banner_follows_preview_selection() {
+        use super::teams_ooo_chat_id;
+
+        assert_eq!(teams_ooo_chat_id(None, Some("preview")), Some("preview"));
+        assert_eq!(
+            teams_ooo_chat_id(Some("open"), Some("preview")),
+            Some("open")
+        );
+        assert_eq!(teams_ooo_chat_id(Some("open"), None), Some("open"));
+        assert_eq!(teams_ooo_chat_id(None, None), None);
+    }
 
     #[test]
     fn contact_presence_marker_matches_teams_status_colors() {

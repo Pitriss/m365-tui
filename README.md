@@ -575,8 +575,11 @@ dark badge so the status remains visible against the selected-row background.
 
 When a one-to-one contact is currently out of office, m365-tui also shows the
 Out of Office message returned by Microsoft Graph in a one-line banner above
-the composer. The same message is available in the contact profile (`g`).
-This uses the existing presence lookup and does not require another permission.
+the composer. The banner follows the selected contact while browsing the chat
+list and remains visible after opening the conversation. The same message is
+available in the contact profile (`g`). Chat-list navigation reuses the
+already-loaded presence data, so `j`/`k` selection does not add another Graph
+request or permission.
 
 #### Set your own presence
 
