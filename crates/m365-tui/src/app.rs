@@ -2280,8 +2280,8 @@ fn calendar_event_intersects_month(event: &CalEvent, month_offset: i32) -> bool 
 
 impl App {
     pub fn new(session: Session, tx: mpsc::Sender<AppMessage>) -> Self {
-        let mut ui_state = load_ui_state(session.config.teams_image_cache_dir.as_deref());
-        let stay_archived = load_stay_archived(session.config.teams_image_cache_dir.as_deref());
+        let mut ui_state = load_ui_state(session.config.cache_dir.as_deref());
+        let stay_archived = load_stay_archived(session.config.cache_dir.as_deref());
         let month_view_fallback =
             ui_state.calendar_view == CalendarView::Month && !calendar_month_view_available();
         if month_view_fallback {
@@ -2448,7 +2448,7 @@ impl App {
     }
 
     fn persist_ui_state(&self) {
-        let Some(cache_dir) = self.session.config.teams_image_cache_dir.as_deref() else {
+        let Some(cache_dir) = self.session.config.cache_dir.as_deref() else {
             return;
         };
 
@@ -2468,7 +2468,7 @@ impl App {
     }
 
     fn persist_stay_archived(&self) -> Option<String> {
-        let cache_dir = self.session.config.teams_image_cache_dir.as_deref()?;
+        let cache_dir = self.session.config.cache_dir.as_deref()?;
 
         match store_stay_archived(cache_dir, &self.teams.stay_archived) {
             Ok(()) => None,
@@ -3602,7 +3602,7 @@ impl App {
         if self.chat_cache_warmup_started || !self.session.config.teams_cache_warmup {
             return;
         }
-        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+        let Some(cache_root) = self.session.config.cache_dir.clone() else {
             return;
         };
 
@@ -4405,7 +4405,7 @@ impl App {
     }
 
     fn restore_teams_conversation_cache(&mut self, chat_id: &str) -> bool {
-        let Some(cache_root) = self.session.config.teams_image_cache_dir.as_deref() else {
+        let Some(cache_root) = self.session.config.cache_dir.as_deref() else {
             return false;
         };
 
@@ -4429,7 +4429,7 @@ impl App {
     }
 
     fn persist_teams_conversation_cache(&self, chat_id: &str) {
-        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+        let Some(cache_root) = self.session.config.cache_dir.clone() else {
             return;
         };
         if self.teams.messages.is_empty() {
@@ -4597,7 +4597,7 @@ impl App {
             .teams_chat_row_for_id(&chat_id)
             .unwrap_or(previous_row.min(self.teams_chat_row_count().saturating_sub(1)));
 
-        let persistent = self.session.config.teams_image_cache_dir.is_some();
+        let persistent = self.session.config.cache_dir.is_some();
         self.status = if enabled {
             if persistent {
                 "Stay archived enabled".into()
@@ -4828,7 +4828,7 @@ impl App {
     /// This path must never fall through to Graph: moving through the chat list
     /// is a local-only preview and must not download hosted content or files.
     fn load_preview_teams_images_from_disk(&self, key: TeamsImageKey) {
-        let Some(cache_dir) = self.session.config.teams_image_cache_dir.clone() else {
+        let Some(cache_dir) = self.session.config.cache_dir.clone() else {
             return;
         };
 
@@ -4982,7 +4982,7 @@ impl App {
             let s = self.session.clone();
             let task_key = key.clone();
             self.spawn(async move {
-                let disk_cache_dir = s.config.teams_image_cache_dir.clone();
+                let disk_cache_dir = s.config.cache_dir.clone();
                 let disk_cache_max_bytes = s
                     .config
                     .teams_image_cache_max_mb
@@ -6254,7 +6254,7 @@ impl App {
     }
 
     fn persist_teams_page_cache(&self, chat_id: &str, messages: &[ChatMessage]) {
-        let Some(cache_root) = self.session.config.teams_image_cache_dir.clone() else {
+        let Some(cache_root) = self.session.config.cache_dir.clone() else {
             return;
         };
         if messages.is_empty() {

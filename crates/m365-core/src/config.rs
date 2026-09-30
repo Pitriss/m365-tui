@@ -154,6 +154,40 @@ impl CalendarNotify {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheDirSource {
+    None,
+    New,
+    DeprecatedOnly,
+    BothSame,
+    BothDifferent {
+        new_value: String,
+        deprecated_value: String,
+    },
+}
+
+impl CacheDirSource {
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Self::None | Self::New => None,
+            Self::DeprecatedOnly => Some(
+                "Warning: M365_TEAMS_IMAGE_CACHE_DIR is deprecated.\nPlease use M365_CACHE_DIR instead."
+                    .to_string(),
+            ),
+            Self::BothSame => Some(
+                "Warning: M365_TEAMS_IMAGE_CACHE_DIR is deprecated and duplicates M365_CACHE_DIR.\nPlease remove or comment out M365_TEAMS_IMAGE_CACHE_DIR."
+                    .to_string(),
+            ),
+            Self::BothDifferent {
+                new_value,
+                deprecated_value,
+            } => Some(format!(
+                "Warning: both M365_CACHE_DIR and deprecated M365_TEAMS_IMAGE_CACHE_DIR are set.\nUsing M365_CACHE_DIR={new_value:?}; ignoring M365_TEAMS_IMAGE_CACHE_DIR={deprecated_value:?}.\nPlease remove or comment out M365_TEAMS_IMAGE_CACHE_DIR."
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -204,9 +238,12 @@ pub struct Config {
     /// Experimental direct Entra directory profile lookup for Teams contacts.
     /// Off by default; requires delegated User.Read.All and administrator consent.
     pub directory_profile: bool,
-    /// Optional persistent cache for decoded Teams image thumbnails.
-    /// Unset keeps Teams image caching memory-only.
-    pub teams_image_cache_dir: Option<PathBuf>,
+    /// Optional common root for persistent application cache/state.
+    /// M365_CACHE_DIR wins over the deprecated M365_TEAMS_IMAGE_CACHE_DIR.
+    /// If neither is set, Teams/UI persistence remains disabled.
+    pub cache_dir: Option<PathBuf>,
+    /// Records which environment variable selected the common cache root.
+    pub cache_dir_source: CacheDirSource,
     /// Maximum persistent Teams image cache size in MiB.
     pub teams_image_cache_max_mb: u64,
     /// Automatically prefill persistent Teams conversation caches in the background.
@@ -235,11 +272,10 @@ impl Config {
         let presence_primary = env_flag("M365_PRESENCE_PRIMARY");
         let teams_file_images = env_flag("M365_TEAMS_FILE_IMAGES");
         let directory_profile = env_flag("M365_DIRECTORY_PROFILE");
-        let teams_image_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        let new_cache_dir = std::env::var("M365_CACHE_DIR").ok();
+        let deprecated_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR").ok();
+        let (cache_dir, cache_dir_source) =
+            resolve_cache_dir_values(new_cache_dir.as_deref(), deprecated_cache_dir.as_deref());
         let meeting_opener = std::env::var("M365_MEETING_OPENER")
             .ok()
             .map(|value| value.trim().to_string())
@@ -401,7 +437,8 @@ impl Config {
             presence_lock_restore,
             teams_file_images,
             directory_profile,
-            teams_image_cache_dir,
+            cache_dir,
+            cache_dir_source,
             teams_image_cache_max_mb,
             teams_cache_warmup,
             teams_hot_chats,
@@ -419,6 +456,13 @@ impl Config {
 
     pub fn scope_string(&self) -> String {
         self.scopes.join(" ")
+    }
+
+    /// Deferred cache-variable compatibility warning.
+    ///
+    /// Frontends should print this only after leaving any alternate-screen TUI.
+    pub fn cache_dir_warning(&self) -> Option<String> {
+        self.cache_dir_source.warning()
     }
 
     /// Whether the token we request can set presence.
@@ -470,6 +514,37 @@ impl Config {
         self.tunnel_base_url
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
+    }
+}
+
+fn resolve_cache_dir_values(
+    new_raw: Option<&str>,
+    deprecated_raw: Option<&str>,
+) -> (Option<PathBuf>, CacheDirSource) {
+    let new_raw = new_raw.filter(|value| !value.trim().is_empty());
+    let deprecated_raw = deprecated_raw.filter(|value| !value.trim().is_empty());
+
+    match (new_raw, deprecated_raw) {
+        (None, None) => (None, CacheDirSource::None),
+        (Some(new_value), None) => (
+            Some(PathBuf::from(new_value.trim())),
+            CacheDirSource::New,
+        ),
+        (None, Some(deprecated_value)) => (
+            Some(PathBuf::from(deprecated_value.trim())),
+            CacheDirSource::DeprecatedOnly,
+        ),
+        (Some(new_value), Some(deprecated_value)) if new_value == deprecated_value => (
+            Some(PathBuf::from(new_value.trim())),
+            CacheDirSource::BothSame,
+        ),
+        (Some(new_value), Some(deprecated_value)) => (
+            Some(PathBuf::from(new_value.trim())),
+            CacheDirSource::BothDifferent {
+                new_value: new_value.to_string(),
+                deprecated_value: deprecated_value.to_string(),
+            },
+        ),
     }
 }
 
@@ -631,7 +706,8 @@ mod tests {
             presence_lock_restore: true,
             teams_file_images: false,
             directory_profile: false,
-            teams_image_cache_dir: None,
+            cache_dir: None,
+            cache_dir_source: CacheDirSource::None,
             teams_image_cache_max_mb: 256,
             teams_cache_warmup: true,
             teams_hot_chats: TEAMS_HOT_CHATS_DEFAULT,
@@ -639,6 +715,72 @@ mod tests {
             teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn resolves_cache_dir_priority_and_legacy_fallback() {
+        assert_eq!(
+            resolve_cache_dir_values(None, None),
+            (None, CacheDirSource::None)
+        );
+        assert_eq!(
+            resolve_cache_dir_values(Some(" /new/cache "), None),
+            (Some(PathBuf::from("/new/cache")), CacheDirSource::New)
+        );
+        assert_eq!(
+            resolve_cache_dir_values(None, Some(" /legacy/cache ")),
+            (
+                Some(PathBuf::from("/legacy/cache")),
+                CacheDirSource::DeprecatedOnly
+            )
+        );
+        assert_eq!(
+            resolve_cache_dir_values(Some("/same"), Some("/same")),
+            (Some(PathBuf::from("/same")), CacheDirSource::BothSame)
+        );
+        assert_eq!(
+            resolve_cache_dir_values(Some("/new"), Some("/old")),
+            (
+                Some(PathBuf::from("/new")),
+                CacheDirSource::BothDifferent {
+                    new_value: "/new".to_string(),
+                    deprecated_value: "/old".to_string(),
+                }
+            )
+        );
+        assert_eq!(
+            resolve_cache_dir_values(Some(" /same "), Some("/same")),
+            (
+                Some(PathBuf::from("/same")),
+                CacheDirSource::BothDifferent {
+                    new_value: " /same ".to_string(),
+                    deprecated_value: "/same".to_string(),
+                }
+            ),
+            "same/different classification intentionally compares exact environment strings"
+        );
+    }
+
+    #[test]
+    fn cache_dir_warnings_cover_deprecated_configurations() {
+        assert!(CacheDirSource::None.warning().is_none());
+        assert!(CacheDirSource::New.warning().is_none());
+
+        let legacy = CacheDirSource::DeprecatedOnly.warning().unwrap();
+        assert!(legacy.contains("deprecated"));
+        assert!(legacy.contains("M365_CACHE_DIR"));
+
+        let same = CacheDirSource::BothSame.warning().unwrap();
+        assert!(same.contains("duplicates M365_CACHE_DIR"));
+
+        let different = CacheDirSource::BothDifferent {
+            new_value: "/new".to_string(),
+            deprecated_value: "/old".to_string(),
+        }
+        .warning()
+        .unwrap();
+        assert!(different.contains("Using M365_CACHE_DIR=\"/new\""));
+        assert!(different.contains("ignoring M365_TEAMS_IMAGE_CACHE_DIR=\"/old\""));
     }
 
     #[test]

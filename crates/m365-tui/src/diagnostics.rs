@@ -801,7 +801,7 @@ pub fn text(app: &App) -> String {
     out.push(row(
         "Persistent Teams cache",
         yes_no(
-            app.session.config.teams_image_cache_dir.is_some(),
+            app.session.config.cache_dir.is_some(),
             "enabled",
             "disabled",
         ),

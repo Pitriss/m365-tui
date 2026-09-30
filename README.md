@@ -332,6 +332,8 @@ M365_CLIENT_ID=00000000-0000-0000-0000-000000000000
 | `M365_TENANT_ID` | `organizations` | Tenant GUID, `organizations`, or `common` |
 | `M365_SCOPES` | built-in defaults | Space-separated delegated Graph scopes |
 | `M365_TOKEN_CACHE` | OS configuration directory | Token cache location |
+| `M365_CACHE_DIR` | unset | Common root for persistent Teams/UI cache and state |
+| `M365_TEAMS_IMAGE_CACHE_DIR` | unset | Deprecated fallback for `M365_CACHE_DIR` |
 | `M365_GRAPH_BASE` | Microsoft Graph | Alternate Graph endpoint, mainly for testing |
 | `M365_NOTIFY` | enabled | Set to `0`, `false`, `no`, or `off` to disable desktop notifications |
 | `M365_NTFY` | `never` | ntfy forwarding mode: `never`, `always`, `away`, `alwayswd`, or `awaywd` |
@@ -768,29 +770,48 @@ The URL is passed directly as one argument. No shell is involved.
 
 If additional command-line arguments are required, use a wrapper script.
 
-### Persistent Teams cache
+### Persistent application cache
 
-Persistent Teams state is enabled by configuring:
+Persistent Teams/UI state is enabled by configuring the common cache root:
 
 ```dotenv
-M365_TEAMS_IMAGE_CACHE_DIR=/home/user/.cache/m365-tui/teams
+M365_CACHE_DIR=/home/user/.cache/m365-tui
 ```
 
-The variable name is historical and is retained for backward compatibility.
+The historical `M365_TEAMS_IMAGE_CACHE_DIR` variable remains as a deprecated
+fallback so existing configurations continue to work unchanged.
 
-The directory is now the common root for:
+Resolution order is:
+
+1. `M365_CACHE_DIR`
+2. `M365_TEAMS_IMAGE_CACHE_DIR` (deprecated)
+3. neither variable -> no persistent Teams/UI cache
+
+If both are set, `M365_CACHE_DIR` wins. When both differ, the application reports
+both configured values and that the deprecated value was ignored. Deprecated
+configuration warnings are printed only after the TUI exits, never inside the
+alternate-screen interface.
+
+No `.env` file, environment variable, or existing cache directory is modified or
+migrated automatically. In particular, switching from the old variable to a new
+path starts using that new path as-is.
+
+The directory is the common root for:
 
 - Teams image cache
 - cached chat conversations
 - persistent UI state
 - Stay archived chat ids
 
-Without this variable:
+Without either cache-root variable:
 
 - Teams images are cached only in RAM,
 - persistent chat conversation cache is disabled,
 - persistent UI state is disabled,
 - Stay archived still works, but only for the current process.
+
+The authentication token cache is separate and continues to use
+`M365_TOKEN_CACHE` / its existing default.
 
 On Unix, cache directories and files are created with restrictive permissions.
 
@@ -1233,8 +1254,8 @@ Files.Read.All
 
 Supported preview formats are JPEG, PNG, and GIF.
 
-Persistent image caching is available when `M365_TEAMS_IMAGE_CACHE_DIR` is
-configured.
+Persistent image caching is available when `M365_CACHE_DIR` (or the deprecated
+`M365_TEAMS_IMAGE_CACHE_DIR` fallback) is configured.
 
 ---
 
@@ -1364,16 +1385,16 @@ M365_TOKEN_CACHE=/path/to/token-cache.json
 Delete the token cache when a changed set of Graph permissions requires a new
 consent flow.
 
-### Teams persistent root
+### Persistent cache root
 
-Persistent Teams data uses:
+Persistent Teams/UI data uses:
 
 ```dotenv
-M365_TEAMS_IMAGE_CACHE_DIR=/path/to/cache
+M365_CACHE_DIR=/path/to/cache
 ```
 
-Despite the historical name, this is the common persistence root for several
-Teams-related features.
+For backward compatibility, `M365_TEAMS_IMAGE_CACHE_DIR` is accepted only as a
+deprecated fallback when `M365_CACHE_DIR` is not set.
 
 It contains data such as:
 
