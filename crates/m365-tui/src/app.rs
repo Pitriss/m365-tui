@@ -90,6 +90,19 @@ pub enum AppMessage {
         chat_id: String,
         status: String,
     },
+    ChatPinsLoaded {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        status: Option<String>,
+    },
+    ChatMarkedUnread {
+        chat_id: String,
+    },
+    ChatTopicUpdated {
+        chat_id: String,
+        topic: String,
+        status: String,
+    },
     ChatCacheWarmed {
         chat_id: String,
         messages: Vec<ChatMessage>,
@@ -215,6 +228,20 @@ pub enum TeamsFocus {
     Composer,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TeamsSlashCommand {
+    Topic(String),
+    Rename(String),
+    Edit(String),
+    Pin,
+    Unpin,
+    Pins,
+    Unread,
+    Delete,
+    Help,
+    HelpAll,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatPollTier {
     Hot,
@@ -270,6 +297,7 @@ fn chat_poll_tier_from_age(age: std::time::Duration) -> ChatPollTier {
 pub enum Overlay {
     Notice(String),
     Help,
+    TeamsCommands,
     Diagnostics,
     ContactDiagnostics,
     Palette {
@@ -284,7 +312,32 @@ pub enum Overlay {
     CalendarEvent,
     ContactProfile,
     /// Emoji reaction picker for the selected Teams message.
-    React,
+    React {
+        row: usize,
+        col: usize,
+    },
+    /// Pinned messages for the currently open chat.
+    PinnedMessages {
+        chat_id: String,
+        messages: Vec<ChatMessage>,
+        sel: usize,
+    },
+    /// Explicit confirmation before renaming a group chat.
+    ConfirmRename {
+        chat_id: String,
+        name: String,
+    },
+    /// Teams chat pinning is single-slot: a new pin replaces the old one.
+    ConfirmReplacePin {
+        chat_id: String,
+        message_id: String,
+    },
+    /// Explicit confirmation before soft-deleting a chat message.
+    ConfirmDelete {
+        chat_id: String,
+        message_id: String,
+        user_id: String,
+    },
     /// Presence (status) picker for the signed-in user.
     Presence,
     /// Single-line editor for the Teams presence status message.
@@ -332,8 +385,17 @@ pub enum ListUpdate {
     Merge,
 }
 
-/// Emoji reactions offered in the picker, keyed 1-7.
-pub const REACTIONS: &[&str] = &["👍", "❤️", "😆", "😮", "😢", "😠", "🎉"];
+/// Reactions used by the Tele-style 4x7 picker.
+///
+/// Layout copied from tele's internal/ui/components/reactionpicker.go so the
+/// same physical navigation and familiar reaction set are available here.
+pub const REACTION_COLS: usize = 7;
+pub const REACTIONS: &[&str] = &[
+    "🤝", "🙏", "👍", "👌", "✍️", "😁", "😈",
+    "💯", "🖕", "❤️", "🫡", "👏", "👨‍💻", "👀",
+    "😎", "🏆", "🤔", "🤷", "😢", "🥰", "🦄",
+    "🤡", "🔥", "💩", "😱", "👎", "😡", "🤬",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresencePreferenceAction {
@@ -639,6 +701,8 @@ pub struct TeamsState {
     pub unseen: usize,
     /// Index of the message being replied to, while composing a reply.
     pub replying_to: Option<usize>,
+    /// Chat/message IDs being edited through the composer.
+    pub editing_message: Option<(String, String)>,
     pub open_chat_id: Option<String>,
     pub preview_chat_id: Option<String>,
     last_chat_id: Option<String>,
@@ -680,6 +744,7 @@ impl Default for TeamsState {
             loading_more: false,
             unseen: 0,
             replying_to: None,
+            editing_message: None,
             open_chat_id: None,
             preview_chat_id: None,
             last_chat_id: None,
@@ -4508,6 +4573,9 @@ impl App {
         self.teams.loading_more = false;
         self.teams.unseen = 0;
         self.teams.replying_to = None;
+        if self.teams.editing_message.take().is_some() {
+            self.teams.composer.clear();
+        }
     }
 
     fn restore_teams_conversation_cache(&mut self, chat_id: &str) -> bool {
@@ -5783,6 +5851,41 @@ impl App {
                 self.mark_teams_chat_active(&chat_id);
                 self.status = status;
                 self.refresh_current();
+            }
+            AppMessage::ChatPinsLoaded {
+                chat_id,
+                messages,
+                status,
+            } => {
+                if self.teams.open_chat_id.as_deref() == Some(chat_id.as_str()) {
+                    self.status = status.unwrap_or_else(|| match messages.len() {
+                        0 => "no pinned message".into(),
+                        1 => "pinned message loaded".into(),
+                        count => format!("{count} pinned messages returned by Graph"),
+                    });
+                    self.overlay = Some(Overlay::PinnedMessages {
+                        chat_id,
+                        messages,
+                        sel: 0,
+                    });
+                }
+            }
+            AppMessage::ChatMarkedUnread { chat_id } => {
+                self.teams.chat_unread_counts.insert(chat_id.clone(), 1);
+                self.teams.locally_read_through.remove(&chat_id);
+                self.status = "chat marked unread".into();
+                self.load_chats();
+            }
+            AppMessage::ChatTopicUpdated {
+                chat_id,
+                topic,
+                status,
+            } => {
+                if let Some(chat) = self.teams.chats.iter_mut().find(|chat| chat.id == chat_id) {
+                    chat.topic = Some(topic);
+                }
+                self.status = status;
+                self.load_chats();
             }
             AppMessage::HotChatPollFinished {
                 chat_id,
@@ -7904,6 +8007,9 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.teams.replying_to = None;
+                    if self.teams.editing_message.take().is_some() {
+                        input.clear();
+                    }
                     self.teams.focus = TeamsFocus::Messages;
                 }
                 KeyCode::Tab => self.teams.focus = TeamsFocus::List,
@@ -7966,7 +8072,11 @@ impl App {
                     TeamsFocus::Composer => TeamsFocus::List,
                 };
             }
-            KeyCode::Char('t') => {
+            KeyCode::Char('c') if self.teams.focus == TeamsFocus::List => {
+                self.teams.replying_to = None;
+                if self.teams.editing_message.take().is_some() {
+                    self.teams.composer.clear();
+                }
                 if self.teams.preview_chat_id.take().is_some() {
                     self.clear_teams_conversation_view();
                 }
@@ -7987,11 +8097,15 @@ impl App {
                     TeamsMode::Channels => TeamsMode::Chats,
                 };
 
-                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+                if self.teams.mode == TeamsMode::Chats {
                     self.preview_selected_teams_chat();
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('a') => {
+                if self.teams.editing_message.take().is_some() {
+                    self.teams.composer.clear();
+                }
+                self.teams.replying_to = None;
                 if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
                     if self.teams_selected_chat().is_none() {
                         self.status = "open Archive with Enter, or select a chat first".into();
@@ -8015,11 +8129,14 @@ impl App {
                 {
                     self.status = "system events cannot be replied to".into();
                 } else {
+                    if self.teams.editing_message.take().is_some() {
+                        self.teams.composer.clear();
+                    }
                     self.teams.replying_to = Some(self.teams.msg_sel);
                     self.teams.focus = TeamsFocus::Composer;
                 }
             }
-            KeyCode::Char('e')
+            KeyCode::Char('t')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
             {
                 if self
@@ -8030,8 +8147,13 @@ impl App {
                 {
                     self.status = "system events cannot be reacted to".into();
                 } else {
-                    self.overlay = Some(Overlay::React);
+                    self.overlay = Some(Overlay::React { row: 0, col: 0 });
                 }
+            }
+            KeyCode::Char('e')
+                if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
+            {
+                self.begin_edit_selected_chat_message();
             }
             KeyCode::Char('x')
                 if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List =>
@@ -8162,6 +8284,9 @@ impl App {
                     self.teams.loading_more = false;
                     self.teams.unseen = 0;
                     self.teams.replying_to = None;
+                    if self.teams.editing_message.take().is_some() {
+                        self.teams.composer.clear();
+                    }
                     self.load_channel_messages(team_id, ch_id, ListUpdate::Replace);
                     self.teams.focus = TeamsFocus::Messages;
                 }
@@ -8174,12 +8299,39 @@ impl App {
         if text.is_empty() {
             return;
         }
-        self.teams.composer.clear();
+
+        if let Some((chat_id, message_id)) = self.teams.editing_message.clone() {
+            self.teams.composer.clear();
+            self.teams.editing_message = None;
+            let s = self.session.clone();
+            self.status = "saving message edit…".into();
+            self.spawn(async move {
+                chats::edit_message(&s.graph, &chat_id, &message_id, &text).await?;
+                Ok(AppMessage::Done("message edited".into()))
+            });
+            return;
+        }
+
         let replying_to = self.teams.replying_to.take();
 
+        if replying_to.is_none() {
+            match parse_teams_slash_command(&text) {
+                Ok(Some(command)) => {
+                    self.teams.composer.clear();
+                    self.execute_teams_slash_command(command);
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            }
+        }
+
+        self.teams.composer.clear();
+
         match (replying_to, self.teams.mode) {
-            // Replying in a chat: quote the original in the body, which is how
-            // Teams itself represents a chat reply.
             (Some(idx), TeamsMode::Chats) => {
                 let (Some(chat_id), Some(original)) = (
                     self.teams.open_chat_id.clone(),
@@ -8199,7 +8351,6 @@ impl App {
                     })
                 });
             }
-            // Channels have a real replies collection, so the reply threads.
             (Some(idx), TeamsMode::Channels) => {
                 let (Some((team_id, channel_id)), Some(original)) = (
                     self.teams.open_channel.clone(),
@@ -8225,6 +8376,292 @@ impl App {
                 if let Some((t, c)) = self.teams.open_channel.clone() {
                     self.send_channel_message(t, c, text);
                 }
+            }
+        }
+    }
+
+    fn selected_owned_chat_message(
+        &mut self,
+        action: &str,
+        past_participle: &str,
+    ) -> Option<(String, ChatMessage)> {
+        if self.teams.mode != TeamsMode::Chats {
+            self.status = format!("{action} is currently available for chats only");
+            return None;
+        }
+
+        let Some(chat_id) = self.teams.open_chat_id.clone() else {
+            self.status = "open a chat first".into();
+            return None;
+        };
+        let Some(message) = self.teams.messages.get(self.teams.msg_sel).cloned() else {
+            self.status = "select a message first".into();
+            return None;
+        };
+        if message.is_system_event() {
+            self.status = format!("system events cannot be {past_participle}");
+            return None;
+        }
+        if message.deleted_date_time.is_some() {
+            self.status = format!("deleted messages cannot be {past_participle}");
+            return None;
+        }
+        let Some(me_id) = self.me.as_ref().map(|me| me.id.as_str()) else {
+            self.status = "still loading your profile".into();
+            return None;
+        };
+        if message.author_id() != Some(me_id) {
+            self.status = format!("only your own messages can be {past_participle}");
+            return None;
+        }
+
+        Some((chat_id, message))
+    }
+
+    fn begin_edit_selected_chat_message(&mut self) {
+        let Some((chat_id, message)) = self.selected_owned_chat_message("edit", "edited") else {
+            return;
+        };
+        if let Err(reason) = validate_plain_message_edit(&message) {
+            self.status = reason.into();
+            return;
+        }
+
+        let raw = message.text();
+        let content_type = message
+            .body
+            .as_ref()
+            .and_then(|body| body.content_type.as_deref());
+        let rendered = content::render_body(content_type, &raw);
+        if !rendered.links.is_empty() {
+            self.status = "editing messages with links is not supported yet".into();
+            return;
+        }
+        let text = content::plain(&rendered.text);
+        if text.trim().is_empty() {
+            self.status = "message has no editable text".into();
+            return;
+        }
+
+        self.teams.replying_to = None;
+        self.teams.editing_message = Some((chat_id, message.id));
+        self.teams.composer = TextInput::from(text.as_str());
+        self.teams.focus = TeamsFocus::Composer;
+        self.status = "editing message".into();
+    }
+
+    fn execute_teams_slash_command(&mut self, command: TeamsSlashCommand) {
+        if matches!(&command, TeamsSlashCommand::Help) {
+            self.help_scroll = 0;
+            self.overlay = Some(Overlay::TeamsCommands);
+            return;
+        }
+        if matches!(&command, TeamsSlashCommand::HelpAll) {
+            self.help_scroll = 0;
+            self.overlay = Some(Overlay::Help);
+            return;
+        }
+
+        if self.teams.mode != TeamsMode::Chats {
+            self.status = "Teams slash commands are currently available for chats only".into();
+            return;
+        }
+
+        let Some(chat_id) = self.teams.open_chat_id.clone() else {
+            self.status = "open a chat first".into();
+            return;
+        };
+
+        match command {
+            TeamsSlashCommand::Topic(topic) => {
+                let Some(chat) = self.teams.chats.iter().find(|chat| chat.id == chat_id) else {
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        "Teams /topic failed locally: chat metadata is not loaded"
+                    );
+                    self.status = "ERROR: /topic requires loaded chat metadata".into();
+                    return;
+                };
+
+                let chat_type = chat.chat_type.as_deref().unwrap_or("unknown").to_string();
+                if !chat_type.eq_ignore_ascii_case("group") {
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        chat_type = %chat_type,
+                        "Teams /topic failed locally: only group chats support topics"
+                    );
+                    self.status =
+                        format!("ERROR: /topic works only in group chats (this chat: {chat_type})");
+                    return;
+                }
+
+                if let Err(error) = validate_chat_topic(&topic) {
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        reason = %error,
+                        "Teams /topic failed local validation"
+                    );
+                    self.status = format!("ERROR: /topic rejected: {error}");
+                    return;
+                }
+
+                let s = self.session.clone();
+                let result_topic = topic.clone();
+                let result_status = format!("Topic updated: {topic}");
+                self.status = "updating chat topic…".into();
+                tracing::debug!(
+                    chat_id = %chat_id,
+                    "Teams /topic PATCH starting"
+                );
+                self.spawn(async move {
+                    chats::set_topic(&s.graph, &chat_id, &topic)
+                        .await
+                        .context("updating Teams chat topic")?;
+                    tracing::debug!(
+                        chat_id = %chat_id,
+                        "Teams /topic PATCH succeeded"
+                    );
+                    Ok(AppMessage::ChatTopicUpdated {
+                        chat_id,
+                        topic: result_topic,
+                        status: result_status,
+                    })
+                });
+            }
+            TeamsSlashCommand::Rename(name) => {
+                let Some(chat) = self.teams.chats.iter().find(|chat| chat.id == chat_id) else {
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        "Teams /rename failed locally: chat metadata is not loaded"
+                    );
+                    self.status = "ERROR: /rename requires loaded chat metadata".into();
+                    return;
+                };
+
+                let chat_type = chat.chat_type.as_deref().unwrap_or("unknown").to_string();
+                if !chat_type.eq_ignore_ascii_case("group") {
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        chat_type = %chat_type,
+                        "Teams /rename failed locally: Graph can rename only group chats"
+                    );
+                    self.status =
+                        format!("ERROR: /rename works only in group chats (this chat: {chat_type})");
+                    return;
+                }
+
+                if let Err(error) = validate_chat_topic(&name) {
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        reason = %error,
+                        "Teams /rename failed local validation"
+                    );
+                    self.status = format!("ERROR: /rename rejected: {error}");
+                    return;
+                }
+
+                self.overlay = Some(Overlay::ConfirmRename { chat_id, name });
+            }
+            TeamsSlashCommand::Edit(text) => {
+                let Some((chat_id, message)) = self.selected_owned_chat_message("edit", "edited") else {
+                    return;
+                };
+                if let Err(reason) = validate_plain_message_edit(&message) {
+                    self.status = reason.into();
+                    return;
+                }
+                let message_id = message.id;
+                let s = self.session.clone();
+                self.status = "saving message edit…".into();
+                self.spawn(async move {
+                    chats::edit_message(&s.graph, &chat_id, &message_id, &text).await?;
+                    Ok(AppMessage::Done("message edited".into()))
+                });
+            }
+            TeamsSlashCommand::Pin => {
+                let Some(message) = self.teams.messages.get(self.teams.msg_sel) else {
+                    self.status = "select a message first".into();
+                    return;
+                };
+                if message.is_system_event() {
+                    self.status = "system events cannot be pinned".into();
+                    return;
+                }
+                self.status =
+                    "Teams allows one pinned chat message; confirm replacement with y".into();
+                self.overlay = Some(Overlay::ConfirmReplacePin {
+                    chat_id,
+                    message_id: message.id.clone(),
+                });
+            }
+            TeamsSlashCommand::Unpin => {
+                let Some(message) = self.teams.messages.get(self.teams.msg_sel) else {
+                    self.status = "select a message first".into();
+                    return;
+                };
+                if message.is_system_event() {
+                    self.status = "system events cannot be unpinned".into();
+                    return;
+                }
+                let message_id = message.id.clone();
+                let s = self.session.clone();
+                self.status = "unpinning message…".into();
+                self.spawn(async move {
+                    chats::unpin_message(&s.graph, &chat_id, &message_id).await?;
+                    Ok(AppMessage::Status("message unpinned".into()))
+                });
+            }
+            TeamsSlashCommand::Pins => {
+                let s = self.session.clone();
+                self.status = "loading pinned messages…".into();
+                self.spawn(async move {
+                    let messages = chats::list_pinned_messages(&s.graph, &chat_id).await?;
+                    Ok(AppMessage::ChatPinsLoaded {
+                        chat_id,
+                        messages,
+                        status: None,
+                    })
+                });
+            }
+            TeamsSlashCommand::Unread => {
+                let tenant_id = self
+                    .teams
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == chat_id)
+                    .and_then(|chat| self.selected_chat_tenant_id(chat));
+                let Some(tenant_id) = tenant_id else {
+                    self.status = "cannot determine tenant id for mark-unread".into();
+                    return;
+                };
+                let known_user_id = self.me.as_ref().map(|me| me.id.clone());
+                let s = self.session.clone();
+                self.status = "marking chat unread…".into();
+                self.spawn(async move {
+                    let user_id = match known_user_id {
+                        Some(id) => id,
+                        None => people::me(&s.graph).await?.id,
+                    };
+                    chats::mark_unread(&s.graph, &chat_id, &user_id, &tenant_id).await?;
+                    Ok(AppMessage::ChatMarkedUnread { chat_id })
+                });
+            }
+            TeamsSlashCommand::Delete => {
+                let Some((chat_id, message)) = self.selected_owned_chat_message("delete", "deleted") else {
+                    return;
+                };
+                let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+                    self.status = "still loading your profile".into();
+                    return;
+                };
+                self.overlay = Some(Overlay::ConfirmDelete {
+                    chat_id,
+                    message_id: message.id,
+                    user_id,
+                });
+            }
+            TeamsSlashCommand::Help | TeamsSlashCommand::HelpAll => {
+                unreachable!("handled above")
             }
         }
     }
@@ -8265,6 +8702,27 @@ impl App {
         // Take the overlay out so we can mutate self freely, then put it back.
         let overlay = self.overlay.take();
         match overlay {
+            Some(Overlay::TeamsCommands) => {
+                let max = self.help_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.help_scroll = 0,
+                    KeyCode::End => self.help_scroll = max,
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::TeamsCommands);
+            }
             Some(Overlay::Help) => {
                 let max = self.help_max_scroll.get();
                 match key.code {
@@ -8363,17 +8821,182 @@ impl App {
                     self.overlay = Some(Overlay::CalendarEvent);
                 }
             }
-            Some(Overlay::React) => {
-                if let KeyCode::Char(c @ '1'..='7') = key.code {
-                    let idx = (c as u8 - b'1') as usize;
-                    if let Some(emoji) = REACTIONS.get(idx) {
+            Some(Overlay::React { mut row, mut col }) => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    col = col.saturating_sub(1);
+                    self.overlay = Some(Overlay::React { row, col });
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    if col + 1 < REACTION_COLS {
+                        col += 1;
+                    }
+                    self.overlay = Some(Overlay::React { row, col });
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    row = row.saturating_sub(1);
+                    self.overlay = Some(Overlay::React { row, col });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if (row + 1) * REACTION_COLS + col < REACTIONS.len() {
+                        row += 1;
+                    }
+                    self.overlay = Some(Overlay::React { row, col });
+                }
+                KeyCode::Enter => {
+                    let index = row * REACTION_COLS + col;
+                    if let Some(emoji) = REACTIONS.get(index) {
                         self.react_selected(emoji);
                     }
-                    // picked -> close (overlay already taken)
-                } else {
-                    self.overlay = Some(Overlay::React); // ignore other keys
                 }
-            }
+                _ => {
+                    self.overlay = Some(Overlay::React { row, col });
+                }
+            },
+            Some(Overlay::PinnedMessages {
+                chat_id,
+                messages,
+                mut sel,
+            }) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    sel = sel.saturating_sub(1);
+                    self.overlay = Some(Overlay::PinnedMessages {
+                        chat_id,
+                        messages,
+                        sel,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    sel = sel.saturating_add(1).min(messages.len().saturating_sub(1));
+                    self.overlay = Some(Overlay::PinnedMessages {
+                        chat_id,
+                        messages,
+                        sel,
+                    });
+                }
+                KeyCode::Enter => {
+                    if self.teams.open_chat_id.as_deref() != Some(chat_id.as_str()) {
+                        self.status = "that pinned message belongs to another chat".into();
+                    } else if let Some(message) = messages.get(sel).cloned() {
+                        let message_id = message.id.clone();
+
+                        // /pins already fetched the full message. If it is older
+                        // than the currently loaded conversation window, merge it
+                        // locally before selecting it so Enter always has a real
+                        // message row to scroll to.
+                        if !self
+                            .teams
+                            .messages
+                            .iter()
+                            .any(|loaded| loaded.id == message_id)
+                        {
+                            let mut combined = self.teams.messages.clone();
+                            combined.push(message);
+                            let next = self.teams.messages_next.clone();
+                            self.set_teams_messages(combined, next, ListUpdate::Replace);
+                        }
+
+                        if let Some(index) = self
+                            .teams
+                            .messages
+                            .iter()
+                            .position(|loaded| loaded.id == message_id)
+                        {
+                            self.teams.msg_sel = index;
+                            self.teams.focus = TeamsFocus::Messages;
+                            self.refresh_selected_teams_images();
+                            self.status = "jumped to pinned message".into();
+                        }
+                    }
+                }
+                KeyCode::Char('u') => {
+                    let Some(message_id) = messages.get(sel).map(|message| message.id.clone())
+                    else {
+                        self.status = "no pinned message selected".into();
+                        return;
+                    };
+                    let s = self.session.clone();
+                    self.status = "unpinning message…".into();
+                    self.spawn(async move {
+                        chats::unpin_message(&s.graph, &chat_id, &message_id).await?;
+                        let messages = chats::list_pinned_messages(&s.graph, &chat_id).await?;
+                        Ok(AppMessage::ChatPinsLoaded {
+                            chat_id,
+                            messages,
+                            status: Some("message unpinned".into()),
+                        })
+                    });
+                }
+                _ => {
+                    self.overlay = Some(Overlay::PinnedMessages {
+                        chat_id,
+                        messages,
+                        sel,
+                    });
+                }
+            },
+            Some(Overlay::ConfirmRename { chat_id, name }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let s = self.session.clone();
+                    let result_name = name.clone();
+                    let result_status = format!("Chat renamed: {name}");
+                    self.status = "renaming chat…".into();
+                    tracing::debug!(
+                        chat_id = %chat_id,
+                        "Teams /rename PATCH starting"
+                    );
+                    self.spawn(async move {
+                        chats::set_topic(&s.graph, &chat_id, &name)
+                            .await
+                            .context("renaming Teams group chat")?;
+                        tracing::debug!(
+                            chat_id = %chat_id,
+                            "Teams /rename PATCH succeeded"
+                        );
+                        Ok(AppMessage::ChatTopicUpdated {
+                            chat_id,
+                            topic: result_name,
+                            status: result_status,
+                        })
+                    });
+                }
+                _ => {
+                    self.status = "chat rename cancelled".into();
+                }
+            },
+            Some(Overlay::ConfirmReplacePin {
+                chat_id,
+                message_id,
+            }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let s = self.session.clone();
+                    self.status = "pinning message…".into();
+                    self.spawn(async move {
+                        chats::pin_message(&s.graph, &chat_id, &message_id).await?;
+                        Ok(AppMessage::Status("message pinned; previous pin replaced if present".into()))
+                    });
+                }
+                _ => {
+                    self.status = "pin replacement cancelled".into();
+                }
+            },
+            Some(Overlay::ConfirmDelete {
+                chat_id,
+                message_id,
+                user_id,
+            }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let s = self.session.clone();
+                    self.status = "deleting message…".into();
+                    self.spawn(async move {
+                        chats::soft_delete_message(&s.graph, &user_id, &chat_id, &message_id)
+                            .await?;
+                        Ok(AppMessage::Done("message deleted".into()))
+                    });
+                }
+                _ => {
+                    self.status = "message deletion cancelled".into();
+                }
+            },
             Some(Overlay::Attachments) => match key.code {
                 KeyCode::Char(c @ '1'..='9') => {
                     self.download_attachment((c as u8 - b'1') as usize);
@@ -8866,6 +9489,75 @@ fn peer_display_name_from_messages<'a>(
         .find(|name| !name.is_empty())
 }
 
+fn parse_teams_slash_command(text: &str) -> Result<Option<TeamsSlashCommand>, String> {
+    let text = text.trim();
+    if !text.starts_with('/') {
+        return Ok(None);
+    }
+
+    let split = text.find(char::is_whitespace).unwrap_or(text.len());
+    let command = text[..split].to_ascii_lowercase();
+    let argument = text[split..].trim();
+
+    let need_argument = |usage: &str| {
+        if argument.is_empty() {
+            Err(format!("usage: {usage}"))
+        } else {
+            Ok(argument.to_string())
+        }
+    };
+
+    match command.as_str() {
+        "/topic" => Ok(Some(TeamsSlashCommand::Topic(need_argument(
+            "/topic <chat topic>",
+        )?))),
+        "/rename" => Ok(Some(TeamsSlashCommand::Rename(need_argument(
+            "/rename <new chat name>",
+        )?))),
+        "/edit" => Ok(Some(TeamsSlashCommand::Edit(need_argument(
+            "/edit <new message text>",
+        )?))),
+        "/pin" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Pin)),
+        "/unpin" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Unpin)),
+        "/pins" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Pins)),
+        "/unread" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Unread)),
+        "/delete" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Delete)),
+        "/help" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Help)),
+        "/help" if argument.eq_ignore_ascii_case("all") => Ok(Some(TeamsSlashCommand::HelpAll)),
+        "/pin" | "/unpin" | "/pins" | "/unread" | "/delete" => {
+            Err(format!("{command} does not take arguments"))
+        }
+        "/help" => Err("usage: /help [all]".into()),
+        _ => Err(format!("unknown Teams command {command}; use /help")),
+    }
+}
+
+fn validate_chat_topic(topic: &str) -> Result<(), &'static str> {
+    if topic.is_empty() {
+        return Err("chat topic cannot be empty");
+    }
+    if topic.chars().count() > 250 {
+        return Err("chat topic cannot exceed 250 characters");
+    }
+    if topic.contains(':') {
+        return Err("chat topic cannot contain ':'");
+    }
+    Ok(())
+}
+
+fn validate_plain_message_edit(message: &ChatMessage) -> Result<(), &'static str> {
+    if message.is_system_event() {
+        return Err("system events cannot be edited");
+    }
+    if message.deleted_date_time.is_some() {
+        return Err("deleted messages cannot be edited");
+    }
+    if !message.attachments.is_empty() || !message.mentions.is_empty() {
+        return Err("editing messages with attachments or mentions is not supported yet");
+    }
+    Ok(())
+}
+
 /// Chronological sort key for a Teams message: creation time, then id.
 fn sort_key(m: &ChatMessage) -> (i64, u64) {
     let at = m
@@ -8925,6 +9617,65 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
         })
         .copied()
         .collect()
+}
+
+#[cfg(test)]
+mod teams_slash_command_tests {
+    use super::{parse_teams_slash_command, validate_chat_topic, TeamsSlashCommand};
+
+    #[test]
+    fn parses_commands_and_arguments() {
+        assert_eq!(
+            parse_teams_slash_command("/topic Release room"),
+            Ok(Some(TeamsSlashCommand::Topic("Release room".into())))
+        );
+        assert_eq!(
+            parse_teams_slash_command("/edit corrected text"),
+            Ok(Some(TeamsSlashCommand::Edit("corrected text".into())))
+        );
+        assert_eq!(parse_teams_slash_command("/pin"), Ok(Some(TeamsSlashCommand::Pin)));
+        assert_eq!(
+            parse_teams_slash_command("/unpin"),
+            Ok(Some(TeamsSlashCommand::Unpin))
+        );
+        assert_eq!(parse_teams_slash_command("/pins"), Ok(Some(TeamsSlashCommand::Pins)));
+        assert_eq!(
+            parse_teams_slash_command("/unread"),
+            Ok(Some(TeamsSlashCommand::Unread))
+        );
+        assert_eq!(
+            parse_teams_slash_command("/delete"),
+            Ok(Some(TeamsSlashCommand::Delete))
+        );
+        assert_eq!(parse_teams_slash_command("/help"), Ok(Some(TeamsSlashCommand::Help)));
+        assert_eq!(
+            parse_teams_slash_command("/help all"),
+            Ok(Some(TeamsSlashCommand::HelpAll))
+        );
+        assert_eq!(
+            parse_teams_slash_command("/rename Release room"),
+            Ok(Some(TeamsSlashCommand::Rename("Release room".into())))
+        );
+        assert_eq!(parse_teams_slash_command("ordinary message"), Ok(None));
+    }
+
+    #[test]
+    fn rejects_bad_command_shapes() {
+        assert!(parse_teams_slash_command("/topic").is_err());
+        assert!(parse_teams_slash_command("/rename").is_err());
+        assert!(parse_teams_slash_command("/edit").is_err());
+        assert!(parse_teams_slash_command("/pins extra").is_err());
+        assert!(parse_teams_slash_command("/help nope").is_err());
+        assert!(parse_teams_slash_command("/unknown").is_err());
+    }
+
+    #[test]
+    fn validates_graph_topic_constraints() {
+        assert!(validate_chat_topic("Release room").is_ok());
+        assert!(validate_chat_topic("").is_err());
+        assert!(validate_chat_topic("bad:topic").is_err());
+        assert!(validate_chat_topic(&"x".repeat(251)).is_err());
+    }
 }
 
 #[cfg(test)]

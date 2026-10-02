@@ -124,6 +124,27 @@ pub async fn mark_read(
         .await
 }
 
+/// Mark a chat unread for the signed-in user. Omitting
+/// lastMessageReadDateTime makes Graph mark the last message unread.
+pub async fn mark_unread(
+    graph: &GraphClient,
+    chat_id: &str,
+    user_id: &str,
+    tenant_id: &str,
+) -> Result<()> {
+    graph
+        .post_action(
+            &format!("chats/{chat_id}/markChatUnreadForUser"),
+            &json!({
+                "user": {
+                    "id": user_id,
+                    "tenantId": tenant_id
+                }
+            }),
+        )
+        .await
+}
+
 /// Hide or unhide a chat for the signed-in user.
 ///
 /// This is the server-side Teams archive state surfaced by
@@ -191,6 +212,103 @@ pub async fn send_message(graph: &GraphClient, chat_id: &str, text: &str) -> Res
     let payload = json!({ "body": { "contentType": "text", "content": text } });
     graph
         .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
+        .await
+}
+
+/// Change the topic of a group chat.
+pub async fn set_topic(graph: &GraphClient, chat_id: &str, topic: &str) -> Result<()> {
+    graph
+        .patch(&format!("chats/{chat_id}"), &json!({ "topic": topic }))
+        .await
+}
+
+/// Replace the body of a chat message with plain text.
+pub async fn edit_message(
+    graph: &GraphClient,
+    chat_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<()> {
+    graph
+        .patch(
+            &format!("chats/{chat_id}/messages/{message_id}"),
+            &json!({
+                "body": {
+                    "contentType": "text",
+                    "content": text
+                }
+            }),
+        )
+        .await
+}
+
+/// Soft-delete one of the signed-in user's chat messages.
+pub async fn soft_delete_message(
+    graph: &GraphClient,
+    user_id: &str,
+    chat_id: &str,
+    message_id: &str,
+) -> Result<()> {
+    graph
+        .post_empty_action(&format!(
+            "users/{user_id}/chats/{chat_id}/messages/{message_id}/softDelete"
+        ))
+        .await
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PinnedChatMessageInfo {
+    id: String,
+}
+
+/// List pin IDs first, then fetch each chatMessage separately.
+///
+/// This deliberately avoids `$expand=message`: some Teams thread shapes return
+/// `Thread property pinnedItems was not found` through that expanded path even
+/// though Graph documents the plain pinnedMessages collection separately.
+pub async fn list_pinned_messages(graph: &GraphClient, chat_id: &str) -> Result<Vec<ChatMessage>> {
+    let pins: Vec<PinnedChatMessageInfo> = graph
+        .get_collection(&format!("chats/{chat_id}/pinnedMessages"))
+        .await?;
+
+    let mut messages = Vec::with_capacity(pins.len());
+    for pin in pins {
+        match graph
+            .get_json::<ChatMessage>(&format!("chats/{chat_id}/messages/{}", pin.id))
+            .await
+        {
+            Ok(message) => messages.push(message),
+            Err(error) => {
+                tracing::warn!(
+                    "could not load pinned Teams message {} in {}: {error:#}",
+                    pin.id,
+                    chat_id
+                );
+            }
+        }
+    }
+    Ok(messages)
+}
+
+/// Pin an existing message in a chat.
+pub async fn pin_message(graph: &GraphClient, chat_id: &str, message_id: &str) -> Result<()> {
+    graph
+        .post_action(
+            &format!("chats/{chat_id}/pinnedMessages"),
+            &json!({
+                "message@odata.bind": format!(
+                    "https://graph.microsoft.com/v1.0/chats/{chat_id}/messages/{message_id}"
+                )
+            }),
+        )
+        .await
+}
+
+/// Unpin a message. Graph defines pinnedChatMessageInfo.id as the chatMessage id.
+pub async fn unpin_message(graph: &GraphClient, chat_id: &str, message_id: &str) -> Result<()> {
+    graph
+        .delete(&format!("chats/{chat_id}/pinnedMessages/{message_id}"))
         .await
 }
 

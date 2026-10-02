@@ -175,28 +175,49 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
     let bg = Color::Rgb(30, 30, 40);
     let hints = format!(" {} · ? help ", context_hints(app));
-    let hints_w = (hints.chars().count() as u16).min(area.width);
+    let requested_hints_w = (hints.chars().count() as u16).min(area.width);
+    let status_w = app.status.chars().count() as u16 + 2;
+    let hints_w = if app.status.is_empty()
+        || status_w.saturating_add(requested_hints_w) <= area.width
+    {
+        requested_hints_w
+    } else {
+        0
+    };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(hints_w)])
         .split(area);
 
+    let status_style = if app.status.is_empty() {
+        Style::default().fg(Color::White).bg(bg)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    let status_bg = if app.status.is_empty() { bg } else { ACCENT };
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {}", app.status),
-            Style::default().fg(Color::White).bg(bg),
+            status_style,
         )))
-        .style(Style::default().bg(bg)),
+        .style(Style::default().bg(status_bg)),
         cols[0],
     );
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hints,
-            Style::default().fg(DIM).bg(bg),
-        ))),
-        cols[1],
-    );
+
+    if hints_w > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hints,
+                Style::default().fg(DIM).bg(bg),
+            ))),
+            cols[1],
+        );
+    }
 }
 
 fn line_width(line: &Line) -> u16 {
@@ -270,7 +291,11 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Compose(_) => "Ctrl+S send · Esc cancel",
             Overlay::Links => "1-9 open · y copy · Esc close",
             Overlay::Attachments => "1-9 save · Esc close",
-            Overlay::React => "1-7 react · Esc close",
+            Overlay::React { .. } => "hjkl/arrows choose · Enter react · Esc close",
+            Overlay::PinnedMessages { .. } => "j/k move · Enter jump · u unpin · Esc close",
+            Overlay::ConfirmRename { .. } => "y rename · any other key cancel",
+            Overlay::ConfirmReplacePin { .. } => "y replace current pin · any other key cancel",
+            Overlay::ConfirmDelete { .. } => "y delete · any other key cancel",
             Overlay::Presence => "1-6 set · m message · c clear message · a auto · Esc close",
             Overlay::PresenceMessage(_) => "Enter set · Esc cancel",
             Overlay::NtfySnooze { .. } => "j/k choose · Enter apply · c/0 resume · Esc close",
@@ -281,6 +306,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Diagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
             Overlay::ContactDiagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
             Overlay::Calendar => "Esc close",
+            Overlay::TeamsCommands => "j/k scroll · PgUp/PgDn · Home/End · Esc close",
             Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
         };
     }
@@ -295,9 +321,9 @@ fn context_hints(app: &App) -> &'static str {
             }
         },
         Screen::Teams => match app.teams.focus {
-            TeamsFocus::List => "j/k move · Enter open/drawer · x archive/restore · X stay · g profile · t chats/channels",
-            TeamsFocus::Messages => "j/k select · h back · r reply · e react · i write",
-            TeamsFocus::Composer => "Enter send · Shift+Enter newline · Esc leave",
+            TeamsFocus::List => "j/k move · Enter open/drawer · x archive/restore · X stay · g profile · c chats/channels",
+            TeamsFocus::Messages => "j/k select · h back · r reply · t react · e edit · i write",
+            TeamsFocus::Composer => "Enter send/run/save · ▶ selected target · Shift+Enter newline · Esc leave",
         },
         Screen::Calendar => match app.calendar.view {
             CalendarView::Agenda => "j/k move · Enter/g detail · o join · n today · a/d/t RSVP · r refresh · w range · v month",
@@ -616,9 +642,15 @@ pub fn conversation_lines(
         let normal_time_style = Style::default().fg(Color::Gray);
 
         if m.deleted_date_time.is_some() {
+            let deleted_style = Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD);
             lines.push(lead(
-                normal_time_style,
-                vec![Span::styled("(message deleted)", Style::default().fg(DIM))],
+                deleted_style,
+                vec![Span::styled(
+                    "── Message deleted ────────────",
+                    deleted_style,
+                )],
             ));
             prev = None; // a deletion breaks the run
             continue;
@@ -662,7 +694,10 @@ pub fn conversation_lines(
                     format!("{}: ", q.author),
                     Style::default().fg(Color::LightGreen),
                 ),
-                Span::styled(truncate(&q.preview, 70), Style::default().fg(DIM)),
+                Span::styled(
+                    truncate(&q.preview, 70),
+                    Style::default().fg(Color::White),
+                ),
             ]
         });
 
@@ -1685,7 +1720,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             let mut state = ListState::default();
             state.select(Some(app.teams.chat_sel));
             f.render_stateful_widget(
-                List::new(items).block(panel_block("Chats (t→channels)", focused)),
+                List::new(items).block(panel_block("Chats (c→channels)", focused)),
                 cols[0],
                 &mut state,
             );
@@ -1707,7 +1742,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                     .iter()
                     .map(|c| ListItem::new(truncate(c.display_name.as_deref().unwrap_or(""), 30)))
                     .collect();
-                ("Channels (t→chats)", items, app.teams.channel_sel)
+                ("Channels (c→chats)", items, app.teams.channel_sel)
             };
 
             let mut state = ListState::default();
@@ -1725,28 +1760,44 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     // pinned date header, and a couple of message rows on small terminals.
     let composer_width = cols[1].width.saturating_sub(2).max(1) as usize;
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
-    // One extra row while a reply is being composed, for the quoted banner.
-    let reply_row = u16::from(app.teams.replying_to.is_some());
+    // One extra row while a reply/edit is being composed, for its context banner.
+    let context_row = u16::from(
+        app.teams.replying_to.is_some() || app.teams.editing_message.is_some(),
+    );
     let oof_row = u16::from(out_of_office.is_some());
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
             Constraint::Length(oof_row),
-            Constraint::Length(composer_rows + reply_row + 2),
+            Constraint::Length(composer_rows + context_row + 2),
         ])
         .split(cols[1]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
+    let message_selection_visible =
+        matches!(app.teams.focus, TeamsFocus::Messages | TeamsFocus::Composer);
     let previewing = app.teams.focus == TeamsFocus::List && app.teams.preview_chat_id.is_some();
-    let title = if previewing {
+    let base_title = if previewing {
         "Conversation preview · cached".to_string()
     } else if app.teams.unseen > 0 {
         format!("Conversation — ▼ {} new (g to jump)", app.teams.unseen)
     } else if focused {
-        "Conversation (j/k select · e react · z copy-mode)".to_string()
+        "Conversation (j/k select · t react · e edit · z copy-mode)".to_string()
     } else {
         "Conversation".to_string()
+    };
+    let topic = app
+        .teams
+        .open_chat_id
+        .as_deref()
+        .and_then(|chat_id| app.teams.chats.iter().find(|chat| chat.id == chat_id))
+        .and_then(|chat| chat.topic.as_deref())
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty());
+    let title = match topic {
+        Some(topic) => format!("{base_title} · topic: {}", truncate(topic, 48)),
+        None => base_title,
     };
 
     // Build the final conversation rectangle first. Inline image sizing must use
@@ -1792,7 +1843,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
     // The dedicated pinned row above the conversation already carries the
     // first visible day. Keep later inline separators for day boundaries.
-    let (mut lines, msg_starts) = conversation_lines(app, focused, false);
+    let (mut lines, msg_starts) =
+        conversation_lines(app, message_selection_visible, false);
     if lines.is_empty() {
         let empty = if previewing && app.teams.messages.is_empty() {
             "No cached conversation for the selected chat."
@@ -1932,7 +1984,9 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let composing = app.teams.focus == TeamsFocus::Composer;
-    let title = if composing {
+    let title = if app.teams.editing_message.is_some() {
+        "Edit message (Enter save · Esc cancel)"
+    } else if composing {
         "Message (Enter send · Shift/Alt+Enter newline)"
     } else {
         "Message"
@@ -1959,7 +2013,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let mut composer_inner = composer_block.inner(right[2]);
     f.render_widget(composer_block, right[2]);
 
-    // Show what's being replied to, so the quote isn't a surprise on send.
+    // Show reply/edit context above the composer.
     if let Some(idx) = app.teams.replying_to {
         let banner = Rect {
             height: 1,
@@ -1987,6 +2041,31 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("┃ replying to ", Style::default().fg(ACCENT)),
                 Span::styled(who, Style::default().fg(Color::LightGreen)),
                 Span::styled(format!(": {excerpt}"), Style::default().fg(DIM)),
+            ])),
+            banner,
+        );
+    } else if let Some((_, message_id)) = app.teams.editing_message.as_ref() {
+        let banner = Rect {
+            height: 1,
+            ..composer_inner
+        };
+        composer_inner = Rect {
+            y: composer_inner.y + 1,
+            height: composer_inner.height.saturating_sub(1),
+            ..composer_inner
+        };
+        let excerpt = app
+            .teams
+            .messages
+            .iter()
+            .position(|message| &message.id == message_id)
+            .and_then(|idx| app.teams.messages_rendered.get(idx))
+            .map(|text| truncate(&crate::content::plain(text).replace('\n', " "), 68))
+            .unwrap_or_else(|| "(original message not in loaded page)".to_string());
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("┃ editing ", Style::default().fg(ACCENT)),
+                Span::styled(excerpt, Style::default().fg(DIM)),
             ])),
             banner,
         );
@@ -2262,6 +2341,36 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 area,
             );
         }
+        Overlay::TeamsCommands => {
+            let area = centered(72, 66, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Teams commands — j/k scroll · Esc close");
+            let inner = block.inner(area);
+            let text = " /topic <text>       set chat topic/title (group chats only)
+ /rename <name>      rename chat (group chats only; asks for confirmation)
+ /edit <text>        replace selected own message text
+ /pin                pin selected message (replaces current pin; asks confirmation)
+ /unpin              unpin selected message
+ /pins               show current pinned message; Enter jump · u unpin
+ /unread             mark current chat unread
+ /delete             delete selected own message (asks confirmation)
+ /help               show this command list
+ /help all           show full application/key help
+
+ Commands that act on a message use the currently selected ▶ message.";
+
+            let lines: Vec<Line<'static>> = text
+                .split('\n')
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+            let max = (rows.len() as u16).saturating_sub(inner.height);
+            app.help_max_scroll.set(max);
+            let scroll = app.help_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
+        }
         Overlay::Help => {
             let area = centered(60, 60, f.area());
             f.render_widget(Clear, area);
@@ -2289,9 +2398,12 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
           f forward · / search · g calendar · in the reading pane j/k scroll\n\
  \n\
- Teams:   t chats/channels · x archive/restore · X toggle Stay archived\n\
-          g profile on chat · g newest in messages · e react\n\
-          a/i type message · r reply to selected · Enter send\n\
+ Teams:   c chats/channels · x archive/restore · X toggle Stay archived\n\
+          g profile on chat · g newest in messages · t react · e edit\n\
+          a/i type message · r reply to selected · Enter send/save\n\
+          /topic <text> (group only) · /rename <name> (group only)\n\
+          /edit <text> · /pin · /unpin · /pins · /unread · /delete\n\
+          /help commands only · /help all full help\n\
  \n\
  Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
            a accept · d decline · t tentative · r refresh · w range · v month\n\
@@ -2354,15 +2466,24 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     if let Some((symbol, color, index)) = marker {
                         let end = index + symbol.len_utf8();
                         Line::from(vec![
-                            Span::raw(line[..index].to_string()),
+                            Span::styled(
+                                line[..index].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
                             Span::styled(
                                 symbol.to_string(),
                                 Style::default().fg(color).add_modifier(Modifier::BOLD),
                             ),
-                            Span::raw(line[end..].to_string()),
+                            Span::styled(
+                                line[end..].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
                         ])
                     } else {
-                        Line::raw(line.to_string())
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::White),
+                        ))
                     }
                 })
                 .collect();
@@ -2413,15 +2534,24 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     if let Some((symbol, color, index)) = marker {
                         let end = index + symbol.len_utf8();
                         Line::from(vec![
-                            Span::raw(line[..index].to_string()),
+                            Span::styled(
+                                line[..index].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
                             Span::styled(
                                 symbol.to_string(),
                                 Style::default().fg(color).add_modifier(Modifier::BOLD),
                             ),
-                            Span::raw(line[end..].to_string()),
+                            Span::styled(
+                                line[end..].to_string(),
+                                Style::default().fg(Color::White),
+                            ),
                         ])
                     } else {
-                        Line::raw(line.to_string())
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::White),
+                        ))
                     }
                 })
                 .collect();
@@ -2580,20 +2710,142 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             );
         }
         Overlay::Compose(c) => render_compose(f, c, app),
-        Overlay::React => {
-            let area = centered(50, 24, f.area());
+        Overlay::React { row, col } => {
+            // Tele-style picker: 4 lines × 7 fixed four-column cells. Keeping
+            // each row as one Line avoids per-cell wrapping and wcwidth drift.
+            let frame = f.area();
+            let width = 33u16.min(frame.width.max(1));
+            let height = 8u16.min(frame.height.max(1));
+            let area = Rect {
+                x: frame.x + frame.width.saturating_sub(width) / 2,
+                y: frame.y + frame.height.saturating_sub(height) / 2,
+                width,
+                height,
+            };
+
             f.render_widget(Clear, area);
-            let picks: String = crate::app::REACTIONS
-                .iter()
+            let block = popup_block("React");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let mut lines = Vec::with_capacity(4);
+            for (row_index, chunk) in crate::app::REACTIONS
+                .chunks(crate::app::REACTION_COLS)
                 .enumerate()
-                .map(|(i, e)| format!("{}  {e}   ", i + 1))
-                .collect();
+            {
+                let mut spans = Vec::with_capacity(chunk.len());
+                for (col_index, emoji) in chunk.iter().enumerate() {
+                    let style = if row_index == *row && col_index == *col {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    spans.push(Span::styled(format!(" {emoji} "), style));
+                }
+                lines.push(Line::from(spans));
+            }
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            f.render_widget(Paragraph::new(lines), rows[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "hjkl/arrows · Enter react · Esc close",
+                    Style::default().fg(DIM),
+                )),
+                rows[2],
+            );
+        }
+        Overlay::PinnedMessages { messages, sel, .. } => {
+            let area = centered(76, 60, f.area());
+            f.render_widget(Clear, area);
+            let title = if messages.len() <= 1 {
+                "Pinned message — Enter jump · u unpin · Esc close"
+            } else {
+                "Pinned messages — j/k move · Enter jump · u unpin · Esc close"
+            };
+            let block = popup_block(title);
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            if messages.is_empty() {
+                f.render_widget(Paragraph::new("No pinned messages."), inner);
+            } else {
+                let items: Vec<ListItem> = messages
+                    .iter()
+                    .map(|message| {
+                        let author = message.author();
+                        let preview = message.text_preview(100);
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                format!("{author}: "),
+                                Style::default()
+                                    .fg(Color::LightGreen)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(preview),
+                        ]))
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                state.select(Some((*sel).min(messages.len().saturating_sub(1))));
+                f.render_stateful_widget(
+                    List::new(items)
+                        .highlight_style(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("▏"),
+                    inner,
+                    &mut state,
+                );
+            }
+        }
+        Overlay::ConfirmRename { name, .. } => {
+            let area = centered(66, 32, f.area());
+            f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(format!(
-                    "React to the selected message:\n\n{picks}\n\nPress 1-7 · Esc cancel"
+                    "Rename this group chat to:\n\n{name}\n\nMicrosoft Graph stores the chat title in the topic property.\n\nPress y to rename. Any other key cancels."
                 ))
                 .wrap(Wrap { trim: false })
-                .block(popup_block("Add reaction")),
+                .block(popup_block("Rename group chat?")),
+                area,
+            );
+        }
+        Overlay::ConfirmReplacePin { .. } => {
+            let area = centered(62, 28, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(
+                    "Teams chat supports only one pinned message at a time.\n\nPinning this message will replace the current pinned message, if there is one.\n\nPress y to continue. Any other key cancels.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Replace pinned message?")),
+                area,
+            );
+        }
+        Overlay::ConfirmDelete { .. } => {
+            let area = centered(58, 24, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(
+                    "Soft-delete the selected Teams message?\n\nPress y to delete. Any other key cancels.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Delete message")),
                 area,
             );
         }

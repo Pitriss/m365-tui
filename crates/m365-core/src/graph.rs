@@ -83,6 +83,8 @@ impl GraphClient {
             }
             if let Some(b) = body {
                 req = req.json(b);
+            } else if method == reqwest::Method::POST {
+                req = req.header(reqwest::header::CONTENT_LENGTH, "0");
             }
 
             let resp = req.send().await.context("sending Graph request")?;
@@ -194,6 +196,13 @@ impl GraphClient {
     pub async fn post_action(&self, path: &str, body: &Value) -> Result<()> {
         let url = self.url(path);
         self.send(reqwest::Method::POST, &url, Some(body)).await?;
+        Ok(())
+    }
+
+    /// POST action whose Graph contract explicitly requires no request body.
+    pub async fn post_empty_action(&self, path: &str) -> Result<()> {
+        let url = self.url(path);
+        self.send(reqwest::Method::POST, &url, None).await?;
         Ok(())
     }
 

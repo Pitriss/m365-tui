@@ -49,7 +49,10 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   archived re-hide behavior.
 - Adaptive HOT/WARM/COOL polling for recently active chats, with a shared
   Microsoft Graph request budget.
-- Replies and emoji reactions.
+- Replies, editing/deleting your own messages, and emoji reactions.
+- Teams chat slash commands for topic/title changes, rename, pin/unpin, mark
+  unread, delete, edit, and built-in command help. Topic/title changes and
+  rename are limited to group chats by Microsoft Graph.
 - Presence indicators for contacts in one-to-one chats.
 - Learns one-to-one contact names from message sender metadata when personal or
   federated roster entries omit a usable display name.
@@ -945,7 +948,7 @@ In the reading pane, `j`/`k` scroll rather than changing the selected message.
 | `Enter` / `l` | Open selected conversation; toggle the Archive drawer when its row is selected |
 | `x` | Archive or restore the selected chat |
 | `X` | Toggle Stay archived for an already archived chat |
-| `t` | Toggle chats / Teams channels |
+| `c` | Toggle chats / Teams channels |
 | `i` / `a` | Open selected chat and start writing |
 
 Moving with `j`/`k` in the chat list does not open the conversation on the
@@ -966,7 +969,8 @@ persisted when persistent UI state is enabled.
 | `Home` | Oldest loaded selectable message |
 | `End` / `g` | Newest selectable message |
 | `r` | Reply to selected message |
-| `e` | React |
+| `t` | React to selected message |
+| `e` | Edit selected own message |
 | `i` / `a` | Enter composer |
 | `h` / `Esc` | Return to chat list |
 
@@ -986,6 +990,30 @@ Deleted and filtered system-event rows are skipped during message navigation.
 | `Ctrl+Left` / `Ctrl+Right` | Move by word |
 | `Home` / `End` | Start/end of line |
 | `Ctrl+Home` / `Ctrl+End` | Start/end of text |
+
+#### Teams chat slash commands
+
+Slash commands are entered in the Teams chat composer.
+
+| Command | Action |
+|---|---|
+| `/topic <text>` | Set the chat topic/title; group chats only |
+| `/rename <name>` | Rename the chat; group chats only; asks for confirmation |
+| `/edit <text>` | Replace the selected own message text |
+| `/pin` | Pin the selected message; asks for confirmation and replaces the current pin if present |
+| `/unpin` | Unpin the selected message |
+| `/pins` | Show the current pinned message; `Enter` jumps to it and `u` unpins |
+| `/unread` | Mark the current chat unread |
+| `/delete` | Delete the selected own message; asks for confirmation |
+| `/help` | Show the compact Teams command list |
+| `/help all` | Show the complete application/key help |
+
+Both `/help` and `/help all` are scrollable with `j`/`k`, `Up`/`Down`,
+`PageUp`/`PageDown`, and `Home`/`End`; `Esc` closes the overlay.
+
+Commands that operate on a message use the currently selected `▶` message.
+Unsupported `/topic` and `/rename` attempts outside group chats fail locally
+and are written to the application log.
 
 ### Calendar agenda
 
@@ -1169,10 +1197,13 @@ Select a message and press:
 
 ```text
 r    reply
-e    react
+t    react
+e    edit your own message
 ```
 
 Chat replies preserve the Teams message-reference information where available.
+The reaction picker supports arrow keys and `h`/`j`/`k`/`l`.
+Deleted messages are rendered as explicit separator-style status rows.
 
 System-event messages are intentionally not replyable or reactable.
 
