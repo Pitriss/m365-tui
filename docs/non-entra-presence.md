@@ -35,6 +35,28 @@ Consequently neither Graph batch presence nor
 This is a known limitation, not a generic failure of Graph presence. F6/F7 can
 still verify that `Presence.Read.All` and normal Entra presence are working.
 
+## Display-name resolution
+
+Microsoft personal-account roster entries can omit both `displayName` and email
+even when message sender identity later contains a usable display name. In the
+tested chats, `chatMessage.from.user.displayName` was present on some peer
+messages and absent on others.
+
+`m365-tui` therefore treats message sender metadata as a fallback name source.
+When processing a loaded message page it scans peer messages until it finds the
+first non-empty sender `displayName`; a nameless first peer message no longer
+prevents a later message on the same page from teaching the application the
+contact name.
+
+F7 reports the availability and source of name metadata in current chat state,
+fresh expanded-chat data, dedicated `/members`, and recent peer messages. It also
+reports how many scanned peer messages contain `displayName`, but never exports
+the actual name, email address, or raw identifier.
+
+Display-name resolution is independent of presence identity. Learning a name
+from message metadata does not turn an opaque personal-account ID into an Entra
+GUID and therefore does not make Graph presence available.
+
 ## Experimental Teams / Skype presence path
 
 The codebase intentionally retains an experimental, read-only path for future

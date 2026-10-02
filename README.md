@@ -51,6 +51,8 @@ design notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   Microsoft Graph request budget.
 - Replies and emoji reactions.
 - Presence indicators for contacts in one-to-one chats.
+- Learns one-to-one contact names from message sender metadata when personal or
+  federated roster entries omit a usable display name.
 - Optional control of your own Teams presence.
 - Configurable automatic Available → Away behavior.
 - Teams system events such as recording, transcript, membership, pin, and chat
@@ -106,7 +108,9 @@ unchanged unless this command is explicitly invoked.
 - Global `F6` read-only diagnostics overlay.
 - Contextual `F7` diagnostics for the selected Teams one-to-one contact. It
   classifies Graph/Teams identity shapes, detects a safe Teams user-MRI candidate,
-  probes batch/direct Graph presence, and traces the read-only Teams path
+  reports which contact-name sources are available, compares the current chat
+  state with fresh expanded-chat, `/members`, and recent-message probes, probes
+  batch/direct Graph presence, and traces the read-only Teams path
   (Skype-resource token -> authz/Skype token -> Middle Tier MRI lookup -> UPS)
   without exporting names, email addresses, raw IDs, tokens, MRIs, or tenant IDs.
 - Shows account/token health, Microsoft 365 work-plan hours and time zones,

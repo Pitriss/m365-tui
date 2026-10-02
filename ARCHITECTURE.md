@@ -144,11 +144,23 @@ export depend on terminal OSC 52 support.
 `F7` adds a contextual diagnostics snapshot for the selected Teams one-to-one
 contact. It records only identity classification (member type, GUID availability,
 safe ID-shape labels such as `MRI consumer (8:live:)`, and same/external/unknown
-tenant relation) plus safe batch/direct Graph presence results. It can retain a
-raw user-MRI candidate and lookup address privately in `App` for the read-only
-Teams diagnostic chain. That chain attempts a Skype-resource token from the
-existing refresh token, exchanges it through Teams `authz` for a Skype token,
-uses `externalsearchv3?includeTFLUsers=true` only when an MRI is not already
+tenant relation) plus safe batch/direct Graph presence results. Name diagnostics
+report availability and source only: the current roster/preview/cache state is
+compared with fresh expanded-chat, dedicated `/members`, and recent-message
+probes. Recent-message diagnostics also count peer messages and how many carry a
+non-empty `displayName`, making intermittent personal-account metadata visible
+without exporting the actual name.
+
+For one-to-one contacts whose roster omits `displayName`, the application can
+learn the display name from message sender identity. Name learning scans the
+loaded peer-message page for the first non-empty sender `displayName` instead of
+stopping at the first peer message; identity, tenant, and presence resolution
+remain separate and continue to use their existing identifiers.
+
+F7 can retain a raw user-MRI candidate and lookup address privately in `App` for
+the read-only Teams diagnostic chain. That chain attempts a Skype-resource token
+from the existing refresh token, exchanges it through Teams `authz` for a Skype
+token, uses `externalsearchv3?includeTFLUsers=true` only when an MRI is not already
 available, and finally reads UPS presence. Names, email addresses, raw IDs,
 access/refresh/Skype tokens, MRIs, tenant IDs, and raw service responses are
 intentionally excluded from the rendered/exported snapshot.
