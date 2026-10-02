@@ -1174,6 +1174,8 @@ pub struct App {
     pub contact_diagnostics_scroll: u16,
     /// Largest useful contact diagnostics scroll offset, set by the renderer.
     pub contact_diagnostics_max_scroll: std::cell::Cell<u16>,
+    /// Raw selected chat id used only for fresh read-only F7 probes; never rendered/exported.
+    contact_diagnostics_chat_id: Option<String>,
     /// Raw Graph user id used only for the live F7 probe; never rendered/exported.
     contact_diagnostics_user_id: Option<String>,
     /// Raw Teams user MRI candidate retained only for read-only UPS probing.
@@ -2399,6 +2401,7 @@ impl App {
             contact_diagnostics: ContactDiagnosticsState::default(),
             contact_diagnostics_scroll: 0,
             contact_diagnostics_max_scroll: std::cell::Cell::new(0),
+            contact_diagnostics_chat_id: None,
             contact_diagnostics_user_id: None,
             contact_diagnostics_mri: None,
             contact_diagnostics_lookup_address: None,
@@ -2624,6 +2627,7 @@ impl App {
             return;
         }
 
+        let chat_id = chat.id.clone();
         let me_id = self.me.as_ref().map(|me| me.id.as_str());
         let peer_member = chat.members.iter().find(|member| {
             me_id
@@ -2746,6 +2750,58 @@ impl App {
         let presence_supported = !personal && !skype && probe_user_id.is_some();
         let cross_tenant_candidate = external && presence_supported;
 
+        let topic_available = chat
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let member_display_name_available = peer_member
+            .and_then(|member| member.display_name.as_deref())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let member_email_available = peer_member
+            .and_then(|member| member.email.as_deref())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let preview_present = chat.last_message_preview.is_some();
+        let preview_sender_available = chat
+            .last_message_preview
+            .as_ref()
+            .and_then(|preview| preview.from.as_ref())
+            .and_then(|from| from.user.as_ref())
+            .is_some();
+        let preview_sender_is_peer = preview_peer.is_some();
+        let preview_display_name_available = preview_peer
+            .and_then(|user| user.display_name.as_deref())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let cached_name_available = self
+            .teams
+            .contact_names
+            .get(&chat.id)
+            .map(String::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+
+        let chat_label_source = if topic_available {
+            "topic"
+        } else if member_display_name_available {
+            "member displayName"
+        } else if preview_display_name_available {
+            "preview sender displayName"
+        } else if member_email_available {
+            "member email"
+        } else {
+            "chatType fallback"
+        }
+        .to_string();
+
+        let list_label_source = if cached_name_available {
+            "cached / learned contact name".to_string()
+        } else {
+            chat_label_source.clone()
+        };
+
         self.contact_diagnostics = ContactDiagnosticsState {
             loading: true,
             member_type,
@@ -2763,8 +2819,20 @@ impl App {
             tenant_relation,
             cross_tenant_candidate,
             presence_supported,
+            current_member_count: chat.members.len(),
+            topic_available,
+            member_display_name_available,
+            member_email_available,
+            preview_present,
+            preview_sender_available,
+            preview_sender_is_peer,
+            preview_display_name_available,
+            cached_name_available,
+            chat_label_source,
+            list_label_source,
             remote: None,
         };
+        self.contact_diagnostics_chat_id = Some(chat_id);
         self.contact_diagnostics_user_id = probe_user_id;
         self.contact_diagnostics_mri = mri_candidate;
         self.contact_diagnostics_lookup_address = lookup_address;
@@ -2778,6 +2846,8 @@ impl App {
 
         let s = self.session.clone();
         let tx = self.tx.clone();
+        let chat_id = self.contact_diagnostics_chat_id.clone();
+        let me_id = self.me.as_ref().map(|me| me.id.clone());
         let user_id = self.contact_diagnostics_user_id.clone();
         let lookup_address = self.contact_diagnostics_lookup_address.clone();
         let mri = self.contact_diagnostics_mri.clone();
@@ -2789,6 +2859,44 @@ impl App {
         let supported = self.contact_diagnostics.presence_supported;
 
         tokio::spawn(async move {
+            let (expanded_name, members_name, messages_name) =
+                if let Some(chat_id) = chat_id.as_deref() {
+                    let expanded_name = match s
+                        .graph
+                        .get_json::<Chat>(&format!(
+                            "me/chats/{chat_id}?$expand=members,lastMessagePreview"
+                        ))
+                        .await
+                    {
+                        Ok(chat) => Ok(crate::diagnostics::contact_chat_name_probe(
+                            &chat,
+                            me_id.as_deref(),
+                        )),
+                        Err(error) => Err(crate::diagnostics::safe_graph_error(&error)),
+                    };
+
+                    let members_name = match chats::list_members(&s.graph, chat_id).await {
+                        Ok(members) => Ok(crate::diagnostics::contact_members_name_probe(
+                            &members,
+                            me_id.as_deref(),
+                        )),
+                        Err(error) => Err(crate::diagnostics::safe_graph_error(&error)),
+                    };
+
+                    let messages_name = match chats::list_messages(&s.graph, chat_id, 25).await {
+                        Ok((messages, _)) => Ok(crate::diagnostics::contact_messages_name_probe(
+                            &messages,
+                            me_id.as_deref(),
+                        )),
+                        Err(error) => Err(crate::diagnostics::safe_graph_error(&error)),
+                    };
+
+                    (expanded_name, members_name, messages_name)
+                } else {
+                    let error = "selected chat id unavailable".to_string();
+                    (Err(error.clone()), Err(error.clone()), Err(error))
+                };
+
             let presence_read_all = match s.auth.access_token().await {
                 Ok(_) => s
                     .auth
@@ -2892,6 +3000,9 @@ impl App {
                         batch,
                         direct,
                         teams,
+                        expanded_name,
+                        members_name,
+                        messages_name,
                     },
                 ))
                 .await;
@@ -3946,12 +4057,7 @@ impl App {
             return false;
         };
 
-        if let Some(name) = peer
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
+        if let Some(name) = peer_display_name_from_messages(messages, me_id) {
             self.teams
                 .contact_names
                 .insert(chat_id.to_string(), name.to_string());
@@ -8740,6 +8846,26 @@ fn parse_vmrss(status: &str) -> Option<u64> {
         .ok()
 }
 
+/// Return the first non-empty displayName found on any message from the peer.
+///
+/// Some external / Microsoft personal-account messages omit displayName while
+/// later messages from the same peer include it. Do not let the first peer
+/// message without a name prevent the application from learning a usable name.
+fn peer_display_name_from_messages<'a>(
+    messages: &'a [ChatMessage],
+    me_id: Option<&str>,
+) -> Option<&'a str> {
+    let me_id = me_id?;
+
+    messages
+        .iter()
+        .filter_map(|message| message.from.as_ref()?.user.as_ref())
+        .filter(|user| user.id.as_deref() != Some(me_id))
+        .filter_map(|user| user.display_name.as_deref())
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+}
+
 /// Chronological sort key for a Teams message: creation time, then id.
 fn sort_key(m: &ChatMessage) -> (i64, u64) {
     let at = m
@@ -8799,6 +8925,56 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
         })
         .copied()
         .collect()
+}
+
+#[cfg(test)]
+mod contact_name_learning_tests {
+    use super::peer_display_name_from_messages;
+    use m365_core::models::ChatMessage;
+
+    fn message(id: &str, sender_id: &str, display_name: Option<&str>) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "from": {
+                "user": {
+                    "id": sender_id,
+                    "displayName": display_name
+                }
+            }
+        }))
+        .expect("valid chat-message fixture")
+    }
+
+    #[test]
+    fn learns_name_from_later_peer_message() {
+        let messages = vec![
+            message("1", "peer", None),
+            message("2", "me", Some("Me")),
+            message("3", "peer", Some("Personal Contact")),
+        ];
+
+        assert_eq!(
+            peer_display_name_from_messages(&messages, Some("me")),
+            Some("Personal Contact")
+        );
+    }
+
+    #[test]
+    fn ignores_empty_peer_names_and_self_names() {
+        let messages = vec![
+            message("1", "me", Some("Me")),
+            message("2", "peer", Some("   ")),
+            message("3", "peer", None),
+        ];
+
+        assert_eq!(peer_display_name_from_messages(&messages, Some("me")), None);
+    }
+
+    #[test]
+    fn requires_signed_in_user_id() {
+        let messages = vec![message("1", "peer", Some("Personal Contact"))];
+        assert_eq!(peer_display_name_from_messages(&messages, None), None);
+    }
 }
 
 #[cfg(test)]

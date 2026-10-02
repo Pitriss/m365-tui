@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local, Utc};
 use m365_core::auth::TokenInfo;
 use m365_core::config::NtfyMode;
+use m365_core::models::{Chat, ChatMessage, ConversationMember};
 use m365_core::work_plan::WorkPlanDiagnostics;
 
 use crate::app::{App, PushState};
@@ -35,12 +36,50 @@ pub enum PresenceProbe {
 }
 
 #[derive(Debug, Clone)]
+pub struct ContactChatNameProbe {
+    pub member_count: usize,
+    pub peer_member_found: bool,
+    pub member_display_name: bool,
+    pub member_email: bool,
+    pub member_user_id_shape: String,
+    pub preview_present: bool,
+    pub preview_sender_present: bool,
+    pub preview_sender_is_peer: bool,
+    pub preview_display_name: bool,
+    pub preview_sender_id_shape: String,
+    pub preview_sender_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactMembersNameProbe {
+    pub member_count: usize,
+    pub peer_member_found: bool,
+    pub member_display_name: bool,
+    pub member_email: bool,
+    pub member_user_id_shape: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactMessagesNameProbe {
+    pub messages_scanned: usize,
+    pub peer_messages: usize,
+    pub peer_messages_with_display_name: usize,
+    pub peer_message_found: bool,
+    pub sender_display_name: bool,
+    pub sender_id_shape: String,
+    pub sender_type: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ContactDiagnosticsRemote {
     pub generated_at: DateTime<Utc>,
     pub presence_read_all: Result<bool, String>,
     pub batch: PresenceProbe,
     pub direct: PresenceProbe,
     pub teams: m365_core::teams_presence::Diagnostics,
+    pub expanded_name: Result<ContactChatNameProbe, String>,
+    pub members_name: Result<ContactMembersNameProbe, String>,
+    pub messages_name: Result<ContactMessagesNameProbe, String>,
 }
 
 #[derive(Debug, Default)]
@@ -61,7 +100,147 @@ pub struct ContactDiagnosticsState {
     pub tenant_relation: String,
     pub cross_tenant_candidate: bool,
     pub presence_supported: bool,
+    pub current_member_count: usize,
+    pub topic_available: bool,
+    pub member_display_name_available: bool,
+    pub member_email_available: bool,
+    pub preview_present: bool,
+    pub preview_sender_available: bool,
+    pub preview_sender_is_peer: bool,
+    pub preview_display_name_available: bool,
+    pub cached_name_available: bool,
+    pub chat_label_source: String,
+    pub list_label_source: String,
     pub remote: Option<ContactDiagnosticsRemote>,
+}
+
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn peer_member<'a>(
+    members: &'a [ConversationMember],
+    me_id: Option<&str>,
+) -> Option<&'a ConversationMember> {
+    members.iter().find(|member| {
+        me_id
+            .map(|id| member.user_id.as_deref() != Some(id))
+            .unwrap_or(true)
+    })
+}
+
+fn safe_identity_type(value: Option<&str>) -> String {
+    let Some(value) = nonempty(value) else {
+        return "missing".into();
+    };
+    if value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        value.to_string()
+    } else {
+        "other".into()
+    }
+}
+
+pub fn contact_chat_name_probe(chat: &Chat, me_id: Option<&str>) -> ContactChatNameProbe {
+    let peer = peer_member(&chat.members, me_id);
+    let preview_user = chat
+        .last_message_preview
+        .as_ref()
+        .and_then(|preview| preview.from.as_ref())
+        .and_then(|from| from.user.as_ref());
+    let preview_sender_is_peer = preview_user.is_some_and(|user| {
+        me_id
+            .map(|id| user.id.as_deref() != Some(id))
+            .unwrap_or(true)
+    });
+
+    ContactChatNameProbe {
+        member_count: chat.members.len(),
+        peer_member_found: peer.is_some(),
+        member_display_name: peer
+            .and_then(|member| nonempty(member.display_name.as_deref()))
+            .is_some(),
+        member_email: peer
+            .and_then(|member| nonempty(member.email.as_deref()))
+            .is_some(),
+        member_user_id_shape: identifier_shape(peer.and_then(|member| member.user_id.as_deref()))
+            .to_string(),
+        preview_present: chat.last_message_preview.is_some(),
+        preview_sender_present: preview_user.is_some(),
+        preview_sender_is_peer,
+        preview_display_name: preview_sender_is_peer
+            && preview_user
+                .and_then(|user| nonempty(user.display_name.as_deref()))
+                .is_some(),
+        preview_sender_id_shape: identifier_shape(preview_user.and_then(|user| user.id.as_deref()))
+            .to_string(),
+        preview_sender_type: safe_identity_type(
+            preview_user.and_then(|user| user.user_identity_type.as_deref()),
+        ),
+    }
+}
+
+pub fn contact_members_name_probe(
+    members: &[ConversationMember],
+    me_id: Option<&str>,
+) -> ContactMembersNameProbe {
+    let peer = peer_member(members, me_id);
+    ContactMembersNameProbe {
+        member_count: members.len(),
+        peer_member_found: peer.is_some(),
+        member_display_name: peer
+            .and_then(|member| nonempty(member.display_name.as_deref()))
+            .is_some(),
+        member_email: peer
+            .and_then(|member| nonempty(member.email.as_deref()))
+            .is_some(),
+        member_user_id_shape: identifier_shape(peer.and_then(|member| member.user_id.as_deref()))
+            .to_string(),
+    }
+}
+
+pub fn contact_messages_name_probe(
+    messages: &[ChatMessage],
+    me_id: Option<&str>,
+) -> ContactMessagesNameProbe {
+    let peers: Vec<_> = messages
+        .iter()
+        .filter_map(|message| message.from.as_ref()?.user.as_ref())
+        .filter(|user| {
+            me_id
+                .map(|id| user.id.as_deref() != Some(id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let named_peer = peers
+        .iter()
+        .copied()
+        .find(|user| nonempty(user.display_name.as_deref()).is_some());
+    let representative_peer = named_peer.or_else(|| peers.first().copied());
+    let peer_messages_with_display_name = peers
+        .iter()
+        .filter(|user| nonempty(user.display_name.as_deref()).is_some())
+        .count();
+
+    ContactMessagesNameProbe {
+        messages_scanned: messages.len(),
+        peer_messages: peers.len(),
+        peer_messages_with_display_name,
+        peer_message_found: !peers.is_empty(),
+        sender_display_name: named_peer.is_some(),
+        sender_id_shape: identifier_shape(
+            representative_peer.and_then(|user| user.id.as_deref()),
+        )
+        .to_string(),
+        sender_type: safe_identity_type(
+            representative_peer.and_then(|user| user.user_identity_type.as_deref()),
+        ),
+    }
 }
 
 fn row(label: &str, value: impl AsRef<str>) -> String {
@@ -412,6 +591,176 @@ pub fn contact_text(app: &App) -> String {
             "○ unavailable"
         },
     ));
+    out.push(String::new());
+
+
+    out.push("Name resolution".into());
+    out.push(row(
+        "Current roster members",
+        state.current_member_count.to_string(),
+    ));
+    out.push(row(
+        "Current topic",
+        yes_no(state.topic_available, "available", "unavailable"),
+    ));
+    out.push(row(
+        "Current member displayName",
+        yes_no(
+            state.member_display_name_available,
+            "available",
+            "unavailable",
+        ),
+    ));
+    out.push(row(
+        "Current member email",
+        yes_no(state.member_email_available, "available", "unavailable"),
+    ));
+    out.push(row(
+        "Current preview",
+        yes_no(state.preview_present, "present", "missing"),
+    ));
+    out.push(row(
+        "Current preview sender",
+        yes_no(state.preview_sender_available, "present", "missing"),
+    ));
+    out.push(row(
+        "Preview sender is peer",
+        yes_no(state.preview_sender_is_peer, "yes", "no / unknown"),
+    ));
+    out.push(row(
+        "Preview sender displayName",
+        yes_no(
+            state.preview_display_name_available,
+            "available",
+            "unavailable",
+        ),
+    ));
+    out.push(row(
+        "Cached / learned name",
+        yes_no(state.cached_name_available, "available", "unavailable"),
+    ));
+    out.push(row(
+        "Chat::label source",
+        if state.chat_label_source.is_empty() {
+            "unknown"
+        } else {
+            &state.chat_label_source
+        },
+    ));
+    out.push(row(
+        "Rendered list source",
+        if state.list_label_source.is_empty() {
+            "unknown"
+        } else {
+            &state.list_label_source
+        },
+    ));
+    out.push(String::new());
+
+    out.push("Fresh Graph name probes".into());
+    match state.remote.as_ref().map(|remote| &remote.expanded_name) {
+        Some(Ok(probe)) => {
+            out.push(row("Expanded chat probe", "● loaded"));
+            out.push(row("Expanded roster members", probe.member_count.to_string()));
+            out.push(row(
+                "Expanded peer member",
+                yes_no(probe.peer_member_found, "found", "missing"),
+            ));
+            out.push(row(
+                "Expanded member displayName",
+                yes_no(probe.member_display_name, "available", "unavailable"),
+            ));
+            out.push(row(
+                "Expanded member email",
+                yes_no(probe.member_email, "available", "unavailable"),
+            ));
+            out.push(row("Expanded member userId", &probe.member_user_id_shape));
+            out.push(row(
+                "Expanded preview",
+                yes_no(probe.preview_present, "present", "missing"),
+            ));
+            out.push(row(
+                "Expanded preview sender",
+                yes_no(probe.preview_sender_present, "present", "missing"),
+            ));
+            out.push(row(
+                "Expanded sender is peer",
+                yes_no(probe.preview_sender_is_peer, "yes", "no / unknown"),
+            ));
+            out.push(row(
+                "Expanded sender displayName",
+                yes_no(probe.preview_display_name, "available", "unavailable"),
+            ));
+            out.push(row("Expanded sender ID", &probe.preview_sender_id_shape));
+            out.push(row("Expanded sender type", &probe.preview_sender_type));
+        }
+        Some(Err(error)) => out.push(row(
+            "Expanded chat probe",
+            format!("× {}", compact_error(error)),
+        )),
+        None => out.push(row(
+            "Expanded chat probe",
+            if state.loading { "? loading" } else { "? not loaded" },
+        )),
+    }
+
+    match state.remote.as_ref().map(|remote| &remote.members_name) {
+        Some(Ok(probe)) => {
+            out.push(row("Dedicated /members probe", "● loaded"));
+            out.push(row("/members roster members", probe.member_count.to_string()));
+            out.push(row(
+                "/members peer member",
+                yes_no(probe.peer_member_found, "found", "missing"),
+            ));
+            out.push(row(
+                "/members displayName",
+                yes_no(probe.member_display_name, "available", "unavailable"),
+            ));
+            out.push(row(
+                "/members email",
+                yes_no(probe.member_email, "available", "unavailable"),
+            ));
+            out.push(row("/members userId", &probe.member_user_id_shape));
+        }
+        Some(Err(error)) => out.push(row(
+            "Dedicated /members probe",
+            format!("× {}", compact_error(error)),
+        )),
+        None => out.push(row(
+            "Dedicated /members probe",
+            if state.loading { "? loading" } else { "? not loaded" },
+        )),
+    }
+
+    match state.remote.as_ref().map(|remote| &remote.messages_name) {
+        Some(Ok(probe)) => {
+            out.push(row("Recent messages probe", "● loaded"));
+            out.push(row("Messages scanned", probe.messages_scanned.to_string()));
+            out.push(row("Peer messages", probe.peer_messages.to_string()));
+            out.push(row(
+                "Peer messages with displayName",
+                probe.peer_messages_with_display_name.to_string(),
+            ));
+            out.push(row(
+                "Recent peer message",
+                yes_no(probe.peer_message_found, "found", "not found"),
+            ));
+            out.push(row(
+                "Any peer sender displayName",
+                yes_no(probe.sender_display_name, "available", "unavailable"),
+            ));
+            out.push(row("Recent sender ID", &probe.sender_id_shape));
+            out.push(row("Recent sender type", &probe.sender_type));
+        }
+        Some(Err(error)) => out.push(row(
+            "Recent messages probe",
+            format!("× {}", compact_error(error)),
+        )),
+        None => out.push(row(
+            "Recent messages probe",
+            if state.loading { "? loading" } else { "? not loaded" },
+        )),
+    }
     out.push(String::new());
 
     out.push("Presence capability".into());
