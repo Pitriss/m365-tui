@@ -1038,6 +1038,10 @@ pub fn text(app: &App) -> String {
         yes_no(app.session.config.teams_file_images, "enabled", "disabled"),
     ));
     out.push(row(
+        "Teams Markdown",
+        yes_no(app.session.config.teams_markdown, "enabled", "disabled"),
+    ));
+    out.push(row(
         "Profile photos",
         yes_no(
             app.session.config.can_read_profile_photos(),
@@ -1154,6 +1158,10 @@ pub fn text(app: &App) -> String {
             "enabled",
             "disabled",
         ),
+    ));
+    out.push(row(
+        "Persistent cache limit",
+        format!("{} MiB", app.session.config.cache_max_mb),
     ));
     let teams_poll = app.teams_poll_diagnostics();
     out.push(row(

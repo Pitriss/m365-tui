@@ -188,6 +188,40 @@ impl CacheDirSource {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheMaxSource {
+    Default,
+    New,
+    DeprecatedOnly,
+    BothSame,
+    BothDifferent {
+        new_value: String,
+        deprecated_value: String,
+    },
+}
+
+impl CacheMaxSource {
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Self::Default | Self::New => None,
+            Self::DeprecatedOnly => Some(
+                "Warning: M365_TEAMS_IMAGE_CACHE_MAX_MB is deprecated.\nPlease use M365_CACHE_MAX_MB instead."
+                    .to_string(),
+            ),
+            Self::BothSame => Some(
+                "Warning: M365_TEAMS_IMAGE_CACHE_MAX_MB is deprecated and duplicates M365_CACHE_MAX_MB.\nPlease remove or comment out M365_TEAMS_IMAGE_CACHE_MAX_MB."
+                    .to_string(),
+            ),
+            Self::BothDifferent {
+                new_value,
+                deprecated_value,
+            } => Some(format!(
+                "Warning: both M365_CACHE_MAX_MB and deprecated M365_TEAMS_IMAGE_CACHE_MAX_MB are set.\nUsing M365_CACHE_MAX_MB={new_value:?}; ignoring M365_TEAMS_IMAGE_CACHE_MAX_MB={deprecated_value:?}.\nPlease remove or comment out M365_TEAMS_IMAGE_CACHE_MAX_MB."
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -244,8 +278,12 @@ pub struct Config {
     pub cache_dir: Option<PathBuf>,
     /// Records which environment variable selected the common cache root.
     pub cache_dir_source: CacheDirSource,
-    /// Maximum persistent Teams image cache size in MiB.
-    pub teams_image_cache_max_mb: u64,
+    /// Maximum size in MiB of evictable persistent cache (Teams images + conversations).
+    pub cache_max_mb: u64,
+    /// Records which environment variable selected the common cache limit.
+    pub cache_max_source: CacheMaxSource,
+    /// Markdown-style formatting for outgoing Teams messages. Enabled by default.
+    pub teams_markdown: bool,
     /// Automatically prefill persistent Teams conversation caches in the background.
     /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
     pub teams_cache_warmup: bool,
@@ -276,6 +314,11 @@ impl Config {
         let deprecated_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR").ok();
         let (cache_dir, cache_dir_source) =
             resolve_cache_dir_values(new_cache_dir.as_deref(), deprecated_cache_dir.as_deref());
+        let new_cache_max = std::env::var("M365_CACHE_MAX_MB").ok();
+        let deprecated_cache_max = std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB").ok();
+        let (cache_max_mb, cache_max_source) =
+            resolve_cache_max_values(new_cache_max.as_deref(), deprecated_cache_max.as_deref())?;
+        let teams_markdown = env_flag_default_on("M365_TEAMS_MARKDOWN");
         let meeting_opener = std::env::var("M365_MEETING_OPENER")
             .ok()
             .map(|value| value.trim().to_string())
@@ -298,19 +341,6 @@ impl Config {
             _ => TEAMS_POLL_BUDGET_DEFAULT_RPS,
         };
         validate_teams_polling(teams_hot_chats, teams_poll_budget_rps)?;
-        let teams_image_cache_max_mb = match std::env::var("M365_TEAMS_IMAGE_CACHE_MAX_MB") {
-            Ok(value) if !value.trim().is_empty() => {
-                let value = value.trim().parse::<u64>().context(
-                    "M365_TEAMS_IMAGE_CACHE_MAX_MB must be a positive integer number of MiB",
-                )?;
-                anyhow::ensure!(
-                    value > 0,
-                    "M365_TEAMS_IMAGE_CACHE_MAX_MB must be greater than zero"
-                );
-                value
-            }
-            _ => 256,
-        };
         let presence_available_timeout_min =
             match std::env::var("M365_PRESENCE_AVAILABLE_TIMEOUT_MIN") {
                 Ok(value) if !value.trim().is_empty() => value.trim().parse::<u64>().context(
@@ -439,7 +469,9 @@ impl Config {
             directory_profile,
             cache_dir,
             cache_dir_source,
-            teams_image_cache_max_mb,
+            cache_max_mb,
+            cache_max_source,
+            teams_markdown,
             teams_cache_warmup,
             teams_hot_chats,
             teams_poll_budget_rps,
@@ -461,8 +493,15 @@ impl Config {
     /// Deferred cache-variable compatibility warning.
     ///
     /// Frontends should print this only after leaving any alternate-screen TUI.
-    pub fn cache_dir_warning(&self) -> Option<String> {
-        self.cache_dir_source.warning()
+    pub fn cache_warning(&self) -> Option<String> {
+        let warnings: Vec<String> = [
+            self.cache_dir_source.warning(),
+            self.cache_max_source.warning(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!warnings.is_empty()).then(|| warnings.join("\n\n"))
     }
 
     /// Whether the token we request can set presence.
@@ -545,6 +584,48 @@ fn resolve_cache_dir_values(
                 deprecated_value: deprecated_value.to_string(),
             },
         ),
+    }
+}
+
+fn resolve_cache_max_values(
+    new_raw: Option<&str>,
+    deprecated_raw: Option<&str>,
+) -> Result<(u64, CacheMaxSource)> {
+    const DEFAULT_MB: u64 = 256;
+
+    let new_raw = new_raw.filter(|value| !value.trim().is_empty());
+    let deprecated_raw = deprecated_raw.filter(|value| !value.trim().is_empty());
+
+    let parse = |name: &str, raw: &str| -> Result<u64> {
+        let value = raw
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be a positive integer number of MiB"))?;
+        anyhow::ensure!(value > 0, "{name} must be greater than zero");
+        Ok(value)
+    };
+
+    match (new_raw, deprecated_raw) {
+        (None, None) => Ok((DEFAULT_MB, CacheMaxSource::Default)),
+        (Some(new_value), None) => Ok((
+            parse("M365_CACHE_MAX_MB", new_value)?,
+            CacheMaxSource::New,
+        )),
+        (None, Some(deprecated_value)) => Ok((
+            parse("M365_TEAMS_IMAGE_CACHE_MAX_MB", deprecated_value)?,
+            CacheMaxSource::DeprecatedOnly,
+        )),
+        (Some(new_value), Some(deprecated_value)) if new_value == deprecated_value => Ok((
+            parse("M365_CACHE_MAX_MB", new_value)?,
+            CacheMaxSource::BothSame,
+        )),
+        (Some(new_value), Some(deprecated_value)) => Ok((
+            parse("M365_CACHE_MAX_MB", new_value)?,
+            CacheMaxSource::BothDifferent {
+                new_value: new_value.to_string(),
+                deprecated_value: deprecated_value.to_string(),
+            },
+        )),
     }
 }
 
@@ -708,7 +789,9 @@ mod tests {
             directory_profile: false,
             cache_dir: None,
             cache_dir_source: CacheDirSource::None,
-            teams_image_cache_max_mb: 256,
+            cache_max_mb: 256,
+            cache_max_source: CacheMaxSource::Default,
+            teams_markdown: true,
             teams_cache_warmup: true,
             teams_hot_chats: TEAMS_HOT_CHATS_DEFAULT,
             teams_poll_budget_rps: TEAMS_POLL_BUDGET_DEFAULT_RPS,
@@ -781,6 +864,64 @@ mod tests {
         .unwrap();
         assert!(different.contains("Using M365_CACHE_DIR=\"/new\""));
         assert!(different.contains("ignoring M365_TEAMS_IMAGE_CACHE_DIR=\"/old\""));
+    }
+
+    #[test]
+    fn resolves_cache_max_priority_and_legacy_fallback() {
+        assert_eq!(
+            resolve_cache_max_values(None, None).unwrap(),
+            (256, CacheMaxSource::Default)
+        );
+        assert_eq!(
+            resolve_cache_max_values(Some(" 512 "), None).unwrap(),
+            (512, CacheMaxSource::New)
+        );
+        assert_eq!(
+            resolve_cache_max_values(None, Some(" 128 ")).unwrap(),
+            (128, CacheMaxSource::DeprecatedOnly)
+        );
+        assert_eq!(
+            resolve_cache_max_values(Some("64"), Some("64")).unwrap(),
+            (64, CacheMaxSource::BothSame)
+        );
+        assert_eq!(
+            resolve_cache_max_values(Some("32"), Some("64")).unwrap(),
+            (
+                32,
+                CacheMaxSource::BothDifferent {
+                    new_value: "32".into(),
+                    deprecated_value: "64".into(),
+                }
+            )
+        );
+        assert!(resolve_cache_max_values(Some("0"), None).is_err());
+        assert!(resolve_cache_max_values(None, Some("bogus")).is_err());
+        assert_eq!(
+            resolve_cache_max_values(Some("32"), Some("bogus")).unwrap().0,
+            32,
+            "deprecated value is ignored when the new value wins"
+        );
+    }
+
+    #[test]
+    fn cache_max_warnings_cover_deprecated_configurations() {
+        assert!(CacheMaxSource::Default.warning().is_none());
+        assert!(CacheMaxSource::New.warning().is_none());
+        assert!(CacheMaxSource::DeprecatedOnly
+            .warning()
+            .unwrap()
+            .contains("M365_CACHE_MAX_MB"));
+        assert!(CacheMaxSource::BothSame
+            .warning()
+            .unwrap()
+            .contains("duplicates M365_CACHE_MAX_MB"));
+        assert!(CacheMaxSource::BothDifferent {
+            new_value: "32".into(),
+            deprecated_value: "64".into(),
+        }
+        .warning()
+        .unwrap()
+        .contains("ignoring M365_TEAMS_IMAGE_CACHE_MAX_MB=\"64\""));
     }
 
     #[test]

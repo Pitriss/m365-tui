@@ -2357,6 +2357,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  /help               show this command list
  /help all           show full application/key help
 
+ Formatting: **bold**  *italic*  ~~strike~~  `code`
+             > quote   - list item   [text](https://url)
+
  Commands that act on a message use the currently selected ▶ message.";
 
             let lines: Vec<Line<'static>> = text
@@ -2404,6 +2407,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           /topic <text> (group only) · /rename <name> (group only)\n\
           /edit <text> · /pin · /unpin · /pins · /unread · /delete\n\
           /help commands only · /help all full help\n\
+          Markdown: **bold** · *italic* · ~~strike~~ · `code` · > quote · - list · [text](url)\n\
  \n\
  Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
            a accept · d decline · t tentative · r refresh · w range · v month\n\
@@ -2996,10 +3000,15 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 .unwrap_or_else(|| "(none)".to_string());
             body.push_str(&format!("Status message: {status_message}\n\n"));
             for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
-                body.push_str(&format!("{}  {}\n", i + 1, opt.label));
+                let label = if i == 0 && app.session.config.presence_primary {
+                    "Available (automatic)"
+                } else {
+                    opt.label
+                };
+                body.push_str(&format!("{}  {}\n", i + 1, label));
             }
             body.push_str(
-                "\nm  Set/edit status message\nc  Clear status message\na  Clear presence (revert to automatic)\nEsc cancel",
+                "\nm  Set/edit status message\nc  Clear status message\na  Automatic (clear manual presence)\nEsc cancel",
             );
             if !app.session.config.can_write_presence() {
                 body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");

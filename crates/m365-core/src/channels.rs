@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::graph::GraphClient;
 use crate::models::{Channel, ChatMessage, Team};
+use crate::teams_format::outgoing_body;
 
 /// Teams the signed-in user has joined.
 pub async fn joined_teams(graph: &GraphClient) -> Result<Vec<Team>> {
@@ -50,8 +51,15 @@ pub async fn send_reply(
     channel_id: &str,
     message_id: &str,
     text: &str,
+    markdown: bool,
 ) -> Result<ChatMessage> {
-    let payload = json!({ "body": { "contentType": "text", "content": text } });
+    let body = outgoing_body(text, markdown);
+    let payload = json!({
+        "body": {
+            "contentType": body.content_type,
+            "content": body.content,
+        }
+    });
     graph
         .post_json(
             &format!("teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"),
@@ -82,8 +90,15 @@ pub async fn send_message(
     team_id: &str,
     channel_id: &str,
     text: &str,
+    markdown: bool,
 ) -> Result<ChatMessage> {
-    let payload = json!({ "body": { "contentType": "text", "content": text } });
+    let body = outgoing_body(text, markdown);
+    let payload = json!({
+        "body": {
+            "contentType": body.content_type,
+            "content": body.content,
+        }
+    });
     graph
         .post_json(
             &format!("teams/{team_id}/channels/{channel_id}/messages"),

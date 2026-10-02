@@ -629,7 +629,8 @@ Inside the presence picker:
 
 | Key | Action |
 |---|---|
-| `1`-`6` | Set Available, Busy, Do not disturb, Be right back, Away, or Appear offline |
+| `1` | Available; with primary presence enabled, clear the manual preferred override and return to automatic Available/Away |
+| `2`-`6` | Set Busy, Do not disturb, Be right back, Away, or Appear offline as manual preferred presence |
 | `m` | Set or edit the Teams status message |
 | `c` | Clear the Teams status message |
 | `x` | Alias for clearing the Teams status message |
@@ -652,6 +653,9 @@ M365_PRESENCE_PRIMARY=1
 This also requires `Presence.ReadWrite`.
 
 The application refreshes the session while running and clears it when exiting.
+Available sessions are refreshed every four minutes because Microsoft Graph
+applies a separate five-minute activity timeout to `Available/Available`;
+non-Available sessions keep the lower-frequency lease renewal.
 
 Application-session writes are serialized. m365-tui tracks the desired target
 separately from the last Graph-confirmed target, allows only one app-session
@@ -831,12 +835,17 @@ Protect the cache directory accordingly.
 #### Cache size
 
 ```dotenv
-M365_TEAMS_IMAGE_CACHE_MAX_MB=256
+M365_CACHE_MAX_MB=256
 ```
 
-controls the persistent image-cache size.
+sets one shared limit for evictable persistent cache data: Teams image entries
+and `conversations/*.json`. Pruning removes the oldest evictable entries until
+their combined size is within the limit. UI state and Stay archived state are
+intentionally excluded from both accounting and pruning.
 
-The default is 256 MiB.
+The default is 256 MiB. `M365_TEAMS_IMAGE_CACHE_MAX_MB` remains a deprecated
+backward-compatible fallback. If both are set, `M365_CACHE_MAX_MB` wins;
+deprecated usage is reported after the TUI exits.
 
 #### Conversation cache warm-up
 
@@ -990,6 +999,13 @@ Deleted and filtered system-event rows are skipped during message navigation.
 | `Ctrl+Left` / `Ctrl+Right` | Move by word |
 | `Home` / `End` | Start/end of line |
 | `Ctrl+Home` / `Ctrl+End` | Start/end of text |
+
+Outgoing Teams messages support a safe Markdown-style subset by default:
+`**bold**`, `*italic*`, `~~strike~~`, inline `` `code` ``, fenced code blocks,
+`> quote`, `- list item`, and `[text](https://url)`. Raw HTML is escaped. Plain
+messages with no formatting remain Graph `text` bodies. Set
+`M365_TEAMS_MARKDOWN=0` (also `false`, `no`, or `off`) to opt out. The same
+formatting path is used for send, reply, `e` edit, and `/edit`.
 
 #### Teams chat slash commands
 

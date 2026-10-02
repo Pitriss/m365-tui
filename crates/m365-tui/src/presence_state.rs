@@ -455,6 +455,35 @@ mod tests {
     }
 
     #[test]
+    fn clearing_manual_available_resumes_automatic_idle_round_trip() {
+        let now = Instant::now();
+        let mut state = PresenceStateManager::new(true);
+
+        state.set_manual(Some(AVAILABLE));
+        assert_eq!(state.diagnostics(now).mode, PresenceMode::Manual);
+        assert_eq!(
+            state.diagnostics(now).desired,
+            SessionTarget::Present(AVAILABLE)
+        );
+
+        state.clear_manual(true, now + Duration::from_secs(1));
+        assert_eq!(state.diagnostics(now).mode, PresenceMode::Automatic);
+        assert_eq!(
+            state.diagnostics(now).desired,
+            SessionTarget::Present(AVAILABLE)
+        );
+
+        state.on_idle(true);
+        assert_eq!(state.diagnostics(now).desired, SessionTarget::Present(AWAY));
+
+        state.on_activity(now + Duration::from_secs(2));
+        assert_eq!(
+            state.diagnostics(now).desired,
+            SessionTarget::Present(AVAILABLE)
+        );
+    }
+
+    #[test]
     fn idle_restores_saved_automatic_session() {
         let now = Instant::now();
         let mut state = PresenceStateManager::new(true);

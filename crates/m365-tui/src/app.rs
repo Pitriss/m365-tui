@@ -456,11 +456,51 @@ pub const PRESENCE_OPTIONS: &[PresenceOption] = &[
     },
 ];
 
-/// How long each presence session is asserted for, and how often it is renewed.
-/// Graph allows PT5M–PT4H; a one-hour lease with a 30-minute refresh keeps it
-/// alive while the app runs without leaving a long stale status if it dies.
+/// How long each presence session is asserted for.
 pub const PRESENCE_SESSION_LEASE: &str = "PT1H";
-pub const PRESENCE_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Graph applies a separate five-minute activity timeout to Available sessions.
+/// Refresh with a one-minute safety margin so Available cannot fade to
+/// AvailableInactive/Away while m365-tui still considers the session active.
+pub const PRESENCE_AVAILABLE_RENEW_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(4 * 60);
+
+/// Non-Available sessions do not have Graph's five-minute Available activity
+/// timeout, so keep the existing low-frequency lease renewal for them.
+pub const PRESENCE_RENEW_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+fn presence_renew_after(target: SessionTarget) -> std::time::Duration {
+    if target == SessionTarget::Present(AVAILABLE) {
+        PRESENCE_AVAILABLE_RENEW_AFTER
+    } else {
+        PRESENCE_RENEW_AFTER
+    }
+}
+
+#[cfg(test)]
+mod presence_renewal_tests {
+    use super::*;
+
+    #[test]
+    fn available_session_renews_before_graph_activity_timeout() {
+        let graph_available_timeout = std::time::Duration::from_secs(5 * 60);
+
+        assert_eq!(
+            presence_renew_after(SessionTarget::Present(AVAILABLE)),
+            PRESENCE_AVAILABLE_RENEW_AFTER
+        );
+        assert!(PRESENCE_AVAILABLE_RENEW_AFTER < graph_available_timeout);
+        assert_eq!(
+            presence_renew_after(SessionTarget::Present(AWAY)),
+            PRESENCE_RENEW_AFTER
+        );
+        assert_eq!(
+            presence_renew_after(SessionTarget::Present(("Busy", "InACall"))),
+            PRESENCE_RENEW_AFTER
+        );
+    }
+}
 
 #[allow(clippy::enum_variant_names)] // the "Mail" suffix distinguishes from Teams compose
 pub enum ComposeKind {
@@ -1452,6 +1492,7 @@ fn store_teams_conversation_cache(
     cache_root: &std::path::Path,
     chat_id: &str,
     messages: &[ChatMessage],
+    max_bytes: u64,
 ) -> std::io::Result<()> {
     let cache_dir = cache_root.join(TEAMS_CONVERSATION_CACHE_DIR);
     create_private_cache_dir(&cache_dir)?;
@@ -1485,7 +1526,8 @@ fn store_teams_conversation_cache(
     if final_path.exists() {
         std::fs::remove_file(&final_path)?;
     }
-    std::fs::rename(temp_path, final_path)
+    std::fs::rename(temp_path, final_path)?;
+    prune_persistent_cache(cache_root, max_bytes)
 }
 
 fn teams_disk_cache_key(key: &TeamsImageKey) -> String {
@@ -2035,67 +2077,180 @@ fn load_teams_disk_cache(
     Ok(Some(images))
 }
 
-fn prune_teams_disk_cache(dir: &std::path::Path, max_bytes: u64) -> std::io::Result<()> {
+fn prune_persistent_cache(cache_root: &std::path::Path, max_bytes: u64) -> std::io::Result<()> {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
+    #[derive(Debug)]
+    enum Kind {
+        Image(String),
+        Conversation(std::path::PathBuf),
+    }
+
     #[derive(Default)]
-    struct Entry {
+    struct ImageEntry {
         size: u64,
         modified: Option<SystemTime>,
     }
 
-    let mut grouped: HashMap<String, Entry> = HashMap::new();
+    struct Entry {
+        kind: Kind,
+        size: u64,
+        modified: SystemTime,
+    }
 
-    for item in std::fs::read_dir(dir)? {
-        let item = item?;
-        let metadata = match item.metadata() {
-            Ok(metadata) if metadata.is_file() => metadata,
-            _ => continue,
-        };
-        let name = item.file_name();
-        let name = name.to_string_lossy();
+    let mut image_groups: HashMap<String, ImageEntry> = HashMap::new();
+    if let Ok(items) = std::fs::read_dir(cache_root) {
+        for item in items.flatten() {
+            let metadata = match item.metadata() {
+                Ok(metadata) if metadata.is_file() => metadata,
+                _ => continue,
+            };
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            if name.len() < TEAMS_DISK_CACHE_KEY_HEX_LEN {
+                continue;
+            }
+            let key = &name[..TEAMS_DISK_CACHE_KEY_HEX_LEN];
+            if !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let delimiter = name.as_bytes().get(TEAMS_DISK_CACHE_KEY_HEX_LEN).copied();
+            if !matches!(delimiter, Some(b'.') | Some(b'-')) {
+                continue;
+            }
 
-        if name.len() < TEAMS_DISK_CACHE_KEY_HEX_LEN {
-            continue;
-        }
-        let key = &name[..TEAMS_DISK_CACHE_KEY_HEX_LEN];
-        if !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        let delimiter = name.as_bytes().get(TEAMS_DISK_CACHE_KEY_HEX_LEN).copied();
-        if !matches!(delimiter, Some(b'.') | Some(b'-')) {
-            continue;
-        }
-
-        let entry = grouped.entry(key.to_string()).or_default();
-        entry.size = entry.size.saturating_add(metadata.len());
-        if let Ok(modified) = metadata.modified() {
-            if entry.modified.is_none_or(|current| modified > current) {
-                entry.modified = Some(modified);
+            let entry = image_groups.entry(key.to_string()).or_default();
+            entry.size = entry.size.saturating_add(metadata.len());
+            if let Ok(modified) = metadata.modified() {
+                if entry.modified.is_none_or(|current| modified > current) {
+                    entry.modified = Some(modified);
+                }
             }
         }
     }
 
-    let mut total = grouped
-        .values()
+    let mut entries = Vec::new();
+    for (key, entry) in image_groups {
+        entries.push(Entry {
+            kind: Kind::Image(key),
+            size: entry.size,
+            modified: entry.modified.unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+
+    let conversations = cache_root.join(TEAMS_CONVERSATION_CACHE_DIR);
+    if let Ok(items) = std::fs::read_dir(&conversations) {
+        for item in items.flatten() {
+            let metadata = match item.metadata() {
+                Ok(metadata) if metadata.is_file() => metadata,
+                _ => continue,
+            };
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            let Some(key) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if key.len() != TEAMS_DISK_CACHE_KEY_HEX_LEN
+                || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            entries.push(Entry {
+                kind: Kind::Conversation(item.path()),
+                size: metadata.len(),
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
+
+    let mut total = entries
+        .iter()
         .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
     if total <= max_bytes {
         return Ok(());
     }
 
-    let mut entries: Vec<_> = grouped.into_iter().collect();
-    entries.sort_by_key(|(_, entry)| entry.modified.unwrap_or(SystemTime::UNIX_EPOCH));
-
-    for (key, entry) in entries {
+    entries.sort_by_key(|entry| entry.modified);
+    for entry in entries {
         if total <= max_bytes {
             break;
         }
-        remove_teams_disk_cache_entry(dir, &key);
+        match entry.kind {
+            Kind::Image(key) => remove_teams_disk_cache_entry(cache_root, &key),
+            Kind::Conversation(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         total = total.saturating_sub(entry.size);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod persistent_cache_pruning_tests {
+    use super::*;
+
+    #[test]
+    fn combined_image_and_conversation_cache_respects_one_limit() {
+        let unique = format!(
+            "m365-cache-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let conversations = root.join(TEAMS_CONVERSATION_CACHE_DIR);
+        std::fs::create_dir_all(&conversations).unwrap();
+
+        let image_key = "11111111111111111111111111111111";
+        std::fs::write(root.join(format!("{image_key}.meta")), vec![b'x'; 40]).unwrap();
+        std::fs::write(root.join(format!("{image_key}-0.png")), vec![b'x'; 40]).unwrap();
+        std::fs::write(
+            conversations.join("22222222222222222222222222222222.json"),
+            vec![b'y'; 80],
+        )
+        .unwrap();
+        std::fs::write(
+            conversations.join("33333333333333333333333333333333.json"),
+            vec![b'z'; 80],
+        )
+        .unwrap();
+
+        std::fs::write(root.join(UI_STATE_FILE), vec![b'u'; 300]).unwrap();
+        std::fs::write(root.join(STAY_ARCHIVED_STATE_FILE), vec![b's'; 300]).unwrap();
+
+        prune_persistent_cache(&root, 200).unwrap();
+
+        let image_size = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with(image_key) {
+                    return None;
+                }
+                entry.metadata().ok().filter(|metadata| metadata.is_file()).map(|metadata| metadata.len())
+            })
+            .sum::<u64>();
+        let conversation_size = std::fs::read_dir(&conversations)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+
+        assert!(image_size + conversation_size <= 200);
+        assert!(root.join(UI_STATE_FILE).exists());
+        assert!(root.join(STAY_ARCHIVED_STATE_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 fn store_teams_disk_cache(
@@ -2152,7 +2307,7 @@ fn store_teams_disk_cache(
     }
     std::fs::rename(&temp_meta, &meta_path)?;
 
-    prune_teams_disk_cache(dir, max_bytes)
+    prune_persistent_cache(dir, max_bytes)
 }
 
 fn reference_image_files(message: &ChatMessage) -> Vec<(String, String)> {
@@ -3115,9 +3270,11 @@ impl App {
     fn pump_presence_session_write(&mut self) {
         let force_sync = self.presence_preference_pending.is_some();
         let now = std::time::Instant::now();
+        let desired = self.presence_state.diagnostics(now).desired;
+        let renew_after = presence_renew_after(desired);
         let Some(write) = self
             .presence_state
-            .next_write(now, PRESENCE_RENEW_AFTER, force_sync)
+            .next_write(now, renew_after, force_sync)
         else {
             return;
         };
@@ -3332,6 +3489,21 @@ impl App {
     /// Apply a chosen status. Preferred presence and the app-session update are
     /// performed by one serialized presence operation, preserving their order.
     fn set_presence(&mut self, opt: &'static PresenceOption) {
+        if self.session.config.presence_primary
+            && opt.preferred == AVAILABLE
+            && opt.session == Some(AVAILABLE)
+        {
+            tracing::debug!(
+                "Available selected with primary presence; clearing preferred override and resuming automatic presence"
+            );
+            self.status = "returning to automatic Available/Away presence…".into();
+            self.presence_state
+                .clear_manual(true, std::time::Instant::now());
+            self.presence_preference_pending = Some(PresencePreferenceAction::Clear);
+            self.pump_presence_session_write();
+            return;
+        }
+
         self.presence_state.set_manual(opt.session);
         let (availability, activity) = opt.preferred;
         self.presence_preference_pending = Some(PresencePreferenceAction::Set {
@@ -3817,6 +3989,7 @@ impl App {
         let s = self.session.clone();
         let tx = self.tx.clone();
         let limiter = self.teams_background_limiter.clone();
+        let cache_max_bytes = self.session.config.cache_max_mb.saturating_mul(1024 * 1024);
 
         tokio::spawn(async move {
             for (chat_id, latest_id) in ordered {
@@ -3897,7 +4070,12 @@ impl App {
                 let write_chat_id = chat_id.clone();
                 let write_messages = oldest_first;
                 match tokio::task::spawn_blocking(move || {
-                    store_teams_conversation_cache(&write_root, &write_chat_id, &write_messages)
+                    store_teams_conversation_cache(
+                        &write_root,
+                        &write_chat_id,
+                        &write_messages,
+                        cache_max_bytes,
+                    )
                 })
                 .await
                 {
@@ -4612,11 +4790,17 @@ impl App {
 
         let chat_id = chat_id.to_string();
         let messages = self.teams.messages.clone();
+        let cache_max_bytes = self.session.config.cache_max_mb.saturating_mul(1024 * 1024);
 
         tokio::spawn(async move {
             let cache_chat_id = chat_id.clone();
             match tokio::task::spawn_blocking(move || {
-                store_teams_conversation_cache(&cache_root, &cache_chat_id, &messages)
+                store_teams_conversation_cache(
+                    &cache_root,
+                    &cache_chat_id,
+                    &messages,
+                    cache_max_bytes,
+                )
             })
             .await
             {
@@ -5159,7 +5343,7 @@ impl App {
                 let disk_cache_dir = s.config.cache_dir.clone();
                 let disk_cache_max_bytes = s
                     .config
-                    .teams_image_cache_max_mb
+                    .cache_max_mb
                     .saturating_mul(1024 * 1024);
                 let disk_cache_key = teams_disk_cache_key(&task_key);
 
@@ -5457,7 +5641,7 @@ impl App {
     fn send_chat_message(&mut self, chat_id: String, text: String) {
         let s = self.session.clone();
         self.spawn(async move {
-            chats::send_message(&s.graph, &chat_id, &text).await?;
+            chats::send_message(&s.graph, &chat_id, &text, s.config.teams_markdown).await?;
             Ok(AppMessage::ChatMessageSent {
                 chat_id,
                 status: "message sent".into(),
@@ -5468,7 +5652,14 @@ impl App {
     fn send_channel_message(&self, team_id: String, channel_id: String, text: String) {
         let s = self.session.clone();
         self.spawn(async move {
-            channels::send_message(&s.graph, &team_id, &channel_id, &text).await?;
+            channels::send_message(
+                &s.graph,
+                &team_id,
+                &channel_id,
+                &text,
+                s.config.teams_markdown,
+            )
+            .await?;
             Ok(AppMessage::Done("message posted".into()))
         });
     }
@@ -6472,6 +6663,7 @@ impl App {
 
         let chat_id = chat_id.to_string();
         let fresh = messages.to_vec();
+        let cache_max_bytes = self.session.config.cache_max_mb.saturating_mul(1024 * 1024);
 
         tokio::spawn(async move {
             let cache_chat_id = chat_id.clone();
@@ -6495,7 +6687,12 @@ impl App {
                 }
                 newest_first.truncate(MAX_TEAMS_CACHED_MESSAGES);
                 newest_first.reverse();
-                store_teams_conversation_cache(&cache_root, &cache_chat_id, &newest_first)
+                store_teams_conversation_cache(
+                    &cache_root,
+                    &cache_chat_id,
+                    &newest_first,
+                    cache_max_bytes,
+                )
             })
             .await
             {
@@ -8306,7 +8503,14 @@ impl App {
             let s = self.session.clone();
             self.status = "saving message edit…".into();
             self.spawn(async move {
-                chats::edit_message(&s.graph, &chat_id, &message_id, &text).await?;
+                chats::edit_message(
+                    &s.graph,
+                    &chat_id,
+                    &message_id,
+                    &text,
+                    s.config.teams_markdown,
+                )
+                .await?;
                 Ok(AppMessage::Done("message edited".into()))
             });
             return;
@@ -8344,7 +8548,14 @@ impl App {
                 let s = self.session.clone();
                 self.status = format!("replying to {author}…");
                 self.spawn(async move {
-                    chats::send_reply(&s.graph, &chat_id, &original, &text).await?;
+                    chats::send_reply(
+                        &s.graph,
+                        &chat_id,
+                        &original,
+                        &text,
+                        s.config.teams_markdown,
+                    )
+                    .await?;
                     Ok(AppMessage::ChatMessageSent {
                         chat_id,
                         status: "reply sent".into(),
@@ -8362,8 +8573,15 @@ impl App {
                 let s = self.session.clone();
                 self.status = "replying…".into();
                 self.spawn(async move {
-                    channels::send_reply(&s.graph, &team_id, &channel_id, &message_id, &text)
-                        .await?;
+                    channels::send_reply(
+                        &s.graph,
+                        &team_id,
+                        &channel_id,
+                        &message_id,
+                        &text,
+                        s.config.teams_markdown,
+                    )
+                    .await?;
                     Ok(AppMessage::Done("reply sent".into()))
                 });
             }
@@ -8574,7 +8792,14 @@ impl App {
                 let s = self.session.clone();
                 self.status = "saving message edit…".into();
                 self.spawn(async move {
-                    chats::edit_message(&s.graph, &chat_id, &message_id, &text).await?;
+                    chats::edit_message(
+                    &s.graph,
+                    &chat_id,
+                    &message_id,
+                    &text,
+                    s.config.teams_markdown,
+                )
+                .await?;
                     Ok(AppMessage::Done("message edited".into()))
                 });
             }

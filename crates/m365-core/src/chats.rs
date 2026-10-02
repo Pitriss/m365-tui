@@ -6,6 +6,7 @@ use serde_json::json;
 use crate::graph::{DeltaPage, GraphClient};
 use crate::models::{Chat, ChatMessage, ConversationMember};
 use crate::util::base64_url_no_pad;
+use crate::teams_format::outgoing_body;
 use crate::util::html_escape;
 
 /// List the signed-in user's chats, most-recently-updated first, with member
@@ -207,9 +208,20 @@ pub async fn delta_messages(
     graph.delta(&path).await
 }
 
-/// Send a plain-text message to a chat.
-pub async fn send_message(graph: &GraphClient, chat_id: &str, text: &str) -> Result<ChatMessage> {
-    let payload = json!({ "body": { "contentType": "text", "content": text } });
+/// Send a message to a chat, optionally applying the safe Markdown subset.
+pub async fn send_message(
+    graph: &GraphClient,
+    chat_id: &str,
+    text: &str,
+    markdown: bool,
+) -> Result<ChatMessage> {
+    let body = outgoing_body(text, markdown);
+    let payload = json!({
+        "body": {
+            "contentType": body.content_type,
+            "content": body.content,
+        }
+    });
     graph
         .post_json(&format!("me/chats/{chat_id}/messages"), &payload)
         .await
@@ -222,20 +234,22 @@ pub async fn set_topic(graph: &GraphClient, chat_id: &str, topic: &str) -> Resul
         .await
 }
 
-/// Replace the body of a chat message with plain text.
+/// Replace the body of a chat message, optionally applying the safe Markdown subset.
 pub async fn edit_message(
     graph: &GraphClient,
     chat_id: &str,
     message_id: &str,
     text: &str,
+    markdown: bool,
 ) -> Result<()> {
+    let body = outgoing_body(text, markdown);
     graph
         .patch(
             &format!("chats/{chat_id}/messages/{message_id}"),
             &json!({
                 "body": {
-                    "contentType": "text",
-                    "content": text
+                    "contentType": body.content_type,
+                    "content": body.content
                 }
             }),
         )
@@ -323,8 +337,11 @@ pub async fn send_reply(
     chat_id: &str,
     original: &ChatMessage,
     text: &str,
+    markdown: bool,
 ) -> Result<ChatMessage> {
     let message_id = &original.id;
+    let formatted = outgoing_body(text, markdown);
+    let formatted_html = formatted.html_fragment();
     let preview: String = original.text_preview(250);
     let sender = json!({
         "user": {
@@ -344,8 +361,7 @@ pub async fn send_reply(
         "body": {
             "contentType": "html",
             "content": format!(
-                "<attachment id=\"{message_id}\"></attachment><p>{}</p>",
-                html_escape(text)
+                "<attachment id=\"{message_id}\"></attachment>{formatted_html}"
             ),
         },
         "attachments": [{
@@ -365,10 +381,9 @@ pub async fn send_reply(
         Err(e) => {
             tracing::warn!("native reply rejected, sending as a quote instead: {e:#}");
             let quoted = format!(
-                "<blockquote><b>{}</b><br>{}</blockquote><p>{}</p>",
+                "<blockquote><b>{}</b><br>{}</blockquote>{formatted_html}",
                 html_escape(&original.author()),
                 html_escape(&preview),
-                html_escape(text),
             );
             graph
                 .post_json(

@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let cache_dir_warning = session.config.cache_dir_warning();
+    let cache_warning = session.config.cache_warning();
 
     // The Teams resource-consent diagnostic is intentionally isolated from
     // the normal Graph login/cache. It never writes the primary token cache and
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
             &result.existing_refresh_token,
         );
         println!("Primary Graph token cache: untouched");
-        if let Some(warning) = cache_dir_warning.as_deref() {
+        if let Some(warning) = cache_warning.as_deref() {
             eprintln!("\n{warning}");
         }
         return Ok(());
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
 
     // Never print cache-variable compatibility warnings while the alternate
     // screen is active. For TUI mode run_tui() has already restored the terminal.
-    if let Some(warning) = cache_dir_warning.as_deref() {
+    if let Some(warning) = cache_warning.as_deref() {
         eprintln!("\n{warning}");
     }
 
