@@ -345,6 +345,7 @@ M365_CLIENT_ID=00000000-0000-0000-0000-000000000000
 | `M365_TEAMS_IMAGE_CACHE_DIR` | unset | Deprecated fallback for `M365_CACHE_DIR` |
 | `M365_GRAPH_BASE` | Microsoft Graph | Alternate Graph endpoint, mainly for testing |
 | `M365_NOTIFY` | enabled | Set to `0`, `false`, `no`, or `off` to disable desktop notifications |
+| `M365_TEAMS_APPLICATION_HIGH_PRIORITY` | disabled | Give eligible Teams application/bot notifications desktop critical urgency and ntfy priority 4 (high) |
 | `M365_NTFY` | `never` | ntfy forwarding mode: `never`, `always`, `away`, `alwayswd`, or `awaywd` |
 | `M365_NTFY_SERVER` | unset | ntfy server root URL; required when ntfy forwarding is enabled |
 | `M365_NTFY_TOPIC` | unset | ntfy topic; required when ntfy forwarding is enabled |
@@ -454,6 +455,25 @@ Files.Read.All
 
 When enabled, m365-tui resolves supported JPEG, PNG, and GIF attachments and can
 display them through the terminal image renderer.
+
+#### Teams application/bot notification priority
+
+Teams messages whose Graph sender is `from.application` are treated as normal
+incoming messages for unread counting and adaptive chat polling instead of being
+discarded for lacking a `from.user` id. The application display name is also
+used as the notification sender when Graph provides one.
+
+To raise the priority of notifications that are already eligible under the
+normal direct-message/mention rules:
+
+```dotenv
+M365_TEAMS_APPLICATION_HIGH_PRIORITY=1
+```
+
+With this enabled, desktop delivery uses `notify-send --urgency=critical` and
+ntfy delivery uses priority `4` (`high`). It does not bypass `M365_NOTIFY`,
+the ntfy forwarding/snooze policy, or the normal rule that group/meeting chats
+notify only when you are mentioned.
 
 #### Teams system events
 

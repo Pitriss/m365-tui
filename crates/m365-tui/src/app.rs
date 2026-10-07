@@ -27,6 +27,7 @@ use crate::diagnostics::{
 };
 use crate::editor::TextInput;
 use crate::navigation;
+use crate::notify::NotificationPriority;
 use crate::presence_state::{
     PresenceStateDiagnostics, PresenceStateManager, PresenceWrite, SessionTarget, WriteReason,
     AVAILABLE, AWAY,
@@ -801,6 +802,25 @@ pub fn teams_chat_is_hidden(chat: &Chat) -> bool {
         .as_ref()
         .and_then(|viewpoint| viewpoint.is_hidden)
         .unwrap_or(false)
+}
+
+fn teams_message_is_incoming(message: &ChatMessage, me_id: Option<&str>) -> bool {
+    if message.deleted_date_time.is_some() || message.is_system_event() {
+        return false;
+    }
+
+    let Some(from) = message.from.as_ref() else {
+        return false;
+    };
+
+    if let Some(user) = from.user.as_ref() {
+        return match (user.id.as_deref(), me_id) {
+            (Some(sender_id), Some(me_id)) => sender_id != me_id,
+            _ => true,
+        };
+    }
+
+    from.application.is_some()
 }
 
 fn teams_chat_is_archived(
@@ -3890,7 +3910,7 @@ impl App {
         }
 
         for (title, body) in external {
-            self.send_notification("Calendar", title, body);
+            self.send_notification("Calendar", title, body, NotificationPriority::Normal);
         }
 
         if let Some(first) = internal.first() {
@@ -4696,14 +4716,7 @@ impl App {
                             break;
                         }
 
-                        if message.deleted_date_time.is_some()
-                            || message.author_id().is_none()
-                            || message.author_id() == Some(me_id.as_str())
-                            || message
-                                .message_type
-                                .as_deref()
-                                .is_some_and(|kind| kind.eq_ignore_ascii_case("systemEventMessage"))
-                        {
+                        if !teams_message_is_incoming(&message, Some(me_id.as_str())) {
                             continue;
                         }
 
@@ -6749,23 +6762,13 @@ impl App {
 
         let my_id = self.me.as_ref().map(|me| me.id.clone());
         let my_name = self.me.as_ref().and_then(|me| me.display_name.clone());
-        let from_id = message
+        if !teams_message_is_incoming(message, my_id.as_deref()) {
+            return;
+        }
+        let application_sender = message
             .from
             .as_ref()
-            .and_then(|from| from.user.as_ref())
-            .and_then(|user| user.id.as_deref());
-
-        // Our own send still keeps the chat hot, but never creates unread state
-        // or a notification.
-        if from_id.is_some() && from_id == my_id.as_deref() {
-            return;
-        }
-        if message.deleted_date_time.is_some()
-            || message.author_id().is_none()
-            || message.is_system_event()
-        {
-            return;
-        }
+            .is_some_and(|from| from.application.is_some());
 
         let Some(chat) = self.teams.chats.iter().find(|chat| chat.id == chat_id) else {
             return;
@@ -6814,8 +6817,8 @@ impl App {
         let who = message
             .from
             .as_ref()
-            .and_then(|from| from.user.as_ref())
-            .and_then(|user| user.display_name.clone())
+            .and_then(|from| from.user.as_ref().or(from.application.as_ref()))
+            .and_then(|sender| sender.display_name.clone())
             .unwrap_or(fallback_label);
         let title = if mentioned {
             format!("{who} mentioned you")
@@ -6823,7 +6826,14 @@ impl App {
             who
         };
         let plain = content::plain(&content::render_body(None, &body).text);
-        self.send_notification("Teams", title, plain);
+        let priority = if application_sender
+            && self.session.config.teams_application_high_priority
+        {
+            NotificationPriority::High
+        } else {
+            NotificationPriority::Normal
+        };
+        self.send_notification("Teams", title, plain, priority);
 
         if self.notified.len() > 1000 {
             self.notified.clear();
@@ -7330,9 +7340,15 @@ impl App {
         )
     }
 
-    fn send_notification(&self, category: &'static str, title: String, body: String) {
+    fn send_notification(
+        &self,
+        category: &'static str,
+        title: String,
+        body: String,
+        priority: NotificationPriority,
+    ) {
         if self.session.config.notifications {
-            crate::notify::send(&title, &body);
+            crate::notify::send(&title, &body, priority);
         }
 
         if !self.ntfy_should_forward() {
@@ -7351,7 +7367,16 @@ impl App {
 
         tokio::spawn(async move {
             if let Err(error) =
-                m365_core::ntfy::send(&server, &topic, token.as_deref(), tag, &title, &body).await
+                m365_core::ntfy::send(
+                    &server,
+                    &topic,
+                    token.as_deref(),
+                    tag,
+                    priority.ntfy_priority(),
+                    &title,
+                    &body,
+                )
+                .await
             {
                 tracing::warn!("ntfy forwarding failed: {error:#}");
             }
@@ -7380,7 +7405,7 @@ impl App {
             return;
         };
 
-        let mut to_notify: Vec<(String, String)> = Vec::new();
+        let mut to_notify: Vec<(String, String, NotificationPriority)> = Vec::new();
         for chat in chats {
             let Some(preview) = chat.last_message_preview.as_ref() else {
                 continue;
@@ -7392,6 +7417,11 @@ impl App {
             if previous.as_deref() == Some(msg_id.as_str()) {
                 continue; // nothing new here
             }
+
+            let application_sender = preview
+                .from
+                .as_ref()
+                .is_some_and(|from| from.application.is_some());
 
             // Never notify for our own messages, or twice for the same one.
             let from_id = preview
@@ -7426,17 +7456,25 @@ impl App {
             let who = preview
                 .from
                 .as_ref()
-                .and_then(|f| f.user.as_ref())
-                .and_then(|u| u.display_name.clone())
+                .and_then(|from| from.user.as_ref().or(from.application.as_ref()))
+                .and_then(|sender| sender.display_name.clone())
                 .unwrap_or_else(|| chat.label(my_id.as_deref()));
             let title = if mentioned {
                 format!("{who} mentioned you")
             } else {
                 who
             };
+            let priority = if application_sender
+                && self.session.config.teams_application_high_priority
+            {
+                NotificationPriority::High
+            } else {
+                NotificationPriority::Normal
+            };
             to_notify.push((
                 title,
                 content::plain(&content::render_body(None, &body).text),
+                priority,
             ));
         }
 
@@ -7444,8 +7482,8 @@ impl App {
         if self.notified.len() > 1000 {
             self.notified.clear();
         }
-        for (title, body) in to_notify {
-            self.send_notification("Teams", title, body);
+        for (title, body, priority) in to_notify {
+            self.send_notification("Teams", title, body, priority);
         }
     }
 
@@ -7486,7 +7524,12 @@ impl App {
             self.notified.clear();
         }
         for (who, subject) in to_notify {
-            self.send_notification("Mail", format!("✉ {who}"), subject);
+            self.send_notification(
+                "Mail",
+                format!("✉ {who}"),
+                subject,
+                NotificationPriority::Normal,
+            );
         }
     }
 
@@ -10062,7 +10105,10 @@ mod ntfy_snooze_poll_tests {
 
 #[cfg(test)]
 mod hot_poll_tests {
-    use super::{chat_poll_tier_from_age, teams_message_id_is_newer, App, ChatPollTier};
+    use super::{
+        chat_poll_tier_from_age, teams_message_id_is_newer, teams_message_is_incoming, App,
+        ChatPollTier,
+    };
     use m365_core::models::ChatMessage;
 
     #[test]
@@ -10083,6 +10129,51 @@ mod hot_poll_tests {
             }
         }))
         .expect("valid chat-message fixture")
+    }
+
+    #[test]
+    fn application_messages_are_incoming_but_own_and_system_messages_are_not() {
+        let application: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "app-1",
+            "createdDateTime": "2026-10-07T07:00:00Z",
+            "from": {
+                "application": {
+                    "id": "workflow-app",
+                    "displayName": "Workflows"
+                }
+            },
+            "body": {
+                "contentType": "text",
+                "content": "Automated message"
+            }
+        }))
+        .unwrap();
+        assert!(teams_message_is_incoming(&application, Some("me")));
+
+        let own: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "own-1",
+            "from": {
+                "user": {
+                    "id": "me",
+                    "displayName": "Me"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!teams_message_is_incoming(&own, Some("me")));
+
+        let system: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-1",
+            "messageType": "systemEventMessage",
+            "from": {
+                "application": {
+                    "id": "workflow-app",
+                    "displayName": "Workflows"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!teams_message_is_incoming(&system, Some("me")));
     }
 
     #[test]

@@ -284,6 +284,8 @@ pub struct Config {
     pub cache_max_source: CacheMaxSource,
     /// Markdown-style formatting for outgoing Teams messages. Enabled by default.
     pub teams_markdown: bool,
+    /// Give Teams messages sent by applications/bots high notification priority.
+    pub teams_application_high_priority: bool,
     /// Automatically prefill persistent Teams conversation caches in the background.
     /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
     pub teams_cache_warmup: bool,
@@ -319,6 +321,8 @@ impl Config {
         let (cache_max_mb, cache_max_source) =
             resolve_cache_max_values(new_cache_max.as_deref(), deprecated_cache_max.as_deref())?;
         let teams_markdown = env_flag_default_on("M365_TEAMS_MARKDOWN");
+        let teams_application_high_priority =
+            env_flag("M365_TEAMS_APPLICATION_HIGH_PRIORITY");
         let meeting_opener = std::env::var("M365_MEETING_OPENER")
             .ok()
             .map(|value| value.trim().to_string())
@@ -472,6 +476,7 @@ impl Config {
             cache_max_mb,
             cache_max_source,
             teams_markdown,
+            teams_application_high_priority,
             teams_cache_warmup,
             teams_hot_chats,
             teams_poll_budget_rps,
