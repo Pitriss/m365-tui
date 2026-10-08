@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 
 use anyhow::Context;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use m365_core::config::{NtfyMode, TeamsSystemEvents, TEAMS_POLL_BUDGET_MIN_RPS};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
@@ -8075,6 +8075,34 @@ impl App {
                 self.status = format!("could not export contact diagnostics: {error:#}");
             }
         }
+    }
+
+    // -- input handling ----------------------------------------------------
+
+    /// Capture mouse input only where wheel navigation is useful. Keeping this
+    /// scoped to the Teams chat list preserves normal terminal text selection
+    /// everywhere else.
+    pub fn wants_mouse_capture(&self) -> bool {
+        !self.copy_mode
+            && self.overlay.is_none()
+            && self.screen == Screen::Teams
+            && self.teams.mode == TeamsMode::Chats
+            && self.teams.focus == TeamsFocus::List
+    }
+
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if !self.wants_mouse_capture() {
+            return;
+        }
+
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return,
+        };
+
+        self.note_presence_activity();
+        self.teams_move(delta);
     }
 
     // -- key handling ------------------------------------------------------

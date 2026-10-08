@@ -31,7 +31,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use app::{App, AppMessage, PushState, HOT_POLL_TICK_SECONDS, POLL_SECONDS};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -276,6 +277,7 @@ async fn run_tui(session: Session) -> Result<()> {
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )
@@ -303,13 +305,25 @@ async fn event_loop(
     change_rx: &mut mpsc::Receiver<ChangeEvent>,
 ) -> Result<()> {
     let mut reader = EventStream::new();
+    let mut mouse_capture = false;
     loop {
+        let wants_mouse_capture = app.wants_mouse_capture();
+        if wants_mouse_capture != mouse_capture {
+            if wants_mouse_capture {
+                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            }
+            mouse_capture = wants_mouse_capture;
+        }
+
         terminal.draw(|f| ui::render(f, app))?;
 
         tokio::select! {
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => app.on_key(k),
+                    Some(Ok(Event::Mouse(mouse))) => app.on_mouse(mouse),
                     Some(Ok(Event::Paste(text))) => app.on_paste(text),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
