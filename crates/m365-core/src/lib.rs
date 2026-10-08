@@ -53,8 +53,14 @@ impl Session {
 
     /// Convenience constructor: load `.env`, then the environment.
     pub fn from_env() -> Result<Self> {
-        Config::load_dotenv();
-        Ok(Self::new(Config::from_env()?))
+        let teams_automation_peers_from_process_env =
+            std::env::var_os("M365_TEAMS_AUTOMATION_PEERS").is_some();
+        let dotenv_path = Config::load_dotenv();
+        let mut config = Config::from_env()?;
+        config.dotenv_path = dotenv_path;
+        config.teams_automation_peers_from_process_env =
+            teams_automation_peers_from_process_env;
+        Ok(Self::new(config))
     }
 
     /// Ensure we hold a usable token, running device-code login (invoking

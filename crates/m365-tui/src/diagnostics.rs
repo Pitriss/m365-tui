@@ -111,6 +111,10 @@ pub struct ContactDiagnosticsState {
     pub cached_name_available: bool,
     pub chat_label_source: String,
     pub list_label_source: String,
+    /// Raw one-to-one peer ID explicitly exposed by F7 for automation setup.
+    pub automation_peer_id: Option<String>,
+    pub automation_peer_configured: bool,
+    pub automation_config_source: String,
     pub remote: Option<ContactDiagnosticsRemote>,
 }
 
@@ -561,6 +565,34 @@ pub fn contact_text(app: &App) -> String {
         },
     ));
     out.push(String::new());
+
+    out.push(String::new());
+
+    out.push("Automation".into());
+    out.push(row(
+        "Peer ID",
+        state
+            .automation_peer_id
+            .as_deref()
+            .unwrap_or("○ unavailable"),
+    ));
+    out.push(row(
+        "Automation peer",
+        if state.automation_peer_configured {
+            "● configured"
+        } else {
+            "○ not configured"
+        },
+    ));
+    out.push(row("Config variable", "M365_TEAMS_AUTOMATION_PEERS"));
+    out.push(row(
+        "Config source",
+        if state.automation_config_source.is_empty() {
+            "unknown"
+        } else {
+            &state.automation_config_source
+        },
+    ));
 
     out.push("Identity sources".into());
     out.push(row("Member resource ID", &state.member_id_shape));

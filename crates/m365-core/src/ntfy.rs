@@ -10,10 +10,11 @@ pub async fn send(
     topic: &str,
     token: Option<&str>,
     tag: Option<&str>,
+    priority: Option<u8>,
     title: &str,
     body: &str,
 ) -> Result<()> {
-    let payload = message_payload(topic, tag, title, body);
+    let payload = message_payload(topic, tag, priority, title, body);
 
     let client = reqwest::Client::new();
     let mut request = client
@@ -45,6 +46,7 @@ pub async fn send(
 fn message_payload(
     topic: &str,
     tag: Option<&str>,
+    priority: Option<u8>,
     title: &str,
     body: &str,
 ) -> serde_json::Value {
@@ -56,6 +58,9 @@ fn message_payload(
 
     if let Some(tag) = tag.map(str::trim).filter(|tag| !tag.is_empty()) {
         payload["tags"] = serde_json::json!([tag]);
+    }
+    if let Some(priority) = priority {
+        payload["priority"] = serde_json::json!(priority);
     }
 
     payload
@@ -83,12 +88,14 @@ mod tests {
     }
 
     #[test]
-    fn payload_encodes_optional_ntfy_tag_as_array() {
-        let tagged = message_payload("m365", Some("email"), "Subject", "Body");
+    fn payload_encodes_optional_ntfy_metadata() {
+        let tagged = message_payload("m365", Some("email"), Some(4), "Subject", "Body");
         assert_eq!(tagged["tags"], serde_json::json!(["email"]));
+        assert_eq!(tagged["priority"], serde_json::json!(4));
 
-        let plain = message_payload("m365", None, "Subject", "Body");
+        let plain = message_payload("m365", None, None, "Subject", "Body");
         assert!(plain.get("tags").is_none());
+        assert!(plain.get("priority").is_none());
     }
 
     #[tokio::test]
@@ -147,6 +154,7 @@ mod tests {
             assert_eq!(json["title"], "Test title");
             assert_eq!(json["message"], "hello world");
             assert_eq!(json["tags"], serde_json::json!(["email"]));
+            assert_eq!(json["priority"], serde_json::json!(4));
 
             stream
                 .write_all(
@@ -161,6 +169,7 @@ mod tests {
             "m365",
             Some("secret-token"),
             Some("email"),
+            Some(4),
             "Test title",
             "hello\nworld",
         )

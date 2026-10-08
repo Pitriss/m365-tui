@@ -110,12 +110,18 @@ unchanged unless this command is explicitly invoked.
 
 - Global `F6` read-only diagnostics overlay.
 - Contextual `F7` diagnostics for the selected Teams one-to-one contact. It
-  classifies Graph/Teams identity shapes, detects a safe Teams user-MRI candidate,
-  reports which contact-name sources are available, compares the current chat
-  state with fresh expanded-chat, `/members`, and recent-message probes, probes
-  batch/direct Graph presence, and traces the read-only Teams path
-  (Skype-resource token -> authz/Skype token -> Middle Tier MRI lookup -> UPS)
-  without exporting names, email addresses, raw IDs, tokens, MRIs, or tenant IDs.
+  exposes the selected chat's raw peer ID because that value is required for
+  `M365_TEAMS_AUTOMATION_PEERS`. `i` copies the peer ID and logs ready-to-use
+  `.env`/`export` lines; `a` can offer to add it to the exact `.env` file loaded
+  at startup and requires explicit `y` confirmation before writing.
+  F7 also classifies Graph/Teams identity shapes, detects a safe Teams user-MRI
+  candidate, reports which contact-name sources are available, compares the
+  current chat state with fresh expanded-chat, `/members`, and recent-message
+  probes, probes batch/direct Graph presence, and traces the read-only Teams
+  path (Skype-resource token -> authz/Skype token -> Middle Tier MRI lookup ->
+  UPS). The peer ID is an intentional exception to the normal raw-identifier
+  privacy rule; names, email addresses, tokens, MRIs and tenant IDs remain
+  excluded from the diagnostics snapshot.
 - Shows account/token health, Microsoft 365 work-plan hours and time zones,
   actual Graph token scopes, optional feature state, presence, push/cache,
   adaptive Teams polling tiers/budget/work, and terminal integration state.
@@ -345,6 +351,8 @@ M365_CLIENT_ID=00000000-0000-0000-0000-000000000000
 | `M365_TEAMS_IMAGE_CACHE_DIR` | unset | Deprecated fallback for `M365_CACHE_DIR` |
 | `M365_GRAPH_BASE` | Microsoft Graph | Alternate Graph endpoint, mainly for testing |
 | `M365_NOTIFY` | enabled | Set to `0`, `false`, `no`, or `off` to disable desktop notifications |
+| `M365_TEAMS_AUTOMATION_PEERS` | unset | Comma- or whitespace-separated one-to-one peer IDs whose Workflows `Post as User` messages should be treated as incoming automation events |
+| `M365_TEAMS_APPLICATION_HIGH_PRIORITY` | disabled | Give eligible Teams application/bot and configured automation-peer notifications desktop critical urgency and ntfy priority 4 |
 | `M365_NTFY` | `never` | ntfy forwarding mode: `never`, `always`, `away`, `alwayswd`, or `awaywd` |
 | `M365_NTFY_SERVER` | unset | ntfy server root URL; required when ntfy forwarding is enabled |
 | `M365_NTFY_TOPIC` | unset | ntfy topic; required when ntfy forwarding is enabled |
@@ -455,6 +463,25 @@ Files.Read.All
 When enabled, m365-tui resolves supported JPEG, PNG, and GIF attachments and can
 display them through the terminal image renderer.
 
+#### Teams application/bot notification priority
+
+Teams messages whose Graph sender is `from.application` are treated as normal
+incoming messages for unread counting and adaptive chat polling instead of being
+discarded for lacking a `from.user` id. The application display name is also
+used as the notification sender when Graph provides one.
+
+To raise the priority of notifications that are already eligible under the
+normal direct-message/mention rules:
+
+```dotenv
+M365_TEAMS_APPLICATION_HIGH_PRIORITY=1
+```
+
+With this enabled, desktop delivery uses `notify-send --urgency=critical` and
+ntfy delivery uses priority `4` (`high`). It does not bypass `M365_NOTIFY`,
+the ntfy forwarding/snooze policy, or the normal rule that group/meeting chats
+notify only when you are mentioned.
+
 #### Teams system events
 
 Control which system events appear in conversations:
@@ -510,6 +537,94 @@ When persistent Teams storage is not configured, Stay archived is intentionally
 memory-only and lasts until m365-tui exits. When persistent storage is enabled,
 the selected chat ids are stored in `stay-archived.json` under the configured
 Teams cache root.
+
+#### Workflows and automation peers
+
+Microsoft Teams Workflows can post messages either as an application/bot or
+**as the signed-in user**.
+
+When a workflow uses **Post as User**, Microsoft Graph reports the message as
+being sent by the current user's own AAD identity. There is no application
+identity in `from.application`, so such a message is normally indistinguishable
+from a message sent manually by that user.
+
+m365-tui can explicitly mark selected one-to-one chats as automation
+destinations:
+
+```dotenv
+M365_TEAMS_AUTOMATION_PEERS=peer-id-1,peer-id-2
+```
+
+The value is a comma- or whitespace-separated list of Teams peer IDs.
+
+For a configured automation peer, a message that Graph reports as sent by the
+signed-in user can be treated as an incoming automation message. It can
+therefore create:
+
+- a Teams unread indicator,
+- a per-chat unread count,
+- a desktop notification,
+- an ntfy notification when the configured ntfy policy allows it.
+
+Messages sent directly by the running m365-tui instance are excluded using the
+message ID returned by Microsoft Graph, so they do not create a false unread
+notification in an automation chat.
+
+This distinction cannot be made for messages sent manually from another Teams
+client using the same account. If such a message is sent into a chat configured
+as an automation peer, Graph may make it indistinguishable from a Workflows
+**Post as User** message and m365-tui can treat it as incoming automation.
+
+Workflows using **Post as Flow bot**, or other messages represented by Graph
+through `from.application`, do not require `M365_TEAMS_AUTOMATION_PEERS`.
+
+Select the desired one-to-one chat in the Teams chat list and press `F7`. The
+**Automation** section shows the raw peer ID and whether that peer is currently
+configured.
+
+Inside F7:
+
+- `i` copies the peer ID to the clipboard and writes the ID plus ready-to-use
+  `.env` and `export` lines to the runtime log.
+- `a` performs the same copy/log action and, when possible, offers to add the
+  peer to the loaded `.env` file.
+- `y` explicitly confirms modification of `.env`.
+- `c` copies/exports the complete contact diagnostics snapshot.
+- `l` writes the diagnostics snapshot to a log.
+- `r` refreshes the diagnostics.
+
+The runtime log contains forms suitable for both `.env` and shell
+configuration:
+
+```text
+F7 automation peer ID: <peer-id>
+F7 automation peer .env: M365_TEAMS_AUTOMATION_PEERS=<complete-list>
+F7 automation peer export: export M365_TEAMS_AUTOMATION_PEERS=<complete-list>
+```
+
+When other peers are already configured, the logged `.env` and `export` lines
+contain the complete resulting list.
+
+If m365-tui loaded configuration from a `.env` file, `a` can modify that exact
+file after confirmation. The new peer is also activated immediately in the
+running application; a restart is not required.
+
+If `M365_TEAMS_AUTOMATION_PEERS` came directly from the process environment,
+m365-tui does not try to overwrite `.env`. The peer ID and complete `export`
+command are still written to the runtime log.
+
+If no `.env` file was loaded, no configuration file is created automatically.
+
+`M365_TEAMS_APPLICATION_HIGH_PRIORITY=1` raises the priority of an otherwise
+eligible Teams notification from a real application/bot or configured
+automation peer:
+
+- desktop notifications use critical urgency,
+- ntfy uses priority `4` (`high`).
+
+It does not bypass the normal notification policy. `M365_NOTIFY`, ntfy mode and
+snooze still apply, and group/meeting chats still use their normal eligibility
+rules.
 
 #### Adaptive chat polling
 
@@ -914,7 +1029,9 @@ steps, `Home`/`End` to jump to the beginning or end, and `Esc` to close it.
 The Diagnostics overlay uses the same scrolling keys. Inside it, `r` refreshes
 the live checks, `c` copies/exports the snapshot, and `l` forces a log export.
 `F7` uses the same controls for the selected Teams one-to-one contact and writes
-fallback logs as `/tmp/m365-tui-contact-diagnostics-*.log`.
+fallback logs as `/tmp/m365-tui-contact-diagnostics-*.log`. F7 additionally
+uses `i` to copy/log the selected peer ID and `a` to start the explicitly
+confirmed automation-peer configuration flow.
 
 ### Navigation
 

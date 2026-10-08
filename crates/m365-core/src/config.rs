@@ -284,6 +284,16 @@ pub struct Config {
     pub cache_max_source: CacheMaxSource,
     /// Markdown-style formatting for outgoing Teams messages. Enabled by default.
     pub teams_markdown: bool,
+    /// One-to-one peer IDs whose self-authored Graph messages should be
+    /// treated as incoming automation events (for example Workflows "Post as User").
+    pub teams_automation_peers: std::collections::HashSet<String>,
+    /// Exact .env file loaded by dotenvy, when configuration came from one.
+    pub dotenv_path: Option<PathBuf>,
+    /// True when M365_TEAMS_AUTOMATION_PEERS already existed in the process
+    /// environment before dotenv loading.
+    pub teams_automation_peers_from_process_env: bool,
+    /// Give Teams messages sent by applications/bots high notification priority.
+    pub teams_application_high_priority: bool,
     /// Automatically prefill persistent Teams conversation caches in the background.
     /// Enabled by default; set M365_TEAMS_CACHE_WARMUP=0 to disable.
     pub teams_cache_warmup: bool,
@@ -319,6 +329,11 @@ impl Config {
         let (cache_max_mb, cache_max_source) =
             resolve_cache_max_values(new_cache_max.as_deref(), deprecated_cache_max.as_deref())?;
         let teams_markdown = env_flag_default_on("M365_TEAMS_MARKDOWN");
+        let teams_automation_peers = parse_teams_automation_peers(
+            std::env::var("M365_TEAMS_AUTOMATION_PEERS").ok().as_deref(),
+        );
+        let teams_application_high_priority =
+            env_flag("M365_TEAMS_APPLICATION_HIGH_PRIORITY");
         let meeting_opener = std::env::var("M365_MEETING_OPENER")
             .ok()
             .map(|value| value.trim().to_string())
@@ -472,6 +487,10 @@ impl Config {
             cache_max_mb,
             cache_max_source,
             teams_markdown,
+            teams_automation_peers,
+            dotenv_path: None,
+            teams_automation_peers_from_process_env: false,
+            teams_application_high_priority,
             teams_cache_warmup,
             teams_hot_chats,
             teams_poll_budget_rps,
@@ -482,8 +501,8 @@ impl Config {
 
     /// Best-effort load of a `.env` file from the current directory or nearest
     /// parent. Missing file is not an error.
-    pub fn load_dotenv() {
-        let _ = dotenvy::dotenv();
+    pub fn load_dotenv() -> Option<PathBuf> {
+        dotenvy::dotenv().ok()
     }
 
     pub fn scope_string(&self) -> String {
@@ -554,6 +573,17 @@ impl Config {
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
     }
+}
+
+fn parse_teams_automation_peers(
+    raw: Option<&str>,
+) -> std::collections::HashSet<String> {
+    raw.into_iter()
+        .flat_map(|value| value.split(|ch: char| ch == ',' || ch.is_ascii_whitespace()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn resolve_cache_dir_values(
@@ -792,12 +822,26 @@ mod tests {
             cache_max_mb: 256,
             cache_max_source: CacheMaxSource::Default,
             teams_markdown: true,
+            teams_automation_peers: std::collections::HashSet::new(),
+            dotenv_path: None,
+            teams_automation_peers_from_process_env: false,
+            teams_application_high_priority: false,
             teams_cache_warmup: true,
             teams_hot_chats: TEAMS_HOT_CHATS_DEFAULT,
             teams_poll_budget_rps: TEAMS_POLL_BUDGET_DEFAULT_RPS,
             teams_system_events: TeamsSystemEvents::Useful,
             meeting_opener: None,
         }
+    }
+
+    #[test]
+    fn parses_teams_automation_peers() {
+        let peers = parse_teams_automation_peers(Some(" peer-a,peer-b  peer-a\npeer-c "));
+        assert_eq!(peers.len(), 3);
+        assert!(peers.contains("peer-a"));
+        assert!(peers.contains("peer-b"));
+        assert!(peers.contains("peer-c"));
+        assert!(parse_teams_automation_peers(None).is_empty());
     }
 
     #[test]

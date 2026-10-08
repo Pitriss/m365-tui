@@ -296,6 +296,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::ConfirmRename { .. } => "y rename · any other key cancel",
             Overlay::ConfirmReplacePin { .. } => "y replace current pin · any other key cancel",
             Overlay::ConfirmDelete { .. } => "y delete · any other key cancel",
+            Overlay::ConfirmAutomationPeer { .. } => "y add automation peer · any other key cancel",
             Overlay::Presence => "1-6 set · m message · c clear message · a auto · Esc close",
             Overlay::PresenceMessage(_) => "Enter set · Esc cancel",
             Overlay::NtfySnooze { .. } => "j/k choose · Enter apply · c/0 resume · Esc close",
@@ -304,7 +305,7 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::CalendarEvent => "o open meeting · Esc close",
             Overlay::ContactProfile => "j/k scroll · Esc close",
             Overlay::Diagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
-            Overlay::ContactDiagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
+            Overlay::ContactDiagnostics => "i peer ID · a autom. · c copy · l log · r refresh · j/k scroll · Esc close",
             Overlay::Calendar => "Esc close",
             Overlay::TeamsCommands => "j/k scroll · PgUp/PgDn · Home/End · Esc close",
             Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
@@ -2504,9 +2505,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let area = centered(84, 86, f.area());
             f.render_widget(Clear, area);
 
-            let block = popup_block(
-                "Contact diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close",
-            );
+            let block = popup_block("Contact diagnostics");
             let inner = block.inner(area);
             let text = diagnostics::contact_text(app);
 
@@ -2816,6 +2815,21 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     &mut state,
                 );
             }
+        }
+        Overlay::ConfirmAutomationPeer {
+            peer_id,
+            dotenv_path,
+        } => {
+            let area = centered(90, 80, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Add this one-to-one peer to M365_TEAMS_AUTOMATION_PEERS?\n\nPeer ID: {peer_id}\nConfig:  {dotenv_path}\n\nWorkflows \"Post as User\" messages in this chat will be treated as incoming automation messages.\n\nPress y to add. Any other key cancels."
+                ))
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Add automation peer?")),
+                area,
+            );
         }
         Overlay::ConfirmRename { name, .. } => {
             let area = centered(66, 32, f.area());

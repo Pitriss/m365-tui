@@ -13,8 +13,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use m365_core::config::{NtfyMode, TeamsSystemEvents, TEAMS_POLL_BUDGET_MIN_RPS};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatMessage, Event as CalEvent, MailFolder, MailMessage, Person, Presence,
-    SystemEventClass, Team, User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, IdentitySet, MailFolder, MailMessage, Person,
+    Presence, SystemEventClass, Team, User,
 };
 use m365_core::{calendar, channels, chats, mail, people, teams_presence, work_plan, Session};
 use ratatui::text::Text;
@@ -27,6 +27,7 @@ use crate::diagnostics::{
 };
 use crate::editor::TextInput;
 use crate::navigation;
+use crate::notify::NotificationPriority;
 use crate::presence_state::{
     PresenceStateDiagnostics, PresenceStateManager, PresenceWrite, SessionTarget, WriteReason,
     AVAILABLE, AWAY,
@@ -88,6 +89,7 @@ pub enum AppMessage {
     },
     ChatMessageSent {
         chat_id: String,
+        message_id: String,
         status: String,
     },
     ChatPinsLoaded {
@@ -337,6 +339,11 @@ pub enum Overlay {
         chat_id: String,
         message_id: String,
         user_id: String,
+    },
+    /// Explicit confirmation before persisting an F7 automation peer.
+    ConfirmAutomationPeer {
+        peer_id: String,
+        dotenv_path: String,
     },
     /// Presence (status) picker for the signed-in user.
     Presence,
@@ -803,6 +810,29 @@ pub fn teams_chat_is_hidden(chat: &Chat) -> bool {
         .unwrap_or(false)
 }
 
+fn teams_sender_is_incoming(from: Option<&IdentitySet>, me_id: Option<&str>) -> bool {
+    let Some(from) = from else {
+        return false;
+    };
+
+    if let Some(user) = from.user.as_ref() {
+        return match (user.id.as_deref(), me_id) {
+            (Some(sender_id), Some(me_id)) => sender_id != me_id,
+            _ => true,
+        };
+    }
+
+    from.application.is_some()
+}
+
+fn teams_message_is_incoming(message: &ChatMessage, me_id: Option<&str>) -> bool {
+    if message.deleted_date_time.is_some() || message.is_system_event() {
+        return false;
+    }
+
+    teams_sender_is_incoming(message.from.as_ref(), me_id)
+}
+
 fn teams_chat_is_archived(
     chat: &Chat,
     stay_archived: &std::collections::HashSet<String>,
@@ -1241,6 +1271,10 @@ pub struct App {
     teams_background_limiter: TeamsBackgroundLimiter,
     /// Prevent overlapping unread-count sweeps when Graph is slow/throttled.
     chat_unread_refresh_running: bool,
+    /// Runtime automation peer set; starts from config and can be extended by F7.
+    teams_automation_peers: std::collections::HashSet<String>,
+    /// IDs returned by sends performed by this m365-tui instance.
+    own_sent_chat_message_ids: std::collections::HashSet<String>,
     /// Inbox message ids already seen, same baseline rule as `chat_seen`.
     mail_seen: Option<std::collections::HashSet<String>>,
     /// State and transitions for the application presence session published by
@@ -2563,6 +2597,7 @@ impl App {
         let presence_activity =
             crate::activity::ActivityMonitor::new(session.config.presence_activity_source);
         let presence_state = PresenceStateManager::new(session.config.presence_lock_restore);
+        let teams_automation_peers = session.config.teams_automation_peers.clone();
 
         let mut app = Self {
             session,
@@ -2604,6 +2639,8 @@ impl App {
             teams_hot_chat_state: std::collections::HashMap::new(),
             teams_background_limiter,
             chat_unread_refresh_running: false,
+            teams_automation_peers,
+            own_sent_chat_message_ids: std::collections::HashSet::new(),
             mail_seen: None,
             presence_state,
             presence_activity,
@@ -2834,7 +2871,7 @@ impl App {
             return;
         }
 
-        let Some(chat) = self.teams_selected_chat() else {
+        let Some(chat) = self.teams_selected_chat().cloned() else {
             self.status = "select a Teams contact first".into();
             return;
         };
@@ -2884,6 +2921,53 @@ impl App {
             .map(String::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
+
+        // Personal-account chats can have no usable Entra GUID and the current
+        // preview can be our own Workflows "Post as User" message. Recover the
+        // real peer sender id from persistent conversation history when needed.
+        let cached_message_peer_id = if cached_id.is_none() {
+            self.session
+                .config
+                .cache_dir
+                .as_deref()
+                .and_then(|cache_root| {
+                    load_teams_conversation_cache(cache_root, &chat.id)
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|(messages, _)| {
+                    messages
+                        .iter()
+                        .filter_map(|message| message.from.as_ref()?.user.as_ref())
+                        .find(|user| {
+                            me_id
+                                .map(|id| user.id.as_deref() != Some(id))
+                                .unwrap_or(true)
+                        })
+                        .and_then(|user| user.id.clone())
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
+
+        let automation_peer_id = cached_id
+            .map(str::to_string)
+            .or(cached_message_peer_id)
+            .or_else(|| member_id.map(str::to_string))
+            .or_else(|| preview_id.map(str::to_string));
+        let automation_peer_configured = automation_peer_id
+            .as_deref()
+            .is_some_and(|peer_id| self.teams_automation_peers.contains(peer_id));
+        let automation_config_source =
+            if self.session.config.teams_automation_peers_from_process_env {
+                "process environment".to_string()
+            } else if let Some(path) = self.session.config.dotenv_path.as_deref() {
+                path.display().to_string()
+            } else {
+                "no .env loaded".to_string()
+            };
 
         let member_guid = member_id.is_some_and(chats::looks_like_user_guid);
         let preview_guid = preview_id.is_some_and(chats::looks_like_user_guid);
@@ -3050,6 +3134,9 @@ impl App {
             cached_name_available,
             chat_label_source,
             list_label_source,
+            automation_peer_id,
+            automation_peer_configured,
+            automation_config_source,
             remote: None,
         };
         self.contact_diagnostics_chat_id = Some(chat_id);
@@ -3890,7 +3977,7 @@ impl App {
         }
 
         for (title, body) in external {
-            self.send_notification("Calendar", title, body);
+            self.send_notification("Calendar", title, body, NotificationPriority::Normal);
         }
 
         if let Some(first) = internal.first() {
@@ -4589,10 +4676,122 @@ impl App {
         });
     }
 
+    fn teams_chat_is_automation_peer(&self, chat_id: &str) -> bool {
+        self.teams
+            .contact_user_ids
+            .get(chat_id)
+            .is_some_and(|peer_id| self.teams_automation_peers.contains(peer_id))
+    }
+
+    fn teams_preview_is_automation_incoming(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        preview: &m365_core::models::LastMessagePreview,
+        my_id: Option<&str>,
+    ) -> bool {
+        if !self.teams_chat_is_automation_peer(chat_id)
+            || self.own_sent_chat_message_ids.contains(message_id)
+        {
+            return false;
+        }
+        let from_id = preview
+            .from
+            .as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|user| user.id.as_deref());
+        from_id.is_some() && from_id == my_id
+    }
+
+    fn teams_message_is_automation_incoming(
+        &self,
+        chat_id: &str,
+        message: &ChatMessage,
+        my_id: Option<&str>,
+    ) -> bool {
+        if message.deleted_date_time.is_some()
+            || message.is_system_event()
+            || !self.teams_chat_is_automation_peer(chat_id)
+            || self.own_sent_chat_message_ids.contains(&message.id)
+        {
+            return false;
+        }
+        let from_id = message
+            .from
+            .as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|user| user.id.as_deref());
+        from_id.is_some() && from_id == my_id
+    }
+
     fn refresh_chat_unread_counts(&mut self, chats_list: &[Chat]) {
         let Some(me_id) = self.me.as_ref().map(|me| me.id.clone()) else {
             return;
         };
+
+        let preserve_application_unread: std::collections::HashSet<&str> = chats_list
+            .iter()
+            .filter_map(|chat| {
+                if !chat
+                    .chat_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+                {
+                    return None;
+                }
+
+                let latest_preview = chat.last_message_preview.as_ref()?;
+                let latest_id = latest_preview.id.as_deref()?;
+                if self
+                    .teams
+                    .locally_read_through
+                    .get(&chat.id)
+                    .is_some_and(|id| id == latest_id)
+                {
+                    return None;
+                }
+
+                if !teams_sender_is_incoming(latest_preview.from.as_ref(), Some(me_id.as_str())) {
+                    return None;
+                }
+
+                latest_preview
+                    .from
+                    .as_ref()
+                    .is_some_and(|from| from.application.is_some())
+                    .then_some(chat.id.as_str())
+            })
+            .collect();
+
+        let preserve_automation_unread: std::collections::HashSet<&str> = chats_list
+            .iter()
+            .filter_map(|chat| {
+                if !chat
+                    .chat_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"))
+                {
+                    return None;
+                }
+                let preview = chat.last_message_preview.as_ref()?;
+                let message_id = preview.id.as_deref()?;
+                if self
+                    .teams
+                    .locally_read_through
+                    .get(&chat.id)
+                    .is_some_and(|id| id == message_id)
+                {
+                    return None;
+                }
+                self.teams_preview_is_automation_incoming(
+                    &chat.id,
+                    message_id,
+                    preview,
+                    Some(me_id.as_str()),
+                )
+                .then_some(chat.id.as_str())
+            })
+            .collect();
 
         let candidates: Vec<(String, String)> = chats_list
             .iter()
@@ -4634,9 +4833,11 @@ impl App {
         // considers read, while preserving known counts during a refresh.
         let candidate_ids: std::collections::HashSet<&str> =
             candidates.iter().map(|(id, _)| id.as_str()).collect();
-        self.teams
-            .chat_unread_counts
-            .retain(|id, _| candidate_ids.contains(id.as_str()));
+        self.teams.chat_unread_counts.retain(|id, _| {
+            candidate_ids.contains(id.as_str())
+                || preserve_application_unread.contains(id.as_str())
+                || preserve_automation_unread.contains(id.as_str())
+        });
 
         if candidates.is_empty() || self.chat_unread_refresh_running {
             return;
@@ -4696,14 +4897,7 @@ impl App {
                             break;
                         }
 
-                        if message.deleted_date_time.is_some()
-                            || message.author_id().is_none()
-                            || message.author_id() == Some(me_id.as_str())
-                            || message
-                                .message_type
-                                .as_deref()
-                                .is_some_and(|kind| kind.eq_ignore_ascii_case("systemEventMessage"))
-                        {
+                        if !teams_message_is_incoming(&message, Some(me_id.as_str())) {
                             continue;
                         }
 
@@ -5641,9 +5835,11 @@ impl App {
     fn send_chat_message(&mut self, chat_id: String, text: String) {
         let s = self.session.clone();
         self.spawn(async move {
-            chats::send_message(&s.graph, &chat_id, &text, s.config.teams_markdown).await?;
+            let message =
+                chats::send_message(&s.graph, &chat_id, &text, s.config.teams_markdown).await?;
             Ok(AppMessage::ChatMessageSent {
                 chat_id,
+                message_id: message.id,
                 status: "message sent".into(),
             })
         });
@@ -6038,7 +6234,15 @@ impl App {
                 }
                 self.status = format!("error: {}", m365_core::util::graph_error_summary(&error));
             }
-            AppMessage::ChatMessageSent { chat_id, status } => {
+            AppMessage::ChatMessageSent {
+                chat_id,
+                message_id,
+                status,
+            } => {
+                if self.own_sent_chat_message_ids.len() >= 1000 {
+                    self.own_sent_chat_message_ids.clear();
+                }
+                self.own_sent_chat_message_ids.insert(message_id);
                 self.mark_teams_chat_active(&chat_id);
                 self.status = status;
                 self.refresh_current();
@@ -6361,6 +6565,20 @@ impl App {
 
             match self.teams_hot_chat_state.get_mut(&chat.id) {
                 Some(state) if Self::state_message_is_newer(state, message_id, message_at) => {
+                    if preview
+                        .from
+                        .as_ref()
+                        .is_some_and(|from| from.application.is_some())
+                    {
+                        tracing::warn!(
+                            "TEAMS_APP_DIAG source=chat-list-hot chat_id={} chat_type={} preview_id={} previous_id={} preview_at={}",
+                            chat.id,
+                            chat.chat_type.as_deref().unwrap_or("<none>"),
+                            message_id,
+                            state.latest_message_id.as_deref().unwrap_or("<none>"),
+                            preview.created_date_time.as_deref().unwrap_or("<none>")
+                        );
+                    }
                     state.latest_message_id = Some(message_id.to_string());
                     state.latest_message_at = message_at;
                     state.last_activity = now;
@@ -6749,23 +6967,29 @@ impl App {
 
         let my_id = self.me.as_ref().map(|me| me.id.clone());
         let my_name = self.me.as_ref().and_then(|me| me.display_name.clone());
-        let from_id = message
+        let diag_application_sender = message
             .from
             .as_ref()
-            .and_then(|from| from.user.as_ref())
-            .and_then(|user| user.id.as_deref());
-
-        // Our own send still keeps the chat hot, but never creates unread state
-        // or a notification.
-        if from_id.is_some() && from_id == my_id.as_deref() {
+            .is_some_and(|from| from.application.is_some());
+        if diag_application_sender {
+            tracing::warn!(
+                "TEAMS_APP_DIAG source=hot-message-enter chat_id={} message_id={} incoming={} deleted={} system={}",
+                chat_id,
+                message.id,
+                teams_message_is_incoming(message, my_id.as_deref()),
+                message.deleted_date_time.is_some(),
+                message.is_system_event()
+            );
+        }
+        let automation_sender =
+            self.teams_message_is_automation_incoming(chat_id, message, my_id.as_deref());
+        if !automation_sender && !teams_message_is_incoming(message, my_id.as_deref()) {
             return;
         }
-        if message.deleted_date_time.is_some()
-            || message.author_id().is_none()
-            || message.is_system_event()
-        {
-            return;
-        }
+        let application_sender = message
+            .from
+            .as_ref()
+            .is_some_and(|from| from.application.is_some());
 
         let Some(chat) = self.teams.chats.iter().find(|chat| chat.id == chat_id) else {
             return;
@@ -6777,6 +7001,18 @@ impl App {
         let chat_type = chat.chat_type.clone();
         let fallback_label = chat.label(my_id.as_deref());
         let open = self.teams.open_chat_id.as_deref() == Some(chat_id);
+
+        if application_sender {
+            tracing::warn!(
+                "TEAMS_APP_DIAG source=hot-message-chat chat_id={} message_id={} chat_type={} one_on_one={} open={} notifications_enabled={}",
+                chat_id,
+                message.id,
+                chat_type.as_deref().unwrap_or("<none>"),
+                one_on_one,
+                open,
+                self.notification_events_enabled()
+            );
+        }
 
         if !open {
             if one_on_one {
@@ -6807,23 +7043,49 @@ impl App {
             my_id.as_deref(),
             my_name.as_deref(),
         );
-        if !crate::notify::should_notify(chat_type.as_deref(), mentioned) {
+        let should_notify = crate::notify::should_notify(chat_type.as_deref(), mentioned);
+        if application_sender {
+            tracing::warn!(
+                "TEAMS_APP_DIAG source=hot-message-policy chat_id={} message_id={} mentioned={} should_notify={} unread_count={}",
+                chat_id,
+                message.id,
+                mentioned,
+                should_notify,
+                self.teams
+                    .chat_unread_counts
+                    .get(chat_id)
+                    .copied()
+                    .unwrap_or(0)
+            );
+        }
+        if !should_notify {
             return;
         }
 
-        let who = message
-            .from
-            .as_ref()
-            .and_then(|from| from.user.as_ref())
-            .and_then(|user| user.display_name.clone())
-            .unwrap_or(fallback_label);
+        let who = if automation_sender {
+            fallback_label.clone()
+        } else {
+            message
+                .from
+                .as_ref()
+                .and_then(|from| from.user.as_ref().or(from.application.as_ref()))
+                .and_then(|sender| sender.display_name.clone())
+                .unwrap_or(fallback_label)
+        };
         let title = if mentioned {
             format!("{who} mentioned you")
         } else {
             who
         };
         let plain = content::plain(&content::render_body(None, &body).text);
-        self.send_notification("Teams", title, plain);
+        let priority = if (application_sender || automation_sender)
+            && self.session.config.teams_application_high_priority
+        {
+            NotificationPriority::High
+        } else {
+            NotificationPriority::Normal
+        };
+        self.send_notification("Teams", title, plain, priority);
 
         if self.notified.len() > 1000 {
             self.notified.clear();
@@ -6857,6 +7119,21 @@ impl App {
             .max_by_key(|message| sort_key(message))
             .cloned();
         let changed = self.observe_teams_chat_page(&chat_id, &messages);
+
+        if newest
+            .as_ref()
+            .and_then(|message| message.from.as_ref())
+            .is_some_and(|from| from.application.is_some())
+        {
+            tracing::warn!(
+                "TEAMS_APP_DIAG source=hot-page chat_id={} previous_id={} newest_id={} changed={} message_count={}",
+                chat_id,
+                previous_message_id.as_deref().unwrap_or("<none>"),
+                newest.as_ref().map(|message| message.id.as_str()).unwrap_or("<none>"),
+                changed,
+                messages.len()
+            );
+        }
 
         for message in
             Self::hot_poll_new_messages(&messages, previous_message_id.as_deref(), changed)
@@ -7330,9 +7607,15 @@ impl App {
         )
     }
 
-    fn send_notification(&self, category: &'static str, title: String, body: String) {
+    fn send_notification(
+        &self,
+        category: &'static str,
+        title: String,
+        body: String,
+        priority: NotificationPriority,
+    ) {
         if self.session.config.notifications {
-            crate::notify::send(&title, &body);
+            crate::notify::send(&title, &body, priority);
         }
 
         if !self.ntfy_should_forward() {
@@ -7351,7 +7634,16 @@ impl App {
 
         tokio::spawn(async move {
             if let Err(error) =
-                m365_core::ntfy::send(&server, &topic, token.as_deref(), tag, &title, &body).await
+                m365_core::ntfy::send(
+                    &server,
+                    &topic,
+                    token.as_deref(),
+                    tag,
+                    priority.ntfy_priority(),
+                    &title,
+                    &body,
+                )
+                .await
             {
                 tracing::warn!("ntfy forwarding failed: {error:#}");
             }
@@ -7380,7 +7672,7 @@ impl App {
             return;
         };
 
-        let mut to_notify: Vec<(String, String)> = Vec::new();
+        let mut to_notify: Vec<(String, String, NotificationPriority)> = Vec::new();
         for chat in chats {
             let Some(preview) = chat.last_message_preview.as_ref() else {
                 continue;
@@ -7393,15 +7685,79 @@ impl App {
                 continue; // nothing new here
             }
 
+            let application_sender = preview
+                .from
+                .as_ref()
+                .is_some_and(|from| from.application.is_some());
+
+            if application_sender {
+                tracing::warn!(
+                    "TEAMS_APP_DIAG source=chat-list-change chat_id={} chat_type={} preview_id={} previous_id={} one_on_one={} open={} notifications_enabled={} high_priority={}",
+                    chat.id,
+                    chat.chat_type.as_deref().unwrap_or("<none>"),
+                    msg_id,
+                    previous.as_deref().unwrap_or("<none>"),
+                    chat.chat_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne")),
+                    self.teams.open_chat_id.as_deref() == Some(chat.id.as_str()),
+                    notification_events_enabled,
+                    self.session.config.teams_application_high_priority
+                );
+            }
+
             // Never notify for our own messages, or twice for the same one.
             let from_id = preview
                 .from
                 .as_ref()
                 .and_then(|f| f.user.as_ref())
                 .and_then(|u| u.id.as_deref());
-            if from_id.is_some() && from_id == my_id.as_deref() {
+            let automation_sender = self
+                .teams
+                .contact_user_ids
+                .get(&chat.id)
+                .is_some_and(|peer_id| self.teams_automation_peers.contains(peer_id))
+                && !self.own_sent_chat_message_ids.contains(&msg_id)
+                && from_id.is_some()
+                && from_id == my_id.as_deref();
+            if from_id.is_some()
+                && from_id == my_id.as_deref()
+                && !automation_sender
+            {
                 continue;
             }
+
+            let one_on_one = chat
+                .chat_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"));
+            let open = self.teams.open_chat_id.as_deref() == Some(chat.id.as_str());
+            if (application_sender
+                && teams_sender_is_incoming(preview.from.as_ref(), my_id.as_deref())
+                || automation_sender)
+                && one_on_one
+                && !open
+            {
+                self.teams
+                    .chat_unread_counts
+                    .entry(chat.id.clone())
+                    .and_modify(|count| *count = (*count).max(1))
+                    .or_insert(1);
+            }
+
+            if application_sender {
+                tracing::warn!(
+                    "TEAMS_APP_DIAG source=chat-list-unread chat_id={} incoming={} unread_count={}",
+                    chat.id,
+                    teams_sender_is_incoming(preview.from.as_ref(), my_id.as_deref()),
+                    self.teams
+                        .chat_unread_counts
+                        .get(&chat.id)
+                        .copied()
+                        .unwrap_or(0)
+                );
+            }
+
             if self.screen != Screen::Teams {
                 self.teams_unread = true;
             }
@@ -7419,24 +7775,47 @@ impl App {
                 .unwrap_or_default();
             let mentioned =
                 crate::notify::mentions_me(&[], &body, my_id.as_deref(), my_name.as_deref());
-            if !crate::notify::should_notify(chat.chat_type.as_deref(), mentioned) {
+            let should_notify =
+                crate::notify::should_notify(chat.chat_type.as_deref(), mentioned);
+            if application_sender {
+                tracing::warn!(
+                    "TEAMS_APP_DIAG source=chat-list-policy chat_id={} mentioned={} should_notify={} already_notified={}",
+                    chat.id,
+                    mentioned,
+                    should_notify,
+                    self.notified.contains(&msg_id)
+                );
+            }
+            if !should_notify {
                 continue;
             }
 
-            let who = preview
-                .from
-                .as_ref()
-                .and_then(|f| f.user.as_ref())
-                .and_then(|u| u.display_name.clone())
-                .unwrap_or_else(|| chat.label(my_id.as_deref()));
+            let who = if automation_sender {
+                chat.label(my_id.as_deref())
+            } else {
+                preview
+                    .from
+                    .as_ref()
+                    .and_then(|from| from.user.as_ref().or(from.application.as_ref()))
+                    .and_then(|sender| sender.display_name.clone())
+                    .unwrap_or_else(|| chat.label(my_id.as_deref()))
+            };
             let title = if mentioned {
                 format!("{who} mentioned you")
             } else {
                 who
             };
+            let priority = if (application_sender || automation_sender)
+                && self.session.config.teams_application_high_priority
+            {
+                NotificationPriority::High
+            } else {
+                NotificationPriority::Normal
+            };
             to_notify.push((
                 title,
                 content::plain(&content::render_body(None, &body).text),
+                priority,
             ));
         }
 
@@ -7444,8 +7823,8 @@ impl App {
         if self.notified.len() > 1000 {
             self.notified.clear();
         }
-        for (title, body) in to_notify {
-            self.send_notification("Teams", title, body);
+        for (title, body, priority) in to_notify {
+            self.send_notification("Teams", title, body, priority);
         }
     }
 
@@ -7486,7 +7865,114 @@ impl App {
             self.notified.clear();
         }
         for (who, subject) in to_notify {
-            self.send_notification("Mail", format!("✉ {who}"), subject);
+            self.send_notification(
+                "Mail",
+                format!("✉ {who}"),
+                subject,
+                NotificationPriority::Normal,
+            );
+        }
+    }
+
+    fn automation_peer_config_value_with(&self, peer_id: &str) -> String {
+        let mut peers: Vec<String> = self.teams_automation_peers.iter().cloned().collect();
+        if !peers.iter().any(|item| item == peer_id) {
+            peers.push(peer_id.to_string());
+        }
+        peers.sort();
+        peers.dedup();
+        peers.join(",")
+    }
+
+    fn copy_log_contact_automation_peer(&mut self) -> Option<(String, String)> {
+        let Some(peer_id) = self.contact_diagnostics.automation_peer_id.clone() else {
+            self.status = "F7 has no usable peer ID for this contact".into();
+            return None;
+        };
+
+        let value = self.automation_peer_config_value_with(&peer_id);
+        tracing::info!("F7 automation peer ID: {peer_id}");
+        tracing::info!("F7 automation peer .env: M365_TEAMS_AUTOMATION_PEERS={value}");
+        tracing::info!(
+            "F7 automation peer export: export M365_TEAMS_AUTOMATION_PEERS={value}"
+        );
+
+        match crate::clipboard::copy(&peer_id) {
+            Ok(via) => self.status = format!("copied automation peer ID via {via}"),
+            Err(error) => {
+                self.status = format!("automation peer ID logged; clipboard failed: {error:#}")
+            }
+        }
+
+        Some((peer_id, value))
+    }
+
+    fn begin_add_contact_automation_peer(&mut self) {
+        let Some((peer_id, _)) = self.copy_log_contact_automation_peer() else {
+            return;
+        };
+
+        if self.teams_automation_peers.contains(&peer_id) {
+            tracing::info!("F7 automation peer already configured: peer_id={peer_id}");
+            self.status = format!("automation peer already configured: {peer_id}");
+            self.contact_diagnostics.automation_peer_configured = true;
+            return;
+        }
+
+        if self.session.config.teams_automation_peers_from_process_env {
+            self.status =
+                "M365_TEAMS_AUTOMATION_PEERS comes from process environment; use the logged export line"
+                    .into();
+            return;
+        }
+
+        let Some(path) = self.session.config.dotenv_path.as_deref() else {
+            self.status =
+                "no loaded .env file; peer ID and ready-to-use config lines were logged".into();
+            return;
+        };
+
+        self.overlay = Some(Overlay::ConfirmAutomationPeer {
+            peer_id,
+            dotenv_path: path.display().to_string(),
+        });
+    }
+
+    fn persist_contact_automation_peer(&mut self, peer_id: String, dotenv_path: String) {
+        let value = self.automation_peer_config_value_with(&peer_id);
+        match write_dotenv_assignment(
+            std::path::Path::new(&dotenv_path),
+            "M365_TEAMS_AUTOMATION_PEERS",
+            &value,
+        ) {
+            Ok(()) => {
+                self.teams_automation_peers.insert(peer_id.clone());
+                if let Some(chat_id) = self.contact_diagnostics_chat_id.clone() {
+                    self.teams
+                        .contact_user_ids
+                        .insert(chat_id, peer_id.clone());
+                }
+                self.contact_diagnostics.automation_peer_configured = true;
+                self.contact_diagnostics.automation_config_source = dotenv_path.clone();
+                tracing::info!(
+                    "F7 automation peer added: peer_id={peer_id} config={dotenv_path}"
+                );
+                tracing::info!(
+                    "F7 automation peer .env: M365_TEAMS_AUTOMATION_PEERS={value}"
+                );
+                tracing::info!(
+                    "F7 automation peer export: export M365_TEAMS_AUTOMATION_PEERS={value}"
+                );
+                self.status = format!(
+                    "automation peer added and activated: {peer_id} ({dotenv_path})"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "F7 automation peer add failed: peer_id={peer_id} config={dotenv_path}: {error:#}"
+                );
+                self.status = format!("could not update {dotenv_path}: {error:#}");
+            }
         }
     }
 
@@ -8548,7 +9034,7 @@ impl App {
                 let s = self.session.clone();
                 self.status = format!("replying to {author}…");
                 self.spawn(async move {
-                    chats::send_reply(
+                    let message = chats::send_reply(
                         &s.graph,
                         &chat_id,
                         &original,
@@ -8558,6 +9044,7 @@ impl App {
                     .await?;
                     Ok(AppMessage::ChatMessageSent {
                         chat_id,
+                        message_id: message.id,
                         status: "reply sent".into(),
                     })
                 });
@@ -9017,11 +9504,19 @@ impl App {
                     KeyCode::Home => self.contact_diagnostics_scroll = 0,
                     KeyCode::End => self.contact_diagnostics_scroll = max,
                     KeyCode::Char('r') => self.refresh_contact_diagnostics(),
+                    KeyCode::Char('i') => {
+                        self.copy_log_contact_automation_peer();
+                    }
+                    KeyCode::Char('a') => {
+                        self.begin_add_contact_automation_peer();
+                    }
                     KeyCode::Char('c') => self.export_contact_diagnostics(false),
                     KeyCode::Char('l') => self.export_contact_diagnostics(true),
                     _ => {}
                 }
-                self.overlay = Some(Overlay::ContactDiagnostics);
+                if self.overlay.is_none() {
+                    self.overlay = Some(Overlay::ContactDiagnostics);
+                }
             }
             Some(Overlay::ContactProfile) => {
                 let max = self.contact_profile_max_scroll.get();
@@ -9157,6 +9652,18 @@ impl App {
                         messages,
                         sel,
                     });
+                }
+            },
+            Some(Overlay::ConfirmAutomationPeer {
+                peer_id,
+                dotenv_path,
+            }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.persist_contact_automation_peer(peer_id, dotenv_path);
+                }
+                _ => {
+                    tracing::info!("F7 automation peer add cancelled: peer_id={peer_id}");
+                    self.status = "automation peer add cancelled".into();
                 }
             },
             Some(Overlay::ConfirmRename { chat_id, name }) => match key.code {
@@ -9659,6 +10166,60 @@ fn truncate_url(url: &str) -> String {
     format!("{head}…")
 }
 
+
+fn write_dotenv_assignment(
+    path: &std::path::Path,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let had_trailing_newline = original.ends_with('\n');
+    let mut output = Vec::new();
+    let mut replaced = false;
+
+    for line in original.lines() {
+        let trimmed = line.trim_start();
+        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let matches_key = assignment
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim() == key);
+
+        if !matches_key {
+            output.push(line.to_string());
+            continue;
+        }
+        if replaced {
+            continue;
+        }
+
+        let indent_len = line.len().saturating_sub(trimmed.len());
+        let indent = &line[..indent_len];
+        let export_prefix = if trimmed.starts_with("export ") {
+            "export "
+        } else {
+            ""
+        };
+        output.push(format!("{indent}{export_prefix}{key}={value}"));
+        replaced = true;
+    }
+
+    if !replaced {
+        if output.last().is_some_and(|line| !line.is_empty()) {
+            output.push(String::new());
+        }
+        output.push(format!("{key}={value}"));
+    }
+
+    let mut rendered = output.join("\n");
+    if had_trailing_newline || !rendered.is_empty() {
+        rendered.push('\n');
+    }
+
+    std::fs::write(path, rendered)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 /// Expand a leading `~` to the user's home directory.
 fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
@@ -10062,7 +10623,10 @@ mod ntfy_snooze_poll_tests {
 
 #[cfg(test)]
 mod hot_poll_tests {
-    use super::{chat_poll_tier_from_age, teams_message_id_is_newer, App, ChatPollTier};
+    use super::{
+        chat_poll_tier_from_age, teams_message_id_is_newer, teams_message_is_incoming, App,
+        ChatPollTier,
+    };
     use m365_core::models::ChatMessage;
 
     #[test]
@@ -10083,6 +10647,51 @@ mod hot_poll_tests {
             }
         }))
         .expect("valid chat-message fixture")
+    }
+
+    #[test]
+    fn application_messages_are_incoming_but_own_and_system_messages_are_not() {
+        let application: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "app-1",
+            "createdDateTime": "2026-10-07T07:00:00Z",
+            "from": {
+                "application": {
+                    "id": "workflow-app",
+                    "displayName": "Workflows"
+                }
+            },
+            "body": {
+                "contentType": "text",
+                "content": "Automated message"
+            }
+        }))
+        .unwrap();
+        assert!(teams_message_is_incoming(&application, Some("me")));
+
+        let own: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "own-1",
+            "from": {
+                "user": {
+                    "id": "me",
+                    "displayName": "Me"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!teams_message_is_incoming(&own, Some("me")));
+
+        let system: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "system-1",
+            "messageType": "systemEventMessage",
+            "from": {
+                "application": {
+                    "id": "workflow-app",
+                    "displayName": "Workflows"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!teams_message_is_incoming(&system, Some("me")));
     }
 
     #[test]

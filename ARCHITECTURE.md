@@ -120,6 +120,31 @@ Mail, Teams, and Calendar ntfy payloads carry distinct emoji-compatible tags
 (`email`, `speech_balloon`, and `calendar`) while keeping a single configured
 topic.
 
+### Teams automation peers
+
+Teams Workflows **Post as User** creates an identity ambiguity that cannot be
+solved from `ChatMessage.from` alone. For those messages Graph commonly returns
+the signed-in user in `from.user` while `from.application` is absent.
+
+The normal own-message filter therefore remains intact globally.
+`M365_TEAMS_AUTOMATION_PEERS` provides an explicit per-one-to-one-chat
+exception. The configuration contains **peer IDs**, not sender IDs.
+
+For a configured automation chat, m365-tui may reinterpret a self-authored
+Graph message as incoming automation. The exception is deliberately scoped to
+that peer and is never applied globally.
+
+Messages sent from the current m365-tui process are tracked using the
+`ChatMessage.id` returned by the Graph POST. Those IDs remain classified as
+local outgoing messages even when the destination chat is an automation peer.
+
+The mechanism cannot identify messages manually sent from another Teams client
+using the same account. Graph does not provide enough provenance to reliably
+distinguish those messages from Workflows **Post as User**.
+
+Real application/bot messages represented by `from.application` continue
+through the separate application-sender path.
+
 ## Diagnostics
 
 `F6` opens a read-only diagnostics overlay. Network-backed details are
@@ -142,14 +167,26 @@ none is usable; `l` always writes the log. This avoids making successful support
 export depend on terminal OSC 52 support.
 
 `F7` adds a contextual diagnostics snapshot for the selected Teams one-to-one
-contact. It records only identity classification (member type, GUID availability,
-safe ID-shape labels such as `MRI consumer (8:live:)`, and same/external/unknown
-tenant relation) plus safe batch/direct Graph presence results. Name diagnostics
-report availability and source only: the current roster/preview/cache state is
-compared with fresh expanded-chat, dedicated `/members`, and recent-message
-probes. Recent-message diagnostics also count peer messages and how many carry a
-non-empty `displayName`, making intermittent personal-account metadata visible
-without exporting the actual name.
+contact. It normally reports identity classification rather than raw identity
+material, but the selected peer ID is intentionally rendered and copyable
+because it is configuration data required by `M365_TEAMS_AUTOMATION_PEERS`.
+Other private diagnostic identifiers remain hidden.
+
+`i` copies that peer ID and writes the ID plus complete `.env` and `export`
+forms to the runtime log. `a` starts the automation-peer configuration flow.
+When startup loaded a concrete `.env` file, the user must explicitly confirm
+with `y` before m365-tui updates `M365_TEAMS_AUTOMATION_PEERS` in that same
+file. The peer is also activated in runtime state immediately.
+
+When `M365_TEAMS_AUTOMATION_PEERS` came from the process environment, or when no
+`.env` file was loaded, F7 does not try to persist the change. It still logs the
+copyable configuration forms.
+
+F7 continues to report safe ID-shape labels, same/external/unknown tenant
+relation, contact-name source availability, fresh expanded-chat, `/members` and
+recent-message probes, batch/direct Graph presence and the read-only Teams
+diagnostic chain without exporting names, email addresses, tokens, MRIs, tenant
+IDs or raw service responses.
 
 For one-to-one contacts whose roster omits `displayName`, the application can
 learn the display name from message sender identity. Name learning scans the
@@ -176,9 +213,13 @@ configurations keep working. Resolution is deliberately simple:
 3. no persistent Teams/UI state when neither is set
 
 When both are present, the new variable wins. Compatibility warnings are kept
-out of the alternate-screen TUI and are printed only after it exits. The
-application does not rewrite `.env`, move cache data, or invent an implicit
-`~/.cache/m365-tui` root.
+out of the alternate-screen TUI and are printed only after it exits. m365-tui
+does not normally rewrite configuration files, move cache data, or invent an
+implicit `~/.cache/m365-tui` root. The one interactive exception is the
+explicit F7 automation-peer action: when startup loaded a concrete `.env` file,
+the user may press `a` and then confirm with `y` to update
+`M365_TEAMS_AUTOMATION_PEERS` in that same file. No `.env` file is created when
+one was not loaded, and process-environment configuration is never overwritten.
 
 The authentication token cache is separate. `M365_TOKEN_CACHE` retains its own
 existing default and is not redirected by `M365_CACHE_DIR`.
