@@ -6999,7 +6999,11 @@ impl App {
             .as_deref()
             .is_some_and(|kind| kind.eq_ignore_ascii_case("oneOnOne"));
         let chat_type = chat.chat_type.clone();
-        let fallback_label = chat.label(my_id.as_deref());
+        let fallback_label = teams_notification_label(
+            self.teams.contact_names.get(chat_id).map(String::as_str),
+            chat,
+            my_id.as_deref(),
+        );
         let open = self.teams.open_chat_id.as_deref() == Some(chat_id);
 
         if application_sender {
@@ -7790,15 +7794,20 @@ impl App {
                 continue;
             }
 
+            let fallback_label = teams_notification_label(
+                self.teams.contact_names.get(&chat.id).map(String::as_str),
+                chat,
+                my_id.as_deref(),
+            );
             let who = if automation_sender {
-                chat.label(my_id.as_deref())
+                fallback_label.clone()
             } else {
                 preview
                     .from
                     .as_ref()
                     .and_then(|from| from.user.as_ref().or(from.application.as_ref()))
                     .and_then(|sender| sender.display_name.clone())
-                    .unwrap_or_else(|| chat.label(my_id.as_deref()))
+                    .unwrap_or(fallback_label)
             };
             let title = if mentioned {
                 format!("{who} mentioned you")
@@ -10281,6 +10290,23 @@ fn parse_vmrss(status: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Prefer the learned 1:1 contact name for notification titles.
+///
+/// Automation messages posted "as user" carry our own identity as the sender,
+/// so `Chat::label()` can otherwise fall all the way back to the raw chat type
+/// (`oneOnOne`). The learned contact name is the actual peer/notifier name.
+fn teams_notification_label(
+    learned_name: Option<&str>,
+    chat: &Chat,
+    me_id: Option<&str>,
+) -> String {
+    learned_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| chat.label(me_id))
 }
 
 /// Return the first non-empty displayName found on any message from the peer.
