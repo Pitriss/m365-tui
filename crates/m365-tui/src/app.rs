@@ -1441,7 +1441,7 @@ fn is_supported_teams_image_name(name: &str) -> bool {
 
 const TEAMS_DISK_CACHE_KEY_HEX_LEN: usize = 32;
 const TEAMS_CONVERSATION_CACHE_DIR: &str = "conversations";
-const TEAMS_CONVERSATION_CACHE_VERSION: u64 = 1;
+const TEAMS_CONVERSATION_CACHE_VERSION: u64 = 2;
 const MAX_TEAMS_CONVERSATION_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TEAMS_CACHED_MESSAGES: usize = 2000;
 static TEAMS_CACHE_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1529,9 +1529,18 @@ fn store_teams_conversation_cache(
     max_bytes: u64,
 ) -> std::io::Result<()> {
     let cache_dir = cache_root.join(TEAMS_CONVERSATION_CACHE_DIR);
-    create_private_cache_dir(&cache_dir)?;
-
     let final_path = teams_conversation_cache_path(cache_root, chat_id);
+
+    if messages.is_empty() {
+        match std::fs::remove_file(&final_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(());
+    }
+
+    create_private_cache_dir(&cache_dir)?;
 
     // Keep the newest bounded slice instead of dropping the cache completely
     // after a user has paged far back in a long-running conversation.
@@ -4356,6 +4365,43 @@ impl App {
     fn remember_contact_from_messages(&mut self, chat_id: &str, messages: &[ChatMessage]) -> bool {
         let me_id = self.me.as_ref().map(|me| me.id.as_str());
 
+        // For Microsoft personal-account 1:1 chats the roster userId is the
+        // authoritative peer identity. Message sender identities can be aadUser
+        // GUIDs (notably Workflows/Post as User) and must never replace that
+        // opaque personal-account id in contact_user_ids.
+        let personal_roster_peer_id = self
+            .teams
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| {
+                chat.members.iter().find(|member| {
+                    me_id
+                        .map(|id| member.user_id.as_deref() != Some(id))
+                        .unwrap_or(true)
+                        && member
+                            .odata_type
+                            .as_deref()
+                            .is_some_and(|kind| {
+                                kind.ends_with("microsoftAccountUserConversationMember")
+                            })
+                })
+            })
+            .and_then(|member| member.user_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let mut learned_peer_id = false;
+        if let Some(peer_id) = personal_roster_peer_id.as_deref() {
+            learned_peer_id = self
+                .teams
+                .contact_user_ids
+                .insert(chat_id.to_string(), peer_id.to_string())
+                .as_deref()
+                != Some(peer_id);
+        }
+
         if self.teams.own_tenant_id.is_none() {
             self.teams.own_tenant_id = self.configured_tenant_id().map(str::to_string);
         }
@@ -4384,27 +4430,33 @@ impl App {
                     .unwrap_or(false)
             })
         else {
-            return false;
+            return learned_peer_id;
         };
 
-        if let Some(name) = peer_display_name_from_messages(messages, me_id) {
+        if let Some(name) = peer_display_name_from_messages(
+            messages,
+            me_id,
+            personal_roster_peer_id.as_deref(),
+        ) {
             self.teams
                 .contact_names
                 .insert(chat_id.to_string(), name.to_string());
         }
 
-        let learned_peer_id = peer
-            .id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some_and(|id| {
-                self.teams
-                    .contact_user_ids
-                    .insert(chat_id.to_string(), id.to_string())
-                    .as_deref()
-                    != Some(id)
-            });
+        if personal_roster_peer_id.is_none() {
+            learned_peer_id |= peer
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|id| {
+                    self.teams
+                        .contact_user_ids
+                        .insert(chat_id.to_string(), id.to_string())
+                        .as_deref()
+                        != Some(id)
+                });
+        }
 
         let federated = peer
             .user_identity_type
@@ -6886,29 +6938,22 @@ impl App {
         tokio::spawn(async move {
             let cache_chat_id = chat_id.clone();
             match tokio::task::spawn_blocking(move || {
-                // Cache files store newest-first. Merge the fresh newest page
-                // with older cached history so a hot poll never truncates a
-                // conversation the user previously paged through.
-                let mut newest_first = fresh;
-                if let Some((cached, _)) =
-                    load_teams_conversation_cache(&cache_root, &cache_chat_id)?
-                {
-                    let mut known: std::collections::HashSet<String> = newest_first
-                        .iter()
-                        .map(|message| message.id.clone())
-                        .collect();
-                    for message in cached {
-                        if known.insert(message.id.clone()) {
-                            newest_first.push(message);
-                        }
-                    }
+                // The freshly fetched newest page is authoritative for its
+                // covered time range. Keep genuinely older cached history, but
+                // do not resurrect entries that disappeared from Graph inside
+                // the fresh window. Deleted tombstones are not persisted.
+                let cached = load_teams_conversation_cache(&cache_root, &cache_chat_id)?
+                    .map(|(messages, _)| messages)
+                    .unwrap_or_default();
+                let mut oldest_first = reconcile_authoritative_message_window(fresh, cached);
+                if oldest_first.len() > MAX_TEAMS_CACHED_MESSAGES {
+                    let drop = oldest_first.len() - MAX_TEAMS_CACHED_MESSAGES;
+                    oldest_first.drain(..drop);
                 }
-                newest_first.truncate(MAX_TEAMS_CACHED_MESSAGES);
-                newest_first.reverse();
                 store_teams_conversation_cache(
                     &cache_root,
                     &cache_chat_id,
-                    &newest_first,
+                    &oldest_first,
                     cache_max_bytes,
                 )
             })
@@ -7428,16 +7473,13 @@ impl App {
                     self.teams.unseen += arrived;
                 }
 
-                // The fetched page supersedes the newest window; everything
-                // older that the user has scrolled back through is kept.
-                let fresh: std::collections::HashSet<String> =
-                    page.iter().map(|m| m.id.clone()).collect();
-                let mut kept: Vec<ChatMessage> = std::mem::take(&mut self.teams.messages)
-                    .into_iter()
-                    .filter(|m| !fresh.contains(&m.id))
-                    .collect();
-                kept.extend(page);
-                self.teams.messages = kept;
+                // The fetched page is authoritative for its newest covered
+                // time window. Keep only cached history that is genuinely older
+                // than that boundary; entries missing from Graph inside the
+                // window are stale and must disappear. Fresh deleted tombstones
+                // remove their cached originals and are not rendered/persisted.
+                let existing = std::mem::take(&mut self.teams.messages);
+                self.teams.messages = reconcile_authoritative_message_window(page, existing);
             }
         }
 
@@ -10317,13 +10359,20 @@ fn teams_notification_label(
 fn peer_display_name_from_messages<'a>(
     messages: &'a [ChatMessage],
     me_id: Option<&str>,
+    expected_peer_id: Option<&str>,
 ) -> Option<&'a str> {
     let me_id = me_id?;
 
     messages
         .iter()
         .filter_map(|message| message.from.as_ref()?.user.as_ref())
-        .filter(|user| user.id.as_deref() != Some(me_id))
+        .filter(|user| {
+            if let Some(expected_peer_id) = expected_peer_id {
+                user.id.as_deref() == Some(expected_peer_id)
+            } else {
+                user.id.as_deref() != Some(me_id)
+            }
+        })
         .filter_map(|user| user.display_name.as_deref())
         .map(str::trim)
         .find(|name| !name.is_empty())
@@ -10396,6 +10445,62 @@ fn validate_plain_message_edit(message: &ChatMessage) -> Result<(), &'static str
         return Err("editing messages with attachments or mentions is not supported yet");
     }
     Ok(())
+}
+
+/// Strict chronological key used when deciding whether a cached message falls
+/// inside a freshly fetched authoritative window. Unlike `sort_key`, missing or
+/// malformed creation times return None so uncertain old cache entries are kept
+/// conservatively rather than deleted by guesswork.
+fn authoritative_message_key(message: &ChatMessage) -> Option<(i64, u64)> {
+    let created = message
+        .created_date_time
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?
+        .timestamp_millis();
+    let id = message.id.parse::<u64>().unwrap_or(0);
+    Some((created, id))
+}
+
+/// Merge a freshly fetched newest server window with previously cached history.
+///
+/// The fresh page is authoritative for every message at or newer than its oldest
+/// trustworthy key. Cached messages in that range that are absent from the fresh
+/// page are stale and are dropped. Cached messages older than the boundary are
+/// retained because they may belong to pages that were not fetched this time.
+/// Fresh deleted tombstones remove matching cached messages but are not retained.
+fn reconcile_authoritative_message_window(
+    fresh: Vec<ChatMessage>,
+    existing: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    if fresh.is_empty() {
+        return Vec::new();
+    }
+
+    let fresh_ids: std::collections::HashSet<String> =
+        fresh.iter().map(|message| message.id.clone()).collect();
+    let oldest_fresh = fresh.iter().filter_map(authoritative_message_key).min();
+
+    let mut merged: Vec<ChatMessage> = existing
+        .into_iter()
+        .filter(|message| {
+            if message.deleted_date_time.is_some() || fresh_ids.contains(&message.id) {
+                return false;
+            }
+
+            match (oldest_fresh, authoritative_message_key(message)) {
+                (Some(boundary), Some(key)) => key < boundary,
+                _ => true,
+            }
+        })
+        .collect();
+
+    merged.extend(
+        fresh
+            .into_iter()
+            .filter(|message| message.deleted_date_time.is_none()),
+    );
+    merged.sort_by_key(sort_key);
+    merged
 }
 
 /// Chronological sort key for a Teams message: creation time, then id.
@@ -10545,7 +10650,7 @@ mod contact_name_learning_tests {
         ];
 
         assert_eq!(
-            peer_display_name_from_messages(&messages, Some("me")),
+            peer_display_name_from_messages(&messages, Some("me"), None),
             Some("Personal Contact")
         );
     }
@@ -10558,13 +10663,52 @@ mod contact_name_learning_tests {
             message("3", "peer", None),
         ];
 
-        assert_eq!(peer_display_name_from_messages(&messages, Some("me")), None);
+        assert_eq!(peer_display_name_from_messages(&messages, Some("me"), None), None);
     }
 
     #[test]
     fn requires_signed_in_user_id() {
         let messages = vec![message("1", "peer", Some("Personal Contact"))];
-        assert_eq!(peer_display_name_from_messages(&messages, None), None);
+        assert_eq!(peer_display_name_from_messages(&messages, None, None), None);
+    }
+
+    #[test]
+    fn personal_chat_name_ignores_unrelated_aad_sender() {
+        let messages = vec![
+            message(
+                "1",
+                "c4e05f66-261e-42a3-b590-df5eb4fb54fd",
+                Some("Wrong Entra Identity"),
+            ),
+            message("2", "47885ff3e9ffcead", Some("Jira Notifier")),
+        ];
+
+        assert_eq!(
+            peer_display_name_from_messages(
+                &messages,
+                Some("me"),
+                Some("47885ff3e9ffcead"),
+            ),
+            Some("Jira Notifier")
+        );
+    }
+
+    #[test]
+    fn personal_chat_name_does_not_fall_back_to_aad_sender() {
+        let messages = vec![message(
+            "1",
+            "c4e05f66-261e-42a3-b590-df5eb4fb54fd",
+            Some("Wrong Entra Identity"),
+        )];
+
+        assert_eq!(
+            peer_display_name_from_messages(
+                &messages,
+                Some("me"),
+                Some("47885ff3e9ffcead"),
+            ),
+            None
+        );
     }
 }
 
@@ -10829,8 +10973,9 @@ mod hot_poll_tests {
 mod tests {
     use super::{
         calendar_reminder_threshold_minutes, merge_newest_first, next_field, ntfy_presence_is_away,
-        parse_recipients, step,
+        parse_recipients, reconcile_authoritative_message_window, step,
     };
+    use m365_core::models::ChatMessage;
 
     #[test]
     fn ntfy_away_mode_is_strictly_graph_away() {
@@ -10962,6 +11107,72 @@ mod tests {
         let fresh = vec!["e", "d", "c"];
         let merged = merge_newest_first(fresh, existing, |s: &&str| s.to_string());
         assert_eq!(merged, vec!["e", "d", "c", "b", "a"]);
+    }
+
+    fn cached_chat_message(
+        id: &str,
+        created: &str,
+        body: &str,
+        deleted: bool,
+    ) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "createdDateTime": created,
+            "body": {
+                "contentType": "text",
+                "content": body
+            },
+            "deletedDateTime": deleted.then_some("2026-10-15T12:00:00Z")
+        }))
+        .expect("valid cached chat-message fixture")
+    }
+
+    #[test]
+    fn authoritative_message_window_drops_stale_entries_but_keeps_older_history() {
+        let fresh = vec![
+            cached_chat_message("3000", "2026-10-15T10:03:00Z", "newest", false),
+            cached_chat_message("2000", "2026-10-15T10:02:00Z", "fresh replacement", false),
+        ];
+        let existing = vec![
+            cached_chat_message("1000", "2026-10-15T10:01:00Z", "older page", false),
+            cached_chat_message("2000", "2026-10-15T10:02:00Z", "old body", false),
+            cached_chat_message("2500", "2026-10-15T10:02:30Z", "stale ghost", false),
+        ];
+
+        let merged = reconcile_authoritative_message_window(fresh, existing);
+        let ids: Vec<&str> = merged.iter().map(|message| message.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["1000", "2000", "3000"]);
+        assert_eq!(merged[1].text(), "fresh replacement");
+    }
+
+    #[test]
+    fn authoritative_message_window_uses_delete_tombstone_to_purge_cache() {
+        let fresh = vec![
+            cached_chat_message("3000", "2026-10-15T10:03:00Z", "deleted", true),
+            cached_chat_message("2000", "2026-10-15T10:02:00Z", "still here", false),
+        ];
+        let existing = vec![
+            cached_chat_message("1000", "2026-10-15T10:01:00Z", "older page", false),
+            cached_chat_message("3000", "2026-10-15T10:03:00Z", "old cached copy", false),
+        ];
+
+        let merged = reconcile_authoritative_message_window(fresh, existing);
+        let ids: Vec<&str> = merged.iter().map(|message| message.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["1000", "2000"]);
+    }
+
+    #[test]
+    fn empty_authoritative_message_window_clears_cached_conversation() {
+        let existing = vec![cached_chat_message(
+            "1000",
+            "2026-10-15T10:01:00Z",
+            "stale",
+            false,
+        )];
+
+        assert!(reconcile_authoritative_message_window(Vec::new(), existing).is_empty());
     }
 
     #[test]
