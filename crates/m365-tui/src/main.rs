@@ -22,6 +22,7 @@ mod files;
 mod navigation;
 mod notify;
 mod opener;
+pub mod out_of_office;
 mod ui;
 mod wrap;
 
@@ -32,7 +33,8 @@ use anyhow::{Context, Result};
 use app::{App, AppMessage, PushState, HOT_POLL_TICK_SECONDS, POLL_SECONDS};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind,
+    EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let cache_warning = session.config.cache_warning();
+    let compatibility_warning = session.config.compatibility_warning();
 
     // The Teams resource-consent diagnostic is intentionally isolated from
     // the normal Graph login/cache. It never writes the primary token cache and
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
             &result.existing_refresh_token,
         );
         println!("Primary Graph token cache: untouched");
-        if let Some(warning) = cache_warning.as_deref() {
+        if let Some(warning) = compatibility_warning.as_deref() {
             eprintln!("\n{warning}");
         }
         return Ok(());
@@ -158,9 +160,9 @@ async fn main() -> Result<()> {
         Command::Tui => run_tui(session).await,
     };
 
-    // Never print cache-variable compatibility warnings while the alternate
+    // Never print deprecated-configuration compatibility warnings while the alternate
     // screen is active. For TUI mode run_tui() has already restored the terminal.
-    if let Some(warning) = cache_warning.as_deref() {
+    if let Some(warning) = compatibility_warning.as_deref() {
         eprintln!("\n{warning}");
     }
 
@@ -269,11 +271,33 @@ async fn run_tui(session: Session) -> Result<()> {
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+
+    // Kitty keyboard progressive enhancement makes modified Enter distinct
+    // from plain Enter. Query before EventStream starts, otherwise the query
+    // response could race with the async event reader.
+    let keyboard_enhancement =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhancement {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )?;
+    }
+
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let res = event_loop(&mut terminal, &mut app, &mut app_rx, &mut change_rx).await;
 
-    // Terminal teardown (best-effort even on error).
+    // Terminal teardown (best-effort even on error). Keyboard enhancement
+    // was pushed on the alternate-screen stack, so pop it before leaving that
+    // screen.
+    if keyboard_enhancement {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
+    }
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),

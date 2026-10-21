@@ -299,6 +299,9 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::ConfirmAutomationPeer { .. } => "y add automation peer · any other key cancel",
             Overlay::Presence => "1-6 set · m message · c clear message · a auto · Esc close",
             Overlay::PresenceMessage(_) => "Enter set · Esc cancel",
+            Overlay::OutOfOffice(_) => "s set/edit · c clear · w web · Esc close",
+            Overlay::OutOfOfficeEdit(_) => "Tab next · ←/→ audience · PgUp/PgDn scroll · Enter save · Space types normally",
+            Overlay::ConfirmOutOfOfficeClear => "y clear · any other key cancel",
             Overlay::NtfySnooze { .. } => "j/k choose · Enter apply · c/0 resume · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
@@ -2355,6 +2358,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
  /pins               show current pinned message; Enter jump · u unpin
  /unread             mark current chat unread
  /delete             delete selected own message (asks confirmation)
+ /ooo                show Out of Office
+ /ooo set            set/edit scheduled Out of Office
+ /ooo clear          disable Out of Office (asks confirmation)
  /help               show this command list
  /help all           show full application/key help
 
@@ -2407,6 +2413,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
           a/i type message · r reply to selected · Enter send/save\n\
           /topic <text> (group only) · /rename <name> (group only)\n\
           /edit <text> · /pin · /unpin · /pins · /unread · /delete\n\
+          /ooo · /ooo set · /ooo clear\n\
           /help commands only · /help all full help\n\
           Markdown: **bold** · *italic* · ~~strike~~ · `code` · > quote · - list · [text](url)\n\
  \n\
@@ -2994,6 +3001,349 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 )),
                 rows[2],
             );
+        }
+        Overlay::OutOfOffice(view) => {
+            let area = centered(82, 74, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(view.text())
+                    .wrap(Wrap { trim: false })
+                    .block(popup_block("Out of office")),
+                area,
+            );
+        }
+        Overlay::ConfirmOutOfOfficeClear => {
+            let area = centered(62, 26, f.area());
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(
+                    "Disable automatic Out of Office replies?\n\nPress y to clear. Any other key cancels.",
+                )
+                .wrap(Wrap { trim: false })
+                .block(popup_block("Clear Out of Office?")),
+                area,
+            );
+        }
+        Overlay::OutOfOfficeEdit(editor) => {
+            const FORM_HEIGHT: u16 = 17;
+
+            let area = centered(96, 94, f.area());
+            f.render_widget(Clear, area);
+            let block = popup_block("Set Out of Office · PgUp/PgDn scroll");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            if inner.width == 0 || inner.height == 0 {
+                return;
+            }
+
+            let viewport_h = inner.height;
+            let max_scroll = FORM_HEIGHT.saturating_sub(viewport_h);
+            let mut scroll = editor.scroll.min(max_scroll);
+            let focus_y = editor.focus_row();
+
+            if focus_y < scroll {
+                scroll = focus_y;
+            } else if focus_y >= scroll.saturating_add(viewport_h) {
+                scroll = focus_y
+                    .saturating_add(1)
+                    .saturating_sub(viewport_h)
+                    .min(max_scroll);
+            }
+
+            let line_rect = |virtual_y: u16| -> Option<Rect> {
+                if virtual_y < scroll || virtual_y >= scroll.saturating_add(viewport_h) {
+                    None
+                } else {
+                    Some(Rect::new(
+                        inner.x,
+                        inner.y + virtual_y - scroll,
+                        inner.width,
+                        1,
+                    ))
+                }
+            };
+
+            let render_segment = |f: &mut Frame,
+                                  area: Rect,
+                                  input: &crate::editor::TextInput,
+                                  focused: bool,
+                                  digits: usize| {
+                let text = input.text();
+                let shown = format!(" {:width$} ", text, width = digits);
+                let style = if focused {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(Color::DarkGray)
+                };
+                f.render_widget(Paragraph::new(shown).style(style), area);
+
+                if focused {
+                    let col = area
+                        .x
+                        .saturating_add(1)
+                        .saturating_add(input.cursor().min(digits) as u16)
+                        .min(area.x + area.width.saturating_sub(1));
+                    f.set_cursor_position((col, area.y));
+                }
+            };
+
+            if let Some(row) = line_rect(0) {
+                f.render_widget(
+                    Paragraph::new(format!("Time zone: {} · DST-aware", editor.local_zone))
+                        .style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(1) {
+                let zone_note = editor
+                    .mailbox_zone
+                    .as_deref()
+                    .filter(|zone| *zone != editor.local_zone)
+                    .map(|zone| format!("Mailbox zone: {zone}"))
+                    .unwrap_or_default();
+                f.render_widget(
+                    Paragraph::new(zone_note).style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+
+            let render_date = |f: &mut Frame,
+                               row: Rect,
+                               label: &str,
+                               year: &crate::editor::TextInput,
+                               month: &crate::editor::TextInput,
+                               day: &crate::editor::TextInput,
+                               field: usize,
+                               year_field: usize,
+                               month_field: usize,
+                               day_field: usize| {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(12),
+                        Constraint::Length(6),
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Min(0),
+                    ])
+                    .split(row);
+                f.render_widget(Paragraph::new(label), cols[0]);
+                render_segment(f, cols[1], year, field == year_field, 4);
+                f.render_widget(Paragraph::new("-"), cols[2]);
+                render_segment(f, cols[3], month, field == month_field, 2);
+                f.render_widget(Paragraph::new("-"), cols[4]);
+                render_segment(f, cols[5], day, field == day_field, 2);
+            };
+
+            let render_time = |f: &mut Frame,
+                               row: Rect,
+                               label: &str,
+                               hour: &crate::editor::TextInput,
+                               minute: &crate::editor::TextInput,
+                               detail: String,
+                               field: usize,
+                               hour_field: usize,
+                               minute_field: usize| {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(12),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(2),
+                        Constraint::Min(0),
+                    ])
+                    .split(row);
+                f.render_widget(Paragraph::new(label), cols[0]);
+                render_segment(f, cols[1], hour, field == hour_field, 2);
+                f.render_widget(Paragraph::new(":"), cols[2]);
+                render_segment(f, cols[3], minute, field == minute_field, 2);
+                f.render_widget(Paragraph::new("  "), cols[4]);
+                f.render_widget(
+                    Paragraph::new(detail).style(Style::default().fg(DIM)),
+                    cols[5],
+                );
+            };
+
+            if let Some(row) = line_rect(2) {
+                render_date(
+                    f,
+                    row,
+                    "Start date:",
+                    &editor.start_year,
+                    &editor.start_month,
+                    &editor.start_day,
+                    editor.field,
+                    crate::out_of_office::START_YEAR,
+                    crate::out_of_office::START_MONTH,
+                    crate::out_of_office::START_DAY,
+                );
+            }
+
+            if let Some(row) = line_rect(3) {
+                render_time(
+                    f,
+                    row,
+                    "Start time:",
+                    &editor.start_hour,
+                    &editor.start_minute,
+                    editor.start_detail(),
+                    editor.field,
+                    crate::out_of_office::START_HOUR,
+                    crate::out_of_office::START_MINUTE,
+                );
+            }
+
+            if let Some(row) = line_rect(4) {
+                render_date(
+                    f,
+                    row,
+                    "End date:",
+                    &editor.end_year,
+                    &editor.end_month,
+                    &editor.end_day,
+                    editor.field,
+                    crate::out_of_office::END_YEAR,
+                    crate::out_of_office::END_MONTH,
+                    crate::out_of_office::END_DAY,
+                );
+            }
+
+            if let Some(row) = line_rect(5) {
+                render_time(
+                    f,
+                    row,
+                    "End time:",
+                    &editor.end_hour,
+                    &editor.end_minute,
+                    editor.end_detail(),
+                    editor.field,
+                    crate::out_of_office::END_HOUR,
+                    crate::out_of_office::END_MINUTE,
+                );
+            }
+
+            if let Some(row) = line_rect(6) {
+                let audience_style = if editor.is_audience_field() {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(Color::DarkGray)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(" Audience: {} ", editor.audience.label()))
+                        .style(audience_style),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(7) {
+                let validation = editor
+                    .validation_error
+                    .as_deref()
+                    .map(|error| format!("Validation: {error}"))
+                    .unwrap_or_default();
+                f.render_widget(
+                    Paragraph::new(validation).style(Style::default().fg(Color::Red)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(8) {
+                let mut schedule_note = String::new();
+                if editor.dst_transition() {
+                    schedule_note.push_str("DST transition occurs inside this interval. ");
+                }
+                if let Some(stored_zone) = editor.stored_zone.as_deref() {
+                    if stored_zone != "UTC" && stored_zone != editor.local_zone {
+                        schedule_note.push_str(&format!(
+                            "Existing schedule used {stored_zone}; saving uses the configured local zone."
+                        ));
+                    }
+                }
+                f.render_widget(
+                    Paragraph::new(schedule_note).style(Style::default().fg(Color::Yellow)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(9) {
+                let label_style = if editor.is_message_field() {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "Message{}:",
+                        if app.session.config.teams_markdown {
+                            " · Markdown enabled"
+                        } else {
+                            " · plain text"
+                        }
+                    ))
+                    .style(label_style),
+                    row,
+                );
+            }
+
+            let message_start = 10u16;
+            let message_end = 15u16;
+            let visible_start = message_start.max(scroll);
+            let visible_end = message_end.min(scroll.saturating_add(viewport_h));
+            if visible_start < visible_end {
+                let message_area = Rect::new(
+                    inner.x,
+                    inner.y + visible_start - scroll,
+                    inner.width,
+                    visible_end - visible_start,
+                );
+
+                let message_bg = if editor.is_message_field() {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                f.render_widget(Block::default().style(message_bg), message_area);
+
+                if let Some((x, y)) =
+                    render_text_area(f, message_area, &editor.message, editor.is_message_field())
+                {
+                    f.set_cursor_position((x, y));
+                }
+            }
+
+            if let Some(row) = line_rect(15) {
+                let scroll_note = if max_scroll > 0 {
+                    format!("Scroll: {scroll}/{max_scroll} · PgUp/PgDn")
+                } else {
+                    "Tab validates/next · Shift+Tab previous · ←/→ changes Audience".to_string()
+                };
+                f.render_widget(
+                    Paragraph::new(scroll_note).style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
+
+            if let Some(row) = line_rect(16) {
+                f.render_widget(
+                    Paragraph::new(
+                        "Enter save · Shift+Enter newline · Ctrl+J fallback · Esc cancel",
+                    )
+                    .style(Style::default().fg(DIM)),
+                    row,
+                );
+            }
         }
         Overlay::Presence => {
             let area = centered(64, 82, f.area());

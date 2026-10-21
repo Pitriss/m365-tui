@@ -13,10 +13,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use m365_core::config::{NtfyMode, TeamsSystemEvents, TEAMS_POLL_BUDGET_MIN_RPS};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
-    Attachment, Chat, ChatMessage, Event as CalEvent, IdentitySet, MailFolder, MailMessage, Person,
-    Presence, SystemEventClass, Team, User,
+    Attachment, Chat, ChatMessage, Event as CalEvent, IdentitySet, MailFolder, MailMessage,
+    MailboxSettingsSnapshot, Person, Presence, SystemEventClass, Team, User,
 };
-use m365_core::{calendar, channels, chats, mail, people, teams_presence, work_plan, Session};
+use m365_core::{
+    calendar, channels, chats, mail, mailbox, people, teams_presence, work_plan, Session,
+};
 use ratatui::text::Text;
 use tokio::sync::mpsc;
 
@@ -28,6 +30,7 @@ use crate::diagnostics::{
 use crate::editor::TextInput;
 use crate::navigation;
 use crate::notify::NotificationPriority;
+use crate::out_of_office;
 use crate::presence_state::{
     PresenceStateDiagnostics, PresenceStateManager, PresenceWrite, SessionTarget, WriteReason,
     AVAILABLE, AWAY,
@@ -165,6 +168,13 @@ pub enum AppMessage {
     },
     /// Silent Microsoft 365 work-plan result used by `alwayswd` / `awaywd`.
     NtfyWorkPlan(bool),
+    /// Fresh mailbox settings for /ooo or /ooo set.
+    OutOfOfficeLoaded {
+        settings: MailboxSettingsSnapshot,
+        edit: bool,
+    },
+    /// Completion of an OOO write.
+    OutOfOfficeSaved(String),
     /// Fresh read-only data for the F6 diagnostics overlay.
     DiagnosticsLoaded(DiagnosticsRemote),
     /// Fresh read-only data for the selected-contact F7 diagnostics overlay.
@@ -240,6 +250,9 @@ enum TeamsSlashCommand {
     Pins,
     Unread,
     Delete,
+    OutOfOffice,
+    OutOfOfficeSet,
+    OutOfOfficeClear,
     Help,
     HelpAll,
 }
@@ -349,6 +362,12 @@ pub enum Overlay {
     Presence,
     /// Single-line editor for the Teams presence status message.
     PresenceMessage(TextInput),
+    /// Read-only Outlook/Teams Out of Office state.
+    OutOfOffice(Box<out_of_office::View>),
+    /// Scheduled Out of Office editor.
+    OutOfOfficeEdit(Box<out_of_office::Editor>),
+    /// Confirmation before disabling automatic replies.
+    ConfirmOutOfOfficeClear,
     /// Temporary pause for ntfy forwarding.
     NtfySnooze {
         sel: usize,
@@ -6461,6 +6480,20 @@ impl App {
             AppMessage::NtfyWorkPlan(working) => {
                 self.ntfy_working_now = Some(working);
             }
+            AppMessage::OutOfOfficeLoaded { settings, edit } => {
+                self.status.clear();
+                self.overlay = Some(if edit {
+                    Overlay::OutOfOfficeEdit(Box::new(out_of_office::Editor::from_settings(
+                        &settings,
+                    )))
+                } else {
+                    Overlay::OutOfOffice(Box::new(out_of_office::View::from_settings(settings)))
+                });
+            }
+            AppMessage::OutOfOfficeSaved(status) => {
+                self.overlay = None;
+                self.status = status;
+            }
             AppMessage::DiagnosticsLoaded(remote) => {
                 self.diagnostics.remote = Some(remote);
                 self.diagnostics.loading = false;
@@ -7587,11 +7620,18 @@ impl App {
         }
     }
 
+    fn open_web_link(&self, url: &str) -> anyhow::Result<()> {
+        match self.session.config.web_link_opener.as_deref() {
+            Some(executable) => crate::opener::open_url_with(url, executable),
+            None => crate::opener::open_url(url),
+        }
+    }
+
     fn open_link(&mut self, index: usize) {
         let Some(url) = self.focused_links().get(index).cloned() else {
             return;
         };
-        match crate::opener::open_url(&url) {
+        match self.open_web_link(&url) {
             Ok(()) => self.status = format!("opening {}", truncate_url(&url)),
             Err(e) => self.status = format!("could not open link: {e:#}"),
         }
@@ -8543,10 +8583,7 @@ impl App {
             return;
         };
 
-        let result = match self.session.config.meeting_opener.as_deref() {
-            Some(executable) => crate::opener::open_url_with(&url, executable),
-            None => crate::opener::open_url(&url),
-        };
+        let result = self.open_web_link(&url);
 
         match result {
             Ok(()) => self.status = "opening online meeting".into(),
@@ -9234,6 +9271,83 @@ impl App {
         self.status = "editing message".into();
     }
 
+    fn out_of_office_ready(&mut self) -> bool {
+        if !self.session.config.out_of_office {
+            self.status =
+                "Out of Office is disabled; set M365_OUT_OF_OFFICE=1 and sign in again".into();
+            return false;
+        }
+        if !self.session.config.can_write_out_of_office() {
+            self.status =
+                "Out of Office needs MailboxSettings.ReadWrite in M365_SCOPES".into();
+            return false;
+        }
+        true
+    }
+
+    fn load_out_of_office(&mut self, edit: bool) {
+        if !self.out_of_office_ready() {
+            return;
+        }
+        let s = self.session.clone();
+        self.status = "loading Out of Office…".into();
+        self.spawn(async move {
+            let settings = mailbox::settings(&s.graph)
+                .await
+                .context("loading Out of Office settings")?;
+            Ok(AppMessage::OutOfOfficeLoaded { settings, edit })
+        });
+    }
+
+    fn save_out_of_office(&mut self, editor: out_of_office::Editor) {
+        if !self.out_of_office_ready() {
+            self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(editor)));
+            return;
+        }
+        let setting = match editor.setting(self.session.config.teams_markdown) {
+            Ok(setting) => setting,
+            Err(error) => {
+                self.status = error;
+                self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(editor)));
+                return;
+            }
+        };
+
+        let s = self.session.clone();
+        self.status = "saving Out of Office…".into();
+        self.spawn(async move {
+            mailbox::set_automatic_replies(&s.graph, &setting)
+                .await
+                .context("saving Out of Office settings")?;
+            Ok(AppMessage::OutOfOfficeSaved(
+                "Out of Office scheduled".into(),
+            ))
+        });
+    }
+
+    fn clear_out_of_office(&mut self) {
+        if !self.out_of_office_ready() {
+            return;
+        }
+        let s = self.session.clone();
+        self.status = "disabling Out of Office…".into();
+        self.spawn(async move {
+            mailbox::clear_automatic_replies(&s.graph)
+                .await
+                .context("disabling Out of Office")?;
+            Ok(AppMessage::OutOfOfficeSaved(
+                "Out of Office disabled".into(),
+            ))
+        });
+    }
+
+    fn open_out_of_office_web(&mut self) {
+        match self.open_web_link(out_of_office::OUTLOOK_OOO_URL) {
+            Ok(()) => self.status = "opening Outlook Web automatic replies".into(),
+            Err(error) => self.status = format!("could not open Outlook Web: {error:#}"),
+        }
+    }
+
     fn execute_teams_slash_command(&mut self, command: TeamsSlashCommand) {
         if matches!(&command, TeamsSlashCommand::Help) {
             self.help_scroll = 0;
@@ -9244,6 +9358,23 @@ impl App {
             self.help_scroll = 0;
             self.overlay = Some(Overlay::Help);
             return;
+        }
+        match &command {
+            TeamsSlashCommand::OutOfOffice => {
+                self.load_out_of_office(false);
+                return;
+            }
+            TeamsSlashCommand::OutOfOfficeSet => {
+                self.load_out_of_office(true);
+                return;
+            }
+            TeamsSlashCommand::OutOfOfficeClear => {
+                if self.out_of_office_ready() {
+                    self.overlay = Some(Overlay::ConfirmOutOfOfficeClear);
+                }
+                return;
+            }
+            _ => {}
         }
 
         if self.teams.mode != TeamsMode::Chats {
@@ -9451,7 +9582,11 @@ impl App {
                     user_id,
                 });
             }
-            TeamsSlashCommand::Help | TeamsSlashCommand::HelpAll => {
+            TeamsSlashCommand::OutOfOffice
+            | TeamsSlashCommand::OutOfOfficeSet
+            | TeamsSlashCommand::OutOfOfficeClear
+            | TeamsSlashCommand::Help
+            | TeamsSlashCommand::HelpAll => {
                 unreachable!("handled above")
             }
         }
@@ -9610,6 +9745,131 @@ impl App {
                     _ => {}
                 }
                 self.overlay = Some(Overlay::ContactProfile);
+            }
+            Some(Overlay::OutOfOffice(view)) => match key.code {
+                KeyCode::Char('s') => {
+                    self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(
+                        out_of_office::Editor::from_settings(&view.settings),
+                    )));
+                }
+                KeyCode::Char('c') => {
+                    self.overlay = Some(Overlay::ConfirmOutOfOfficeClear);
+                }
+                KeyCode::Char('w') => {
+                    self.open_out_of_office_web();
+                    self.overlay = Some(Overlay::OutOfOffice(view));
+                }
+                _ => self.overlay = Some(Overlay::OutOfOffice(view)),
+            },
+            Some(Overlay::ConfirmOutOfOfficeClear) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.clear_out_of_office(),
+                _ => self.status = "Out of Office clear cancelled".into(),
+            },
+            Some(Overlay::OutOfOfficeEdit(mut editor)) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let shifted = key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT);
+
+                // Message editing is intentionally handled first and in
+                // isolation. Printable characters, including an ordinary
+                // space, always go into the message body while it is focused.
+                if editor.is_message_field() {
+                    let width = self.text_width_hint.get().max(1);
+                    match key.code {
+                        KeyCode::Tab => editor.next_field(),
+                        KeyCode::BackTab => editor.prev_field(),
+                        KeyCode::PageUp => editor.page_up(),
+                        KeyCode::PageDown => editor.page_down(),
+                        KeyCode::Enter if shifted => editor.message.insert('\n'),
+                        KeyCode::Char('j') if ctrl => editor.message.insert('\n'),
+                        KeyCode::Enter => {
+                            self.save_out_of_office(*editor);
+                            return;
+                        }
+                        KeyCode::Backspace => editor.message.backspace(),
+                        KeyCode::Delete => editor.message.delete(),
+                        KeyCode::Char('w') if ctrl => editor.message.delete_word_before(),
+                        KeyCode::Char('u') if ctrl => editor.message.delete_to_line_start(),
+                        KeyCode::Char('k') if ctrl => editor.message.delete_to_line_end(),
+                        KeyCode::Left if ctrl => editor.message.word_left(),
+                        KeyCode::Right if ctrl => editor.message.word_right(),
+                        KeyCode::Left => editor.message.left(),
+                        KeyCode::Right => editor.message.right(),
+                        KeyCode::Up => editor.message.move_row(-1, width),
+                        KeyCode::Down => editor.message.move_row(1, width),
+                        KeyCode::Home if ctrl => editor.message.start_of_text(),
+                        KeyCode::End if ctrl => editor.message.end_of_text(),
+                        KeyCode::Home => editor.message.home(),
+                        KeyCode::End => editor.message.end(),
+                        KeyCode::Char(ch) if !ctrl => editor.message.insert(ch),
+                        _ => {}
+                    }
+                    self.overlay = Some(Overlay::OutOfOfficeEdit(editor));
+                    return;
+                }
+
+                let is_audience = editor.is_audience_field();
+                let is_numeric = editor.is_numeric_field();
+
+                match key.code {
+                    KeyCode::Tab => editor.next_field(),
+                    KeyCode::BackTab => editor.prev_field(),
+                    KeyCode::PageUp => editor.page_up(),
+                    KeyCode::PageDown => editor.page_down(),
+                    KeyCode::Enter => {
+                        self.save_out_of_office(*editor);
+                        return;
+                    }
+
+                    // Audience uses only arrows. Space is deliberately not a
+                    // toggle shortcut, so it can never conflict with text input.
+                    KeyCode::Left | KeyCode::Right if is_audience => editor.audience.toggle(),
+
+                    KeyCode::Backspace if is_numeric => {
+                        editor.mark_editing();
+                        if let Some(input) = editor.active_mut() {
+                            input.backspace();
+                        }
+                    }
+                    KeyCode::Delete if is_numeric => {
+                        editor.mark_editing();
+                        if let Some(input) = editor.active_mut() {
+                            input.delete();
+                        }
+                    }
+                    KeyCode::Left if is_numeric => {
+                        editor.mark_editing();
+                        if let Some(input) = editor.active_mut() {
+                            input.left();
+                        }
+                    }
+                    KeyCode::Right if is_numeric => {
+                        editor.mark_editing();
+                        if let Some(input) = editor.active_mut() {
+                            input.right();
+                        }
+                    }
+                    KeyCode::Home if is_numeric => {
+                        editor.mark_editing();
+                        if let Some(input) = editor.active_mut() {
+                            input.home();
+                        }
+                    }
+                    KeyCode::End if is_numeric => {
+                        editor.mark_editing();
+                        if let Some(input) = editor.active_mut() {
+                            input.end();
+                        }
+                    }
+
+                    KeyCode::Char(ch) if is_numeric && !ctrl && ch.is_ascii_digit() => {
+                        editor.insert_digit(ch);
+                    }
+                    KeyCode::Char(_) if is_numeric && !ctrl => editor.reject_non_digit(),
+
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::OutOfOfficeEdit(editor));
             }
             Some(Overlay::Calendar) => {
                 // Any key besides Esc closes the compact calendar overlay.
@@ -10084,6 +10344,10 @@ impl App {
                 input.insert_str(&text);
                 self.overlay = Some(Overlay::PresenceMessage(input));
             }
+            Some(Overlay::OutOfOfficeEdit(mut editor)) => {
+                editor.paste(&text);
+                self.overlay = Some(Overlay::OutOfOfficeEdit(editor));
+            }
             other => {
                 self.overlay = other;
                 if self.overlay.is_none()
@@ -10411,11 +10675,19 @@ fn parse_teams_slash_command(text: &str) -> Result<Option<TeamsSlashCommand>, St
         "/pins" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Pins)),
         "/unread" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Unread)),
         "/delete" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Delete)),
+        "/ooo" if argument.is_empty() => Ok(Some(TeamsSlashCommand::OutOfOffice)),
+        "/ooo" if argument.eq_ignore_ascii_case("set") => {
+            Ok(Some(TeamsSlashCommand::OutOfOfficeSet))
+        }
+        "/ooo" if argument.eq_ignore_ascii_case("clear") => {
+            Ok(Some(TeamsSlashCommand::OutOfOfficeClear))
+        }
         "/help" if argument.is_empty() => Ok(Some(TeamsSlashCommand::Help)),
         "/help" if argument.eq_ignore_ascii_case("all") => Ok(Some(TeamsSlashCommand::HelpAll)),
         "/pin" | "/unpin" | "/pins" | "/unread" | "/delete" => {
             Err(format!("{command} does not take arguments"))
         }
+        "/ooo" => Err("usage: /ooo [set|clear]".into()),
         "/help" => Err("usage: /help [all]".into()),
         _ => Err(format!("unknown Teams command {command}; use /help")),
     }
@@ -10592,6 +10864,18 @@ mod teams_slash_command_tests {
             parse_teams_slash_command("/delete"),
             Ok(Some(TeamsSlashCommand::Delete))
         );
+        assert_eq!(
+            parse_teams_slash_command("/ooo"),
+            Ok(Some(TeamsSlashCommand::OutOfOffice))
+        );
+        assert_eq!(
+            parse_teams_slash_command("/ooo set"),
+            Ok(Some(TeamsSlashCommand::OutOfOfficeSet))
+        );
+        assert_eq!(
+            parse_teams_slash_command("/ooo CLEAR"),
+            Ok(Some(TeamsSlashCommand::OutOfOfficeClear))
+        );
         assert_eq!(parse_teams_slash_command("/help"), Ok(Some(TeamsSlashCommand::Help)));
         assert_eq!(
             parse_teams_slash_command("/help all"),
@@ -10610,6 +10894,7 @@ mod teams_slash_command_tests {
         assert!(parse_teams_slash_command("/rename").is_err());
         assert!(parse_teams_slash_command("/edit").is_err());
         assert!(parse_teams_slash_command("/pins extra").is_err());
+        assert!(parse_teams_slash_command("/ooo forever").is_err());
         assert!(parse_teams_slash_command("/help nope").is_err());
         assert!(parse_teams_slash_command("/unknown").is_err());
     }

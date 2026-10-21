@@ -251,26 +251,6 @@ fn row(label: &str, value: impl AsRef<str>) -> String {
     format!("  {label:<30} {}", value.as_ref())
 }
 
-fn local_timezone_name() -> String {
-    if let Ok(value) = std::env::var("TZ") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-
-    if let Ok(target) = std::fs::read_link("/etc/localtime") {
-        let value = target.to_string_lossy();
-        if let Some((_, zone)) = value.split_once("/zoneinfo/") {
-            if !zone.trim().is_empty() {
-                return zone.to_string();
-            }
-        }
-    }
-
-    chrono::Local::now().offset().to_string()
-}
-
 fn ntfy_mode(mode: NtfyMode) -> &'static str {
     match mode {
         NtfyMode::Never => "never",
@@ -306,6 +286,7 @@ fn permission_lines(app: &App, token: Option<&TokenInfo>) -> Vec<String> {
         "People.Read",
         "Mail.ReadWrite",
         "Mail.Send",
+        "MailboxSettings.ReadWrite",
         "Calendars.ReadWrite",
         "Chat.ReadWrite",
         "ChannelMessage.Send",
@@ -1003,7 +984,10 @@ pub fn text(app: &App) -> String {
     out.push(String::new());
 
     out.push("Microsoft 365 work settings".into());
-    out.push(row("Local time zone", local_timezone_name()));
+    out.push(row(
+        "Local time zone",
+        crate::out_of_office::local_timezone_name(),
+    ));
     out.push(row("NTFY mode", ntfy_mode(app.session.config.ntfy)));
     match remote.map(|remote| &remote.work_plan) {
         Some(Ok(plan)) => {
@@ -1084,6 +1068,10 @@ pub fn text(app: &App) -> String {
     out.push(row(
         "Directory profile",
         yes_no(app.session.config.directory_profile, "enabled", "disabled"),
+    ));
+    out.push(row(
+        "Out of office",
+        yes_no(app.session.config.out_of_office, "enabled", "disabled"),
     ));
     out.push(String::new());
 

@@ -113,12 +113,38 @@ impl MailMessage {
 // Calendar
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DateTimeTimeZone {
     pub date_time: String,
     #[serde(default)]
     pub time_zone: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomaticRepliesSetting {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_audience: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_start_date_time: Option<DateTimeTimeZone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_end_date_time: Option<DateTimeTimeZone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_reply_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reply_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxSettingsSnapshot {
+    #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub automatic_replies_setting: AutomaticRepliesSetting,
 }
 
 #[derive(Debug, Clone, Deserialize)]

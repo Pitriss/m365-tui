@@ -245,6 +245,7 @@ not unexpectedly change the consent request for every user.
 |---|---|---|
 | `Team.ReadBasic.All` | Teams and channel enumeration | `M365_TEAMS_CHANNELS=1` |
 | `Presence.ReadWrite` | Set or publish your own presence | `M365_PRESENCE_WRITE=1` or `M365_PRESENCE_PRIMARY=1` |
+| `MailboxSettings.ReadWrite` | Read/set Outlook + Teams Out of Office automatic replies | `M365_OUT_OF_OFFICE=1` |
 | `Files.Read.All` | Regular Teams image files from OneDrive / SharePoint | `M365_TEAMS_FILE_IMAGES=1` |
 
 If `M365_SCOPES` is set explicitly, optional permissions are **not**
@@ -884,19 +885,30 @@ M365_CALENDAR_NOTIFY=all
 
 keeps the internal Calendar reminder but suppresses its desktop notification.
 
-#### Meeting opener
+#### Web-link opener
 
-Online meeting links normally use the operating-system URL handler.
+Web links opened by m365-tui normally use the operating-system URL handler.
+This includes Outlook/Teams message links, Calendar online-meeting links, and
+links to Outlook Web settings such as Out of Office.
 
-To force a specific executable:
+To force one executable for all of them:
 
 ```dotenv
-M365_MEETING_OPENER=/usr/bin/firefox
+M365_WEBLINK_OPENER=/usr/bin/firefox
 ```
 
-The URL is passed directly as one argument. No shell is involved.
+The URL is passed directly as one argument. No shell is involved. If additional
+command-line arguments are required, use a wrapper script.
 
-If additional command-line arguments are required, use a wrapper script.
+`M365_MEETING_OPENER` remains as a deprecated compatibility fallback so existing
+configurations continue to work. Resolution order is:
+
+1. `M365_WEBLINK_OPENER`
+2. `M365_MEETING_OPENER` (deprecated)
+3. neither variable -> operating-system URL handler
+
+If both are set, `M365_WEBLINK_OPENER` wins. Deprecated-variable warnings are
+deferred until after the alternate-screen TUI exits.
 
 ### Persistent application cache
 
@@ -1138,6 +1150,9 @@ Slash commands are entered in the Teams chat composer.
 | `/pins` | Show the current pinned message; `Enter` jumps to it and `u` unpins |
 | `/unread` | Mark the current chat unread |
 | `/delete` | Delete the selected own message; asks for confirmation |
+| `/ooo` | Show current Out of Office state |
+| `/ooo set` | Set or edit scheduled Out of Office |
+| `/ooo clear` | Disable Out of Office; asks for confirmation |
 | `/help` | Show the compact Teams command list |
 | `/help all` | Show the complete application/key help |
 
@@ -1147,6 +1162,16 @@ Both `/help` and `/help all` are scrollable with `j`/`k`, `Up`/`Down`,
 Commands that operate on a message use the currently selected `▶` message.
 Unsupported `/topic` and `/rename` attempts outside group chats fail locally
 and are written to the application log.
+
+Out of Office commands are account-global even though they are entered in the
+Teams composer. Enable them with `M365_OUT_OF_OFFICE=1`. `/ooo set` edits a
+scheduled start/end, `Internal` or `All` audience, and one message. The existing
+safe Markdown formatter is reused when `M365_TEAMS_MARKDOWN=1`; raw HTML remains
+escaped. Date/time input uses separate year/month/day/hour/minute fields. Each segment is
+validated as focus leaves it, complete timestamps are checked for local DST
+gaps/overlaps, and the effective abbreviation/UTC offset is shown for both
+endpoints. Graph stores the validated instants as UTC. The read-only
+OOO view also offers `w` to open Outlook Web automatic-reply settings.
 
 ### Calendar agenda
 

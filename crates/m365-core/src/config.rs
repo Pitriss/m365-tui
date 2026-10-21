@@ -79,6 +79,10 @@ pub const PROFILE_PHOTO_SCOPE: &str = "User.ReadBasic.All";
 /// which requires administrator consent. The feature is currently untested.
 pub const DIRECTORY_PROFILE_SCOPE: &str = "User.Read.All";
 
+/// Needed to read and update Outlook automatic-reply (Out of Office) settings.
+/// Kept opt-in because changing delegated scopes can trigger a new consent flow.
+pub const MAILBOX_SETTINGS_WRITE_SCOPE: &str = "MailboxSettings.ReadWrite";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresenceActivitySource {
     Auto,
@@ -222,6 +226,40 @@ impl CacheMaxSource {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebLinkOpenerSource {
+    None,
+    New,
+    DeprecatedOnly,
+    BothSame,
+    BothDifferent {
+        new_value: String,
+        deprecated_value: String,
+    },
+}
+
+impl WebLinkOpenerSource {
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Self::None | Self::New => None,
+            Self::DeprecatedOnly => Some(
+                "Warning: M365_MEETING_OPENER is deprecated.\nPlease use M365_WEBLINK_OPENER instead."
+                    .to_string(),
+            ),
+            Self::BothSame => Some(
+                "Warning: M365_MEETING_OPENER is deprecated and duplicates M365_WEBLINK_OPENER.\nPlease remove or comment out M365_MEETING_OPENER."
+                    .to_string(),
+            ),
+            Self::BothDifferent {
+                new_value,
+                deprecated_value,
+            } => Some(format!(
+                "Warning: both M365_WEBLINK_OPENER and deprecated M365_MEETING_OPENER are set.\nUsing M365_WEBLINK_OPENER={new_value:?}; ignoring M365_MEETING_OPENER={deprecated_value:?}.\nPlease remove or comment out M365_MEETING_OPENER."
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Entra application (client) ID of the registered public client.
@@ -272,6 +310,9 @@ pub struct Config {
     /// Experimental direct Entra directory profile lookup for Teams contacts.
     /// Off by default; requires delegated User.Read.All and administrator consent.
     pub directory_profile: bool,
+    /// Read and update Outlook/Teams Out of Office automatic replies.
+    /// Off by default; adds delegated MailboxSettings.ReadWrite with default scopes.
+    pub out_of_office: bool,
     /// Optional common root for persistent application cache/state.
     /// M365_CACHE_DIR wins over the deprecated M365_TEAMS_IMAGE_CACHE_DIR.
     /// If neither is set, Teams/UI persistence remains disabled.
@@ -306,9 +347,12 @@ pub struct Config {
     /// Which Teams system events are visible in conversations.
     /// Defaults to Useful; accepts useful, all, or none.
     pub teams_system_events: TeamsSystemEvents,
-    /// Optional executable used to open Calendar online-meeting URLs.
+    /// Optional executable used to open web links from the TUI.
+    /// M365_WEBLINK_OPENER wins over deprecated M365_MEETING_OPENER.
     /// Unset uses the operating system handler (`xdg-open` / `open`).
-    pub meeting_opener: Option<String>,
+    pub web_link_opener: Option<String>,
+    /// Records which environment variable selected the web-link opener.
+    pub web_link_opener_source: WebLinkOpenerSource,
 }
 
 impl Config {
@@ -320,6 +364,7 @@ impl Config {
         let presence_primary = env_flag("M365_PRESENCE_PRIMARY");
         let teams_file_images = env_flag("M365_TEAMS_FILE_IMAGES");
         let directory_profile = env_flag("M365_DIRECTORY_PROFILE");
+        let out_of_office = env_flag("M365_OUT_OF_OFFICE");
         let new_cache_dir = std::env::var("M365_CACHE_DIR").ok();
         let deprecated_cache_dir = std::env::var("M365_TEAMS_IMAGE_CACHE_DIR").ok();
         let (cache_dir, cache_dir_source) =
@@ -334,10 +379,12 @@ impl Config {
         );
         let teams_application_high_priority =
             env_flag("M365_TEAMS_APPLICATION_HIGH_PRIORITY");
-        let meeting_opener = std::env::var("M365_MEETING_OPENER")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let new_web_link_opener = std::env::var("M365_WEBLINK_OPENER").ok();
+        let deprecated_meeting_opener = std::env::var("M365_MEETING_OPENER").ok();
+        let (web_link_opener, web_link_opener_source) = resolve_web_link_opener_values(
+            new_web_link_opener.as_deref(),
+            deprecated_meeting_opener.as_deref(),
+        );
         let teams_cache_warmup = env_flag_default_on("M365_TEAMS_CACHE_WARMUP");
         let teams_system_events =
             parse_teams_system_events(std::env::var("M365_TEAMS_SYSTEM_EVENTS").ok().as_deref())?;
@@ -393,6 +440,9 @@ impl Config {
                 }
                 if directory_profile {
                     s.push(DIRECTORY_PROFILE_SCOPE.to_string());
+                }
+                if out_of_office {
+                    s.push(MAILBOX_SETTINGS_WRITE_SCOPE.to_string());
                 }
                 s
             }
@@ -482,6 +532,7 @@ impl Config {
             presence_lock_restore,
             teams_file_images,
             directory_profile,
+            out_of_office,
             cache_dir,
             cache_dir_source,
             cache_max_mb,
@@ -495,7 +546,8 @@ impl Config {
             teams_hot_chats,
             teams_poll_budget_rps,
             teams_system_events,
-            meeting_opener,
+            web_link_opener,
+            web_link_opener_source,
         })
     }
 
@@ -523,6 +575,20 @@ impl Config {
         (!warnings.is_empty()).then(|| warnings.join("\n\n"))
     }
 
+    /// Deferred compatibility warnings for deprecated environment variables.
+    ///
+    /// Frontends should print this only after leaving any alternate-screen TUI.
+    pub fn compatibility_warning(&self) -> Option<String> {
+        let warnings: Vec<String> = [
+            self.cache_warning(),
+            self.web_link_opener_source.warning(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!warnings.is_empty()).then(|| warnings.join("\n\n"))
+    }
+
     /// Whether the token we request can set presence.
     pub fn can_write_presence(&self) -> bool {
         self.has_scope(PRESENCE_WRITE_SCOPE)
@@ -541,6 +607,11 @@ impl Config {
     /// Whether the requested token can read other users' basic profile/photo.
     pub fn can_read_profile_photos(&self) -> bool {
         self.has_scope(PROFILE_PHOTO_SCOPE)
+    }
+
+    /// Whether the current token request includes mailbox-settings write access.
+    pub fn can_write_out_of_office(&self) -> bool {
+        self.has_scope(MAILBOX_SETTINGS_WRITE_SCOPE)
     }
 
     fn has_scope(&self, scope: &str) -> bool {
@@ -610,6 +681,39 @@ fn resolve_cache_dir_values(
         (Some(new_value), Some(deprecated_value)) => (
             Some(PathBuf::from(new_value.trim())),
             CacheDirSource::BothDifferent {
+                new_value: new_value.to_string(),
+                deprecated_value: deprecated_value.to_string(),
+            },
+        ),
+    }
+}
+
+fn resolve_web_link_opener_values(
+    new_raw: Option<&str>,
+    deprecated_raw: Option<&str>,
+) -> (Option<String>, WebLinkOpenerSource) {
+    let new_value = new_raw.map(str::trim).filter(|value| !value.is_empty());
+    let deprecated_value = deprecated_raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (new_value, deprecated_value) {
+        (None, None) => (None, WebLinkOpenerSource::None),
+        (Some(new_value), None) => (
+            Some(new_value.to_string()),
+            WebLinkOpenerSource::New,
+        ),
+        (None, Some(deprecated_value)) => (
+            Some(deprecated_value.to_string()),
+            WebLinkOpenerSource::DeprecatedOnly,
+        ),
+        (Some(new_value), Some(deprecated_value)) if new_value == deprecated_value => (
+            Some(new_value.to_string()),
+            WebLinkOpenerSource::BothSame,
+        ),
+        (Some(new_value), Some(deprecated_value)) => (
+            Some(new_value.to_string()),
+            WebLinkOpenerSource::BothDifferent {
                 new_value: new_value.to_string(),
                 deprecated_value: deprecated_value.to_string(),
             },
@@ -817,6 +921,7 @@ mod tests {
             presence_lock_restore: true,
             teams_file_images: false,
             directory_profile: false,
+            out_of_office: false,
             cache_dir: None,
             cache_dir_source: CacheDirSource::None,
             cache_max_mb: 256,
@@ -830,7 +935,8 @@ mod tests {
             teams_hot_chats: TEAMS_HOT_CHATS_DEFAULT,
             teams_poll_budget_rps: TEAMS_POLL_BUDGET_DEFAULT_RPS,
             teams_system_events: TeamsSystemEvents::Useful,
-            meeting_opener: None,
+            web_link_opener: None,
+            web_link_opener_source: WebLinkOpenerSource::None,
         }
     }
 
@@ -842,6 +948,81 @@ mod tests {
         assert!(peers.contains("peer-b"));
         assert!(peers.contains("peer-c"));
         assert!(parse_teams_automation_peers(None).is_empty());
+    }
+
+    #[test]
+    fn resolves_web_link_opener_priority_and_legacy_fallback() {
+        assert_eq!(
+            resolve_web_link_opener_values(None, None),
+            (None, WebLinkOpenerSource::None)
+        );
+        assert_eq!(
+            resolve_web_link_opener_values(Some(" /usr/bin/firefox "), None),
+            (
+                Some("/usr/bin/firefox".to_string()),
+                WebLinkOpenerSource::New
+            )
+        );
+        assert_eq!(
+            resolve_web_link_opener_values(None, Some(" /usr/bin/firefox ")),
+            (
+                Some("/usr/bin/firefox".to_string()),
+                WebLinkOpenerSource::DeprecatedOnly
+            )
+        );
+        assert_eq!(
+            resolve_web_link_opener_values(
+                Some(" /usr/bin/firefox "),
+                Some("/usr/bin/firefox")
+            ),
+            (
+                Some("/usr/bin/firefox".to_string()),
+                WebLinkOpenerSource::BothSame
+            )
+        );
+        assert_eq!(
+            resolve_web_link_opener_values(
+                Some("/usr/bin/firefox"),
+                Some("/usr/bin/chromium")
+            ),
+            (
+                Some("/usr/bin/firefox".to_string()),
+                WebLinkOpenerSource::BothDifferent {
+                    new_value: "/usr/bin/firefox".to_string(),
+                    deprecated_value: "/usr/bin/chromium".to_string(),
+                }
+            )
+        );
+        assert_eq!(
+            resolve_web_link_opener_values(Some("  "), Some(" /usr/bin/firefox ")),
+            (
+                Some("/usr/bin/firefox".to_string()),
+                WebLinkOpenerSource::DeprecatedOnly
+            ),
+            "an empty new variable must not suppress the deprecated fallback"
+        );
+    }
+
+    #[test]
+    fn web_link_opener_warnings_cover_deprecated_configurations() {
+        assert!(WebLinkOpenerSource::None.warning().is_none());
+        assert!(WebLinkOpenerSource::New.warning().is_none());
+
+        let legacy = WebLinkOpenerSource::DeprecatedOnly.warning().unwrap();
+        assert!(legacy.contains("M365_MEETING_OPENER is deprecated"));
+        assert!(legacy.contains("M365_WEBLINK_OPENER"));
+
+        let same = WebLinkOpenerSource::BothSame.warning().unwrap();
+        assert!(same.contains("duplicates M365_WEBLINK_OPENER"));
+
+        let different = WebLinkOpenerSource::BothDifferent {
+            new_value: "/usr/bin/firefox".to_string(),
+            deprecated_value: "/usr/bin/chromium".to_string(),
+        }
+        .warning()
+        .unwrap();
+        assert!(different.contains("Using M365_WEBLINK_OPENER=\"/usr/bin/firefox\""));
+        assert!(different.contains("ignoring M365_MEETING_OPENER=\"/usr/bin/chromium\""));
     }
 
     #[test]

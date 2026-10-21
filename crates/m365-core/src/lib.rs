@@ -13,6 +13,7 @@ pub mod config;
 pub mod events;
 pub mod graph;
 pub mod mail;
+pub mod mailbox;
 pub mod models;
 pub mod ntfy;
 pub mod people;
