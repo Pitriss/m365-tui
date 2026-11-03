@@ -9,7 +9,9 @@ use std::io::IsTerminal;
 
 use anyhow::Context;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use m365_core::config::{NtfyMode, TeamsSystemEvents, TEAMS_POLL_BUDGET_MIN_RPS};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
@@ -2560,6 +2562,14 @@ fn calendar_event_intersects_month(event: &CalEvent, month_offset: i32) -> bool 
     let month_start = calendar_month_first(month_offset);
     let next_month = calendar_month_first(month_offset + 1);
     event_start < next_month && event_end >= month_start
+}
+
+fn mouse_wheel_delta(kind: MouseEventKind) -> Option<i32> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(-1),
+        MouseEventKind::ScrollDown => Some(1),
+        _ => None,
+    }
 }
 
 impl App {
@@ -8170,15 +8180,11 @@ impl App {
 
     // -- input handling ----------------------------------------------------
 
-    /// Capture mouse input only where wheel navigation is useful. Keeping this
-    /// scoped to the Teams chat list preserves normal terminal text selection
-    /// everywhere else.
+    /// Capture mouse input in the normal application view so the top tabs can
+    /// be clicked. Copy mode and overlays deliberately release capture for
+    /// ordinary terminal selection / modal input.
     pub fn wants_mouse_capture(&self) -> bool {
-        !self.copy_mode
-            && self.overlay.is_none()
-            && self.screen == Screen::Teams
-            && self.teams.mode == TeamsMode::Chats
-            && self.teams.focus == TeamsFocus::List
+        !self.copy_mode && self.overlay.is_none()
     }
 
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -8186,14 +8192,130 @@ impl App {
             return;
         }
 
-        let delta = match mouse.kind {
-            MouseEventKind::ScrollUp => -1,
-            MouseEventKind::ScrollDown => 1,
-            _ => return,
+        self.note_presence_activity();
+
+        let target = crate::ui::mouse_target_at(mouse.column, mouse.row);
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            match target {
+                Some(crate::ui::MouseTarget::Screen(screen)) => {
+                    self.switch_screen(screen);
+                    return;
+                }
+                Some(crate::ui::MouseTarget::CalendarEvent(index))
+                    if self.screen == Screen::Calendar =>
+                {
+                    if index < self.calendar.events.len() {
+                        self.calendar.selected = index;
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookFolderRow(index))
+                    if self.screen == Screen::Outlook =>
+                {
+                    if self.outlook_focus == OutlookFocus::Reading {
+                        self.cancel_read_timer();
+                    }
+                    self.outlook_focus = OutlookFocus::Folders;
+                    if index < self.outlook.folders.len() {
+                        self.outlook.folder_sel = index;
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookFolders)
+                    if self.screen == Screen::Outlook =>
+                {
+                    if self.outlook_focus == OutlookFocus::Reading {
+                        self.cancel_read_timer();
+                    }
+                    self.outlook_focus = OutlookFocus::Folders;
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookMessageRow(index))
+                    if self.screen == Screen::Outlook =>
+                {
+                    if self.outlook_focus == OutlookFocus::Reading {
+                        self.cancel_read_timer();
+                    }
+                    self.outlook_focus = OutlookFocus::Messages;
+                    if index < self.outlook.messages.len() {
+                        self.outlook.msg_sel = index;
+                        if index + 1 == self.outlook.messages.len() {
+                            self.load_more_messages();
+                        }
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookMessages)
+                    if self.screen == Screen::Outlook =>
+                {
+                    if self.outlook_focus == OutlookFocus::Reading {
+                        self.cancel_read_timer();
+                    }
+                    self.outlook_focus = OutlookFocus::Messages;
+                    return;
+                }
+                Some(crate::ui::MouseTarget::TeamsChatRow(index))
+                    if self.screen == Screen::Teams
+                        && self.teams.mode == TeamsMode::Chats
+                        && self.teams.focus != TeamsFocus::Composer =>
+                {
+                    self.teams.focus = TeamsFocus::List;
+                    if index < self.teams_chat_row_count() {
+                        self.teams.chat_sel = index;
+                        self.preview_selected_teams_chat();
+                        self.refresh_selected_teams_images();
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::TeamsList)
+                    if self.screen == Screen::Teams
+                        && self.teams.focus != TeamsFocus::Composer =>
+                {
+                    self.teams.focus = TeamsFocus::List;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(delta) = mouse_wheel_delta(mouse.kind) else {
+            return;
         };
 
-        self.note_presence_activity();
-        self.teams_move(delta);
+        match target {
+            Some(crate::ui::MouseTarget::Calendar)
+            | Some(crate::ui::MouseTarget::CalendarEvent(_))
+                if self.screen == Screen::Calendar =>
+            {
+                if self.calendar.view == CalendarView::Month {
+                    self.calendar_month_move_event(delta);
+                } else {
+                    self.calendar.selected =
+                        step(self.calendar.selected, delta, self.calendar.events.len());
+                }
+            }
+            Some(crate::ui::MouseTarget::OutlookMessages)
+            | Some(crate::ui::MouseTarget::OutlookMessageRow(_))
+                if self.screen == Screen::Outlook =>
+            {
+                if self.outlook_focus == OutlookFocus::Reading {
+                    self.cancel_read_timer();
+                }
+                self.outlook_focus = OutlookFocus::Messages;
+                self.outlook_move(delta);
+            }
+            Some(crate::ui::MouseTarget::TeamsList)
+            | Some(crate::ui::MouseTarget::TeamsChatRow(_))
+                if self.screen == Screen::Teams
+                    && self.teams.focus != TeamsFocus::Composer =>
+            {
+                self.teams.focus = TeamsFocus::List;
+                self.teams_move(delta);
+                self.refresh_selected_teams_images();
+            }
+            _ => {}
+        }
     }
 
     // -- key handling ------------------------------------------------------
@@ -11257,10 +11379,19 @@ mod hot_poll_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        calendar_reminder_threshold_minutes, merge_newest_first, next_field, ntfy_presence_is_away,
-        parse_recipients, reconcile_authoritative_message_window, step,
+        calendar_reminder_threshold_minutes, merge_newest_first, mouse_wheel_delta, next_field,
+        ntfy_presence_is_away, parse_recipients, reconcile_authoritative_message_window, step,
     };
     use m365_core::models::ChatMessage;
+
+    #[test]
+    fn mouse_wheel_steps_exactly_one_row() {
+        use crossterm::event::MouseEventKind;
+
+        assert_eq!(mouse_wheel_delta(MouseEventKind::ScrollUp), Some(-1));
+        assert_eq!(mouse_wheel_delta(MouseEventKind::ScrollDown), Some(1));
+        assert_eq!(mouse_wheel_delta(MouseEventKind::Moved), None);
+    }
 
     #[test]
     fn ntfy_away_mode_is_strictly_graph_away() {

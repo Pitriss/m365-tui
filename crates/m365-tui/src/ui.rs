@@ -20,6 +20,7 @@ const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
 pub fn render(f: &mut Frame, app: &App) {
+    reset_mouse_regions();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -83,9 +84,230 @@ fn render_copy_mode(f: &mut Frame, app: &App) {
     );
 }
 
+const OUTLOOK_TAB_IDLE: &str = "Outlook (F1)  ";
+const TEAMS_TAB_IDLE: &str = "Teams (F2)  ";
+const CALENDAR_TAB_IDLE: &str = "Calendar (F3)  ";
+const TAB_GAP_WIDTH: u16 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseTarget {
+    Screen(Screen),
+    OutlookFolders,
+    OutlookFolderRow(usize),
+    OutlookMessages,
+    OutlookMessageRow(usize),
+    Calendar,
+    CalendarEvent(usize),
+    TeamsList,
+    TeamsChatRow(usize),
+}
+
+#[derive(Default)]
+struct MouseRegions {
+    outlook_tab: Option<Rect>,
+    teams_tab: Option<Rect>,
+    calendar_tab: Option<Rect>,
+    outlook_folders: Option<Rect>,
+    outlook_folder_rows: Option<ListRows>,
+    outlook_messages: Option<Rect>,
+    outlook_message_rows: Option<ListRows>,
+    calendar: Option<Rect>,
+    calendar_rows: Option<ListRows>,
+    calendar_events: Vec<(Rect, usize)>,
+    teams_list: Option<Rect>,
+    teams_chat_rows: Option<ListRows>,
+}
+
+#[derive(Clone, Copy)]
+struct ListRows {
+    area: Rect,
+    offset: usize,
+    len: usize,
+}
+
+impl ListRows {
+    fn index_at(self, column: u16, row: u16) -> Option<usize> {
+        if !rect_contains(self.area, column, row) {
+            return None;
+        }
+
+        let visible_row = usize::from(row.saturating_sub(self.area.y));
+        let index = self.offset.saturating_add(visible_row);
+        (index < self.len).then_some(index)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MouseList {
+    OutlookFolders,
+    OutlookMessages,
+    CalendarAgenda,
+    TeamsChats,
+}
+
+static MOUSE_REGIONS: std::sync::OnceLock<std::sync::Mutex<MouseRegions>> =
+    std::sync::OnceLock::new();
+
+fn with_mouse_regions<R>(f: impl FnOnce(&mut MouseRegions) -> R) -> R {
+    let mutex = MOUSE_REGIONS.get_or_init(|| std::sync::Mutex::new(MouseRegions::default()));
+    let mut regions = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut regions)
+}
+
+fn reset_mouse_regions() {
+    with_mouse_regions(|regions| *regions = MouseRegions::default());
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn register_list_rows(
+    target: MouseList,
+    area: Rect,
+    offset: usize,
+    len: usize,
+) {
+    if area.width == 0 || area.height == 0 || len == 0 {
+        return;
+    }
+
+    let rows = ListRows {
+        area,
+        offset,
+        len,
+    };
+    with_mouse_regions(|regions| match target {
+        MouseList::OutlookFolders => regions.outlook_folder_rows = Some(rows),
+        MouseList::OutlookMessages => regions.outlook_message_rows = Some(rows),
+        MouseList::CalendarAgenda => regions.calendar_rows = Some(rows),
+        MouseList::TeamsChats => regions.teams_chat_rows = Some(rows),
+    });
+}
+
+fn register_mouse_region(target: MouseTarget, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    with_mouse_regions(|regions| match target {
+        MouseTarget::Screen(Screen::Outlook) => regions.outlook_tab = Some(area),
+        MouseTarget::Screen(Screen::Teams) => regions.teams_tab = Some(area),
+        MouseTarget::Screen(Screen::Calendar) => regions.calendar_tab = Some(area),
+        MouseTarget::OutlookFolders => regions.outlook_folders = Some(area),
+        MouseTarget::OutlookMessages => regions.outlook_messages = Some(area),
+        MouseTarget::Calendar => regions.calendar = Some(area),
+        MouseTarget::CalendarEvent(index) => regions.calendar_events.push((area, index)),
+        MouseTarget::TeamsList => regions.teams_list = Some(area),
+        MouseTarget::OutlookFolderRow(_)
+        | MouseTarget::OutlookMessageRow(_)
+        | MouseTarget::TeamsChatRow(_) => {}
+    });
+}
+
+pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
+    with_mouse_regions(|regions| {
+        if let Some(index) = regions
+            .outlook_folder_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::OutlookFolderRow(index));
+        }
+        if let Some(index) = regions
+            .outlook_message_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::OutlookMessageRow(index));
+        }
+        if let Some(index) = regions
+            .calendar_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::CalendarEvent(index));
+        }
+        if let Some((_, index)) = regions
+            .calendar_events
+            .iter()
+            .rev()
+            .find(|(area, _)| rect_contains(*area, column, row))
+        {
+            return Some(MouseTarget::CalendarEvent(*index));
+        }
+        if let Some(index) = regions
+            .teams_chat_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::TeamsChatRow(index));
+        }
+
+        [
+            (regions.outlook_tab, MouseTarget::Screen(Screen::Outlook)),
+            (regions.teams_tab, MouseTarget::Screen(Screen::Teams)),
+            (regions.calendar_tab, MouseTarget::Screen(Screen::Calendar)),
+            (regions.outlook_folders, MouseTarget::OutlookFolders),
+            (regions.outlook_messages, MouseTarget::OutlookMessages),
+            (regions.calendar, MouseTarget::Calendar),
+            (regions.teams_list, MouseTarget::TeamsList),
+        ]
+        .into_iter()
+        .find_map(|(area, target)| {
+            area.filter(|area| rect_contains(*area, column, row))
+                .map(|_| target)
+        })
+    })
+}
+
+fn rendered_tab_width(label: &str) -> u16 {
+    label.chars().count() as u16 + 2
+}
+
+fn clipped_tab_rect(area: Rect, offset: u16, requested_width: u16) -> Rect {
+    if offset >= area.width || area.height == 0 {
+        return Rect::new(area.x.saturating_add(area.width), area.y, 0, 0);
+    }
+
+    Rect::new(
+        area.x.saturating_add(offset),
+        area.y,
+        requested_width.min(area.width - offset),
+        1,
+    )
+}
+
+fn register_tab_regions(area: Rect) {
+    let outlook_w = rendered_tab_width(OUTLOOK_TAB_IDLE);
+    let teams_w = rendered_tab_width(TEAMS_TAB_IDLE);
+    let calendar_w = rendered_tab_width(CALENDAR_TAB_IDLE);
+
+    let outlook_offset = 0;
+    let teams_offset = outlook_w.saturating_add(TAB_GAP_WIDTH);
+    let calendar_offset = teams_offset
+        .saturating_add(teams_w)
+        .saturating_add(TAB_GAP_WIDTH);
+
+    register_mouse_region(
+        MouseTarget::Screen(Screen::Outlook),
+        clipped_tab_rect(area, outlook_offset, outlook_w),
+    );
+    register_mouse_region(
+        MouseTarget::Screen(Screen::Teams),
+        clipped_tab_rect(area, teams_offset, teams_w),
+    );
+    register_mouse_region(
+        MouseTarget::Screen(Screen::Calendar),
+        clipped_tab_rect(area, calendar_offset, calendar_w),
+    );
+}
+
 /// Top row: which app is active on the left, live state on the right.
-/// No key hints live here — those belong in the bottom bar.
+/// No key hints live here; those belong in the bottom bar.
 fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
+    register_tab_regions(area);
     let tab = |name: &str, active: bool, unread: bool| {
         let style = if active {
             Style::default()
@@ -111,7 +333,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     let outlook_tab = if outlook_unread {
         "Outlook (F1) *"
     } else {
-        "Outlook (F1)  "
+        OUTLOOK_TAB_IDLE
     };
     let teams_has_unread = app
         .teams
@@ -123,7 +345,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     } else if teams_has_unread {
         "Teams (F2) •"
     } else {
-        "Teams (F2)  "
+        TEAMS_TAB_IDLE
     };
     let tabs = Line::from(vec![
         tab(outlook_tab, app.screen == Screen::Outlook, outlook_unread),
@@ -134,7 +356,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
             app.teams_unread || teams_has_unread,
         ),
         Span::raw("  "),
-        tab("Calendar (F3)  ", app.screen == Screen::Calendar, false),
+        tab(CALENDAR_TAB_IDLE, app.screen == Screen::Calendar, false),
     ]);
 
     // Right-hand state: presence · poll health · ntfy · memory · local clock.
@@ -362,6 +584,9 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
+    register_mouse_region(MouseTarget::OutlookFolders, cols[0]);
+    register_mouse_region(MouseTarget::OutlookMessages, cols[1]);
+
     // Folders
     let folder_inner_width = cols[0].width.saturating_sub(3) as usize;
     let items: Vec<ListItem> = app
@@ -398,6 +623,14 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         selectable_list(items, "Folders", app.outlook_focus == OutlookFocus::Folders),
         cols[0],
         &mut fstate,
+    );
+    let folder_inner =
+        panel_block("Folders", app.outlook_focus == OutlookFocus::Folders).inner(cols[0]);
+    register_list_rows(
+        MouseList::OutlookFolders,
+        folder_inner,
+        fstate.offset(),
+        app.outlook.folders.len(),
     );
 
     // Messages
@@ -449,6 +682,14 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         ),
         cols[1],
         &mut mstate,
+    );
+    let message_inner =
+        panel_block(&msg_title, app.outlook_focus == OutlookFocus::Messages).inner(cols[1]);
+    register_list_rows(
+        MouseList::OutlookMessages,
+        message_inner,
+        mstate.offset(),
+        app.outlook.messages.len(),
     );
 
     // Reading pane — scrollable when focused, like the Teams conversation.
@@ -1197,6 +1438,31 @@ fn render_calendar_month_panel(
         for lane in 0..event_rows {
             let mut row = Vec::new();
 
+            if active {
+                let event_y = area
+                    .y
+                    .saturating_add(4)
+                    .saturating_add((week * (event_rows + 2) + lane) as u16);
+                for (event_index, segment_lane, start_day, end_day) in &segments {
+                    if *segment_lane != lane {
+                        continue;
+                    }
+                    let x_offset =
+                        widths.iter().take(*start_day).sum::<usize>() + *start_day;
+                    let span_width = widths[*start_day..=*end_day].iter().sum::<usize>()
+                        + (*end_day).saturating_sub(*start_day);
+                    register_mouse_region(
+                        MouseTarget::CalendarEvent(*event_index),
+                        Rect {
+                            x: area.x.saturating_add(1).saturating_add(x_offset as u16),
+                            y: event_y,
+                            width: span_width as u16,
+                            height: 1,
+                        },
+                    );
+                }
+            }
+
             for (day, width) in widths.iter().enumerate() {
                 if day > 0 {
                     let bridge = segments.iter().find(|(_, segment_lane, start, end)| {
@@ -1316,6 +1582,8 @@ fn render_calendar_month(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
+    register_mouse_region(MouseTarget::Calendar, area);
+
     if app.calendar.view == CalendarView::Month {
         render_calendar_month(f, area, app);
         return;
@@ -1413,6 +1681,13 @@ fn render_calendar(f: &mut Frame, area: Rect, app: &App) {
             ),
         area,
         &mut state,
+    );
+    let calendar_inner = Block::default().borders(Borders::ALL).inner(area);
+    register_list_rows(
+        MouseList::CalendarAgenda,
+        calendar_inner,
+        state.offset(),
+        app.calendar.events.len(),
     );
 }
 
@@ -1539,6 +1814,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(32), Constraint::Min(20)])
         .split(area);
+
+    register_mouse_region(MouseTarget::TeamsList, cols[0]);
 
     let me_id = app.me.as_ref().map(|m| m.id.as_str());
     // Show the same OOO banner while browsing cached chat previews as after
@@ -1721,12 +1998,20 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                 })
                 .collect();
 
+            let chat_row_count = items.len();
             let mut state = ListState::default();
             state.select(Some(app.teams.chat_sel));
             f.render_stateful_widget(
                 List::new(items).block(panel_block("Chats (c→channels)", focused)),
                 cols[0],
                 &mut state,
+            );
+            let chat_inner = panel_block("Chats (c→channels)", focused).inner(cols[0]);
+            register_list_rows(
+                MouseList::TeamsChats,
+                chat_inner,
+                state.offset(),
+                chat_row_count,
             );
         }
         TeamsMode::Channels => {
@@ -3790,8 +4075,81 @@ fn centered(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{contact_presence_marker, day_label, local_time, presence_out_of_office_message};
+
+    #[test]
+    fn mouse_regions_follow_rendered_rectangles() {
+        use super::{
+            mouse_target_at, register_mouse_region, register_tab_regions, reset_mouse_regions,
+            MouseTarget,
+        };
+        use crate::app::Screen;
+        use ratatui::layout::Rect;
+
+        reset_mouse_regions();
+        register_tab_regions(Rect::new(5, 3, 80, 1));
+        register_mouse_region(MouseTarget::OutlookFolders, Rect::new(2, 5, 16, 12));
+        register_mouse_region(MouseTarget::OutlookMessages, Rect::new(20, 5, 30, 12));
+        register_mouse_region(MouseTarget::TeamsList, Rect::new(2, 20, 16, 10));
+
+        assert!(matches!(
+            mouse_target_at(5, 3),
+            Some(MouseTarget::Screen(Screen::Outlook))
+        ));
+        assert!(matches!(
+            mouse_target_at(23, 3),
+            Some(MouseTarget::Screen(Screen::Teams))
+        ));
+        assert!(matches!(
+            mouse_target_at(39, 3),
+            Some(MouseTarget::Screen(Screen::Calendar))
+        ));
+        assert!(matches!(
+            mouse_target_at(10, 8),
+            Some(MouseTarget::OutlookFolders)
+        ));
+        assert!(matches!(
+            mouse_target_at(25, 8),
+            Some(MouseTarget::OutlookMessages)
+        ));
+        assert!(matches!(
+            mouse_target_at(10, 22),
+            Some(MouseTarget::TeamsList)
+        ));
+        assert!(mouse_target_at(0, 0).is_none());
+    }
+
+    use super::{
+        contact_presence_marker, day_label, local_time, presence_out_of_office_message,
+    };
     use ratatui::style::Color;
+
+
+    #[test]
+    fn list_rows_map_visible_mouse_rows_to_model_indices() {
+        use super::ListRows;
+        use ratatui::layout::Rect;
+
+        let rows = ListRows {
+            area: Rect::new(20, 5, 30, 3),
+            offset: 7,
+            len: 20,
+        };
+
+        assert_eq!(rows.index_at(20, 5), Some(7));
+        assert_eq!(rows.index_at(35, 6), Some(8));
+        assert_eq!(rows.index_at(49, 7), Some(9));
+        assert_eq!(rows.index_at(50, 7), None);
+        assert_eq!(rows.index_at(20, 8), None);
+
+        let clipped = ListRows {
+            area: Rect::new(2, 10, 20, 5),
+            offset: 18,
+            len: 20,
+        };
+        assert_eq!(clipped.index_at(2, 10), Some(18));
+        assert_eq!(clipped.index_at(2, 11), Some(19));
+        assert_eq!(clipped.index_at(2, 12), None);
+    }
 
     #[test]
     fn teams_ooo_banner_follows_preview_selection() {
