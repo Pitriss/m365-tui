@@ -1045,6 +1045,20 @@ fallback logs as `/tmp/m365-tui-contact-diagnostics-*.log`. F7 additionally
 uses `i` to copy/log the selected peer ID and `a` to start the explicitly
 confirmed automation-peer configuration flow.
 
+### Mouse interaction
+
+Mouse navigation complements the existing keyboard controls.
+
+- Single-click selects list items and moves focus to the clicked pane where applicable.
+- Double-click activates the clicked item, for example opening a mail, chat,
+  calendar event, attachment action, or message link.
+- The mouse wheel scrolls Outlook mail, Teams conversations, and supported
+  dialogs one row at a time.
+- The double-click interval is controlled by `M365_MOUSE_DOUBLE_CLICK_MS`
+  (default: `400`; `0` disables double-click actions).
+
+Keyboard navigation remains available for every mouse-enabled workflow.
+
 ### Navigation
 
 The UI follows a left-to-right pane model.
@@ -1948,6 +1962,12 @@ and publishes architecture-specific archives plus SHA-256 checksums.
 Release asset names are stable so the GitHub `releases/latest/download/...`
 installation URL can be used without embedding a version number.
 
+#### Versioning
+
+Version numbers follow product milestones. Major releases may represent
+substantial feature or UX generations and do not necessarily imply
+backward-incompatible changes.
+
 ---
 
 ## Relationship to upstream
@@ -1960,7 +1980,8 @@ It retains the original project's Microsoft Graph and terminal-client
 foundations but now contains substantial additional Outlook, Teams, Calendar,
 presence, caching, image, navigation, and workflow functionality.
 
-The fork is maintained and released independently.
+The fork is maintained and released independently and no longer tracks
+upstream releases.
 
 The historical development of those changes is available through Git history
 and release history rather than being duplicated as a separate
