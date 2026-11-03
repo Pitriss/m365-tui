@@ -8183,11 +8183,27 @@ impl App {
 
     // -- input handling ----------------------------------------------------
 
-    /// Capture mouse input in the normal application view so the top tabs can
-    /// be clicked. Copy mode and overlays deliberately release capture for
-    /// ordinary terminal selection / modal input.
+    fn overlay_mouse_enabled(&self) -> bool {
+        matches!(
+            self.overlay.as_ref(),
+            Some(
+                Overlay::Notice(_)
+                    | Overlay::Help
+                    | Overlay::TeamsCommands
+                    | Overlay::Diagnostics
+                    | Overlay::ContactDiagnostics
+                    | Overlay::ContactProfile
+                    | Overlay::CalendarEvent
+                    | Overlay::OutOfOffice(_)
+            )
+        )
+    }
+
+    /// Capture mouse input in the normal application view and in read-only
+    /// informational overlays that support click-away and native clipboard copy.
+    /// Editing/confirmation overlays still release capture for terminal selection.
     pub fn wants_mouse_capture(&self) -> bool {
-        !self.copy_mode && self.overlay.is_none()
+        !self.copy_mode && (self.overlay.is_none() || self.overlay_mouse_enabled())
     }
 
     fn mouse_left_click_is_double(
@@ -8224,6 +8240,49 @@ impl App {
         }
 
         self.note_presence_activity();
+
+        // Read-only informational overlays own the mouse completely. A click
+        // outside closes the overlay without falling through to the underlying
+        // Outlook/Teams/Calendar view. A double-click inside copies the complete
+        // source text, but only when a native clipboard integration is available.
+        if self.overlay_mouse_enabled() {
+            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return;
+            }
+
+            let inside = crate::ui::overlay_contains(mouse.column, mouse.row).unwrap_or(false);
+            if !inside {
+                let was_notice = matches!(self.overlay.as_ref(), Some(Overlay::Notice(_)));
+                self.overlay = None;
+                self.last_mouse_click = None;
+                if was_notice {
+                    self.notice_until = None;
+                }
+                return;
+            }
+
+            let double_click =
+                self.mouse_left_click_is_double(Some(crate::ui::MouseTarget::Overlay));
+            if double_click && crate::clipboard::native_backend().is_some() {
+                let text = self
+                    .overlay
+                    .as_ref()
+                    .and_then(|overlay| crate::ui::overlay_copy_text(self, overlay))
+                    .filter(|text| !text.trim().is_empty());
+
+                if let Some(text) = text {
+                    if let Some(via) = crate::clipboard::copy_native(&text) {
+                        self.status = format!(
+                            "copied popup to clipboard ({} bytes, via {via})",
+                            text.len()
+                        );
+                    } else {
+                        self.status = "native clipboard copy failed".into();
+                    }
+                }
+            }
+            return;
+        }
 
         let target = crate::ui::mouse_target_at(mouse.column, mouse.row);
 
@@ -10653,7 +10712,7 @@ where
 }
 
 /// Flatten rendered lines to plain text for the clipboard.
-fn lines_to_plain(lines: &[ratatui::text::Line<'_>]) -> String {
+pub(crate) fn lines_to_plain(lines: &[ratatui::text::Line<'_>]) -> String {
     lines
         .iter()
         .map(|l| {

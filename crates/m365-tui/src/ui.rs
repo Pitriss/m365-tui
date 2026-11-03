@@ -92,6 +92,7 @@ const TAB_GAP_WIDTH: u16 = 2;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MouseTarget {
     Screen(Screen),
+    Overlay,
     OutlookFolders,
     OutlookFolderRow(usize),
     OutlookMessages,
@@ -104,6 +105,7 @@ pub(crate) enum MouseTarget {
 
 #[derive(Default)]
 struct MouseRegions {
+    overlay: Option<Rect>,
     outlook_tab: Option<Rect>,
     teams_tab: Option<Rect>,
     calendar_tab: Option<Rect>,
@@ -160,6 +162,21 @@ fn reset_mouse_regions() {
     with_mouse_regions(|regions| *regions = MouseRegions::default());
 }
 
+fn register_overlay_region(area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    with_mouse_regions(|regions| regions.overlay = Some(area));
+}
+
+pub(crate) fn overlay_contains(column: u16, row: u16) -> Option<bool> {
+    with_mouse_regions(|regions| {
+        regions
+            .overlay
+            .map(|area| rect_contains(area, column, row))
+    })
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
@@ -204,7 +221,8 @@ fn register_mouse_region(target: MouseTarget, area: Rect) {
         MouseTarget::Calendar => regions.calendar = Some(area),
         MouseTarget::CalendarEvent(index) => regions.calendar_events.push((area, index)),
         MouseTarget::TeamsList => regions.teams_list = Some(area),
-        MouseTarget::OutlookFolderRow(_)
+        MouseTarget::Overlay
+        | MouseTarget::OutlookFolderRow(_)
         | MouseTarget::OutlookMessageRow(_)
         | MouseTarget::TeamsChatRow(_) => {}
     });
@@ -2380,6 +2398,85 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 // Overlays
 // ---------------------------------------------------------------------------
 
+const TEAMS_COMMANDS_TEXT: &str = " /topic <text>       set chat topic/title (group chats only)
+ /rename <name>      rename chat (group chats only; asks for confirmation)
+ /edit <text>        replace selected own message text
+ /pin                pin selected message (replaces current pin; asks confirmation)
+ /unpin              unpin selected message
+ /pins               show current pinned message; Enter jump · u unpin
+ /unread             mark current chat unread
+ /delete             delete selected own message (asks confirmation)
+ /ooo                show Out of Office
+ /ooo set            set/edit scheduled Out of Office
+ /ooo clear          disable Out of Office (asks confirmation)
+ /help               show this command list
+ /help all           show full application/key help
+
+ Formatting: **bold**  *italic*  ~~strike~~  `code`
+             > quote   - list item   [text](https://url)
+
+ Commands that act on a message use the currently selected ▶ message.";
+const HELP_TEXT: &str = "\
+ M365 TUI — keys\n\
+ \n\
+ Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · F6 diagnostics · F7 contact diagnostics · Ctrl+P palette · p presence · ? help · q quit\n\
+  Presence: p menu · 1-6 state · m set/edit status message · c clear message · a automatic\n\
+ \n\
+ NTFY:    F4 menu · j/k choose · Enter apply · c/0 resume now · Esc cancel\n\
+          Snooze: 1h · 2h · 4h · 8h · 12h · 24h · Resume now\n\
+ \n\
+ Links:   o list links in the message · 1-9 open in browser\n\
+ Attach:  A list attachments · 1-9 save to your Downloads folder\n\
+          when writing: Tab to Attach, type a path, Enter to attach\n\
+ \n\
+ Copying: y yank focused message · Y yank whole view\n\
+          z copy mode (full-width, borderless — drag-select cleanly)\n\
+ \n\
+ Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
+          j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
+ \n\
+ Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
+          f forward · / search · g calendar · in the reading pane j/k scroll\n\
+ \n\
+ Teams:   c chats/channels · x archive/restore · X toggle Stay archived\n\
+          g profile on chat · g newest in messages · t react · e edit\n\
+          a/i type message · r reply to selected · Enter send/save\n\
+          /topic <text> (group only) · /rename <name> (group only)\n\
+          /edit <text> · /pin · /unpin · /pins · /unread · /delete\n\
+          /ooo · /ooo set · /ooo clear\n\
+          /help commands only · /help all full help\n\
+          Markdown: **bold** · *italic* · ~~strike~~ · `code` · > quote · - list · [text](url)\n\
+ \n\
+ Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
+           a accept · d decline · t tentative · r refresh · w range · v month\n\
+ Calendar month:  j/k event · Enter/g detail · o open meeting · n today\n\
+           ←/→ previous/next month · a/d/t RSVP · v agenda\n\
+ \n\
+ Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
+          ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
+          Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
+          Enter newline in body · paste works (bracketed paste)\n\
+ \n\
+ Help:    j/k or ↑/↓ scroll · PgUp/PgDn · Home/End · Esc close.";
+
+pub(crate) fn overlay_copy_text(app: &App, overlay: &Overlay) -> Option<String> {
+    match overlay {
+        Overlay::Notice(message) => Some(message.clone()),
+        Overlay::TeamsCommands => Some(TEAMS_COMMANDS_TEXT.to_string()),
+        Overlay::Help => Some(HELP_TEXT.to_string()),
+        Overlay::Diagnostics => Some(diagnostics::text(app)),
+        Overlay::ContactDiagnostics => Some(diagnostics::contact_text(app)),
+        Overlay::ContactProfile => Some(crate::app::lines_to_plain(&contact_profile_lines(app))),
+        Overlay::CalendarEvent => app
+            .calendar
+            .events
+            .get(app.calendar.selected)
+            .map(|event| crate::app::lines_to_plain(&calendar_event_detail(event))),
+        Overlay::OutOfOffice(view) => Some(view.text()),
+        _ => None,
+    }
+}
+
 fn calendar_event_detail(event: &m365_core::models::Event) -> Vec<Line<'static>> {
     let subject = event
         .subject
@@ -2619,6 +2716,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
     match overlay {
         Overlay::Notice(message) => {
             let area = centered(66, 30, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(format!(
@@ -2632,27 +2730,11 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::TeamsCommands => {
             let area = centered(72, 66, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
             let block = popup_block("Teams commands — j/k scroll · Esc close");
             let inner = block.inner(area);
-            let text = " /topic <text>       set chat topic/title (group chats only)
- /rename <name>      rename chat (group chats only; asks for confirmation)
- /edit <text>        replace selected own message text
- /pin                pin selected message (replaces current pin; asks confirmation)
- /unpin              unpin selected message
- /pins               show current pinned message; Enter jump · u unpin
- /unread             mark current chat unread
- /delete             delete selected own message (asks confirmation)
- /ooo                show Out of Office
- /ooo set            set/edit scheduled Out of Office
- /ooo clear          disable Out of Office (asks confirmation)
- /help               show this command list
- /help all           show full application/key help
-
- Formatting: **bold**  *italic*  ~~strike~~  `code`
-             > quote   - list item   [text](https://url)
-
- Commands that act on a message use the currently selected ▶ message.";
+            let text = TEAMS_COMMANDS_TEXT;
 
             let lines: Vec<Line<'static>> = text
                 .split('\n')
@@ -2668,51 +2750,12 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::Help => {
             let area = centered(60, 60, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
             let block = popup_block("Help — j/k scroll · Esc close");
             let inner = block.inner(area);
-            let text = "\
- M365 TUI — keys\n\
- \n\
- Global:  F1 Outlook · F2 Teams · F3 Calendar · F4 ntfy snooze · F5 force poll · F6 diagnostics · F7 contact diagnostics · Ctrl+P palette · p presence · ? help · q quit\n\
-  Presence: p menu · 1-6 state · m set/edit status message · c clear message · a automatic\n\
- \n\
- NTFY:    F4 menu · j/k choose · Enter apply · c/0 resume now · Esc cancel\n\
-          Snooze: 1h · 2h · 4h · 8h · 12h · 24h · Resume now\n\
- \n\
- Links:   o list links in the message · 1-9 open in browser\n\
- Attach:  A list attachments · 1-9 save to your Downloads folder\n\
-          when writing: Tab to Attach, type a path, Enter to attach\n\
- \n\
- Copying: y yank focused message · Y yank whole view\n\
-          z copy mode (full-width, borderless — drag-select cleanly)\n\
- \n\
- Moving:  h/← out a pane · l/→ into it (opens what's selected)\n\
-          j/k or ↑/↓ move · arrows work everywhere hjkl does\n\
- \n\
- Outlook: Enter open · u read/unread · c compose · r reply · a reply-all\n\
-          f forward · / search · g calendar · in the reading pane j/k scroll\n\
- \n\
- Teams:   c chats/channels · x archive/restore · X toggle Stay archived\n\
-          g profile on chat · g newest in messages · t react · e edit\n\
-          a/i type message · r reply to selected · Enter send/save\n\
-          /topic <text> (group only) · /rename <name> (group only)\n\
-          /edit <text> · /pin · /unpin · /pins · /unread · /delete\n\
-          /ooo · /ooo set · /ooo clear\n\
-          /help commands only · /help all full help\n\
-          Markdown: **bold** · *italic* · ~~strike~~ · `code` · > quote · - list · [text](url)\n\
- \n\
- Calendar agenda: j/k select · Enter/g detail · o open meeting · n today\n\
-           a accept · d decline · t tentative · r refresh · w range · v month\n\
- Calendar month:  j/k event · Enter/g detail · o open meeting · n today\n\
-           ←/→ previous/next month · a/d/t RSVP · v agenda\n\
- \n\
- Compose: Tab/Shift+Tab field · Ctrl+S send · Esc cancel\n\
-          ←→↑↓ move · Ctrl+←→ by word · Home/End line · Ctrl+Home/End all\n\
-          Backspace/Delete · Ctrl+W word · Ctrl+U to line start · Ctrl+K to end\n\
-          Enter newline in body · paste works (bracketed paste)\n\
- \n\
- Help:    j/k or ↑/↓ scroll · PgUp/PgDn · Home/End · Esc close.";
+            let text = HELP_TEXT;
+
             let lines: Vec<Line<'static>> = text
                 .split('\n')
                 .map(|line| Line::raw(line.to_string()))
@@ -2727,6 +2770,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::Diagnostics => {
             let area = centered(84, 86, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
 
             let block = popup_block(
@@ -2795,6 +2839,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::ContactDiagnostics => {
             let area = centered(84, 86, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
 
             let block = popup_block("Contact diagnostics");
@@ -2861,6 +2906,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::ContactProfile => {
             let area = centered(76, 72, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
 
             let block = popup_block("Contact profile — j/k scroll · Esc close");
@@ -2947,6 +2993,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::CalendarEvent => {
             let area = centered(76, 76, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
 
             if let Some(event) = app.calendar.events.get(app.calendar.selected) {
@@ -3289,6 +3336,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::OutOfOffice(view) => {
             let area = centered(82, 74, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(view.text())
@@ -4079,8 +4127,8 @@ mod tests {
     #[test]
     fn mouse_regions_follow_rendered_rectangles() {
         use super::{
-            mouse_target_at, register_mouse_region, register_tab_regions, reset_mouse_regions,
-            MouseTarget,
+            mouse_target_at, overlay_contains, register_mouse_region, register_overlay_region,
+            register_tab_regions, reset_mouse_regions, MouseTarget,
         };
         use crate::app::Screen;
         use ratatui::layout::Rect;
@@ -4090,7 +4138,10 @@ mod tests {
         register_mouse_region(MouseTarget::OutlookFolders, Rect::new(2, 5, 16, 12));
         register_mouse_region(MouseTarget::OutlookMessages, Rect::new(20, 5, 30, 12));
         register_mouse_region(MouseTarget::TeamsList, Rect::new(2, 20, 16, 10));
+        register_overlay_region(Rect::new(30, 10, 20, 8));
 
+        assert_eq!(overlay_contains(35, 12), Some(true));
+        assert_eq!(overlay_contains(10, 12), Some(false));
         assert!(matches!(
             mouse_target_at(5, 3),
             Some(MouseTarget::Screen(Screen::Outlook))
