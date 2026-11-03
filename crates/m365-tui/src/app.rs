@@ -8378,6 +8378,14 @@ impl App {
                     self.teams.focus = TeamsFocus::List;
                     return;
                 }
+                Some(crate::ui::MouseTarget::TeamsComposer)
+                    if self.screen == Screen::Teams =>
+                {
+                    if double_click && self.teams.focus != TeamsFocus::Composer {
+                        self.teams_begin_compose();
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -9127,22 +9135,7 @@ impl App {
                     self.preview_selected_teams_chat();
                 }
             }
-            KeyCode::Char('i') | KeyCode::Char('a') => {
-                if self.teams.editing_message.take().is_some() {
-                    self.teams.composer.clear();
-                }
-                self.teams.replying_to = None;
-                if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
-                    if self.teams_selected_chat().is_none() {
-                        self.status = "open Archive with Enter, or select a chat first".into();
-                        return;
-                    }
-                    if let Some(chat_id) = self.teams.preview_chat_id.clone() {
-                        self.open_teams_chat(chat_id);
-                    }
-                }
-                self.teams.focus = TeamsFocus::Composer;
-            }
+            KeyCode::Char('i') | KeyCode::Char('a') => self.teams_begin_compose(),
             // Reply to the selected message: same composer, quoted on send.
             KeyCode::Char('r')
                 if self.teams.focus == TeamsFocus::Messages && !self.teams.messages.is_empty() =>
@@ -9268,6 +9261,25 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn teams_begin_compose(&mut self) {
+        if self.teams.editing_message.take().is_some() {
+            self.teams.composer.clear();
+        }
+        self.teams.replying_to = None;
+
+        if self.teams.mode == TeamsMode::Chats && self.teams.focus == TeamsFocus::List {
+            if self.teams_selected_chat().is_none() {
+                self.status = "open Archive with Enter, or select a chat first".into();
+                return;
+            }
+            if let Some(chat_id) = self.teams.preview_chat_id.clone() {
+                self.open_teams_chat(chat_id);
+            }
+        }
+
+        self.teams.focus = TeamsFocus::Composer;
     }
 
     fn teams_enter(&mut self) {

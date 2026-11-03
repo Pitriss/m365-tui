@@ -101,6 +101,7 @@ pub(crate) enum MouseTarget {
     CalendarEvent(usize),
     TeamsList,
     TeamsChatRow(usize),
+    TeamsComposer,
 }
 
 #[derive(Default)]
@@ -118,6 +119,7 @@ struct MouseRegions {
     calendar_events: Vec<(Rect, usize)>,
     teams_list: Option<Rect>,
     teams_chat_rows: Option<ListRows>,
+    teams_composer: Option<Rect>,
 }
 
 #[derive(Clone, Copy)]
@@ -221,6 +223,7 @@ fn register_mouse_region(target: MouseTarget, area: Rect) {
         MouseTarget::Calendar => regions.calendar = Some(area),
         MouseTarget::CalendarEvent(index) => regions.calendar_events.push((area, index)),
         MouseTarget::TeamsList => regions.teams_list = Some(area),
+        MouseTarget::TeamsComposer => regions.teams_composer = Some(area),
         MouseTarget::Overlay
         | MouseTarget::OutlookFolderRow(_)
         | MouseTarget::OutlookMessageRow(_)
@@ -271,6 +274,7 @@ pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
             (regions.outlook_messages, MouseTarget::OutlookMessages),
             (regions.calendar, MouseTarget::Calendar),
             (regions.teams_list, MouseTarget::TeamsList),
+            (regions.teams_composer, MouseTarget::TeamsComposer),
         ]
         .into_iter()
         .find_map(|(area, target)| {
@@ -2318,6 +2322,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
     let composer_block = panel_block(title, composing);
     let mut composer_inner = composer_block.inner(right[2]);
+    register_mouse_region(MouseTarget::TeamsComposer, right[2]);
     f.render_widget(composer_block, right[2]);
 
     // Show reply/edit context above the composer.
@@ -2383,7 +2388,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     if app.teams.composer.is_empty() && !composing {
         f.render_widget(
             Paragraph::new(Span::styled(
-                "press i to type · Enter to send",
+                "press i or double-click to type · Enter to send",
                 Style::default().fg(DIM),
             )),
             composer_inner,
@@ -4138,6 +4143,7 @@ mod tests {
         register_mouse_region(MouseTarget::OutlookFolders, Rect::new(2, 5, 16, 12));
         register_mouse_region(MouseTarget::OutlookMessages, Rect::new(20, 5, 30, 12));
         register_mouse_region(MouseTarget::TeamsList, Rect::new(2, 20, 16, 10));
+        register_mouse_region(MouseTarget::TeamsComposer, Rect::new(20, 20, 40, 4));
         register_overlay_region(Rect::new(30, 10, 20, 8));
 
         assert_eq!(overlay_contains(35, 12), Some(true));
@@ -4165,6 +4171,10 @@ mod tests {
         assert!(matches!(
             mouse_target_at(10, 22),
             Some(MouseTarget::TeamsList)
+        ));
+        assert!(matches!(
+            mouse_target_at(25, 22),
+            Some(MouseTarget::TeamsComposer)
         ));
         assert!(mouse_target_at(0, 0).is_none());
     }
