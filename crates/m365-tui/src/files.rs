@@ -8,17 +8,45 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Where downloads go: the user's Download dir, else the temp dir.
-pub fn download_dir() -> PathBuf {
-    directories::UserDirs::new()
+/// Effective attachment download directory. M365_DOWNLOAD_DIR overrides the
+/// desktop/XDG Downloads directory. Absolute paths are used directly; `~/...`
+/// and other relative values are resolved against the user's home directory so
+/// the result never depends on the process working directory.
+pub fn download_dir() -> Result<PathBuf> {
+    if let Some(value) = std::env::var_os("M365_DOWNLOAD_DIR") {
+        if !value.is_empty() {
+            let path = PathBuf::from(&value);
+            if path.is_absolute() {
+                return Ok(path);
+            }
+
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+                .context("resolving home directory for M365_DOWNLOAD_DIR")?;
+
+            if let Some(text) = value.to_str() {
+                if text == "~" {
+                    return Ok(home);
+                }
+                if let Some(rest) = text.strip_prefix("~/") {
+                    return Ok(home.join(rest));
+                }
+            }
+
+            return Ok(home.join(path));
+        }
+    }
+
+    Ok(directories::UserDirs::new()
         .and_then(|u| u.download_dir().map(Path::to_path_buf))
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(std::env::temp_dir))
 }
 
 /// Write `bytes` into the download directory under a safe form of `name`,
 /// without overwriting an existing file. Returns the path written.
 pub fn save(name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let dir = download_dir();
+    let dir = download_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = unique_path(&dir, &safe_file_name(name));
     std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
@@ -29,10 +57,7 @@ pub fn save(name: &str, bytes: &[u8]) -> Result<PathBuf> {
 /// Strips any directory components, so `../../.ssh/authorized_keys` becomes
 /// `authorized_keys` and can only ever land inside the download directory.
 pub fn safe_file_name(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = base
         .chars()
         .filter(|c| !c.is_control() && *c != '\0')
@@ -75,9 +100,15 @@ mod tests {
 
     #[test]
     fn strips_path_traversal() {
-        assert_eq!(safe_file_name("../../.ssh/authorized_keys"), "authorized_keys");
+        assert_eq!(
+            safe_file_name("../../.ssh/authorized_keys"),
+            "authorized_keys"
+        );
         assert_eq!(safe_file_name("/etc/passwd"), "passwd");
-        assert_eq!(safe_file_name(r"..\..\windows\system32\evil.dll"), "evil.dll");
+        assert_eq!(
+            safe_file_name(r"..\..\windows\system32\evil.dll"),
+            "evil.dll"
+        );
         assert_eq!(safe_file_name(".."), "attachment");
         assert_eq!(safe_file_name("."), "attachment");
         assert_eq!(safe_file_name(""), "attachment");
@@ -87,12 +118,18 @@ mod tests {
     #[test]
     fn keeps_ordinary_names() {
         assert_eq!(safe_file_name("report.pdf"), "report.pdf");
-        assert_eq!(safe_file_name("Relatório final.docx"), "Relatório final.docx");
+        assert_eq!(
+            safe_file_name("Relatório final.docx"),
+            "Relatório final.docx"
+        );
     }
 
     #[test]
     fn drops_control_characters() {
-        assert_eq!(safe_file_name("evil\n\r\u{1b}[2Jname.txt"), "evil[2Jname.txt");
+        assert_eq!(
+            safe_file_name("evil\n\r\u{1b}[2Jname.txt"),
+            "evil[2Jname.txt"
+        );
     }
 
     #[test]

@@ -118,7 +118,6 @@ pub struct ContactDiagnosticsState {
     pub remote: Option<ContactDiagnosticsRemote>,
 }
 
-
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -237,10 +236,8 @@ pub fn contact_messages_name_probe(
         peer_messages_with_display_name,
         peer_message_found: !peers.is_empty(),
         sender_display_name: named_peer.is_some(),
-        sender_id_shape: identifier_shape(
-            representative_peer.and_then(|user| user.id.as_deref()),
-        )
-        .to_string(),
+        sender_id_shape: identifier_shape(representative_peer.and_then(|user| user.id.as_deref()))
+            .to_string(),
         sender_type: safe_identity_type(
             representative_peer.and_then(|user| user.user_identity_type.as_deref()),
         ),
@@ -606,7 +603,6 @@ pub fn contact_text(app: &App) -> String {
     ));
     out.push(String::new());
 
-
     out.push("Name resolution".into());
     out.push(row(
         "Current roster members",
@@ -674,7 +670,10 @@ pub fn contact_text(app: &App) -> String {
     match state.remote.as_ref().map(|remote| &remote.expanded_name) {
         Some(Ok(probe)) => {
             out.push(row("Expanded chat probe", "● loaded"));
-            out.push(row("Expanded roster members", probe.member_count.to_string()));
+            out.push(row(
+                "Expanded roster members",
+                probe.member_count.to_string(),
+            ));
             out.push(row(
                 "Expanded peer member",
                 yes_no(probe.peer_member_found, "found", "missing"),
@@ -713,14 +712,21 @@ pub fn contact_text(app: &App) -> String {
         )),
         None => out.push(row(
             "Expanded chat probe",
-            if state.loading { "? loading" } else { "? not loaded" },
+            if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            },
         )),
     }
 
     match state.remote.as_ref().map(|remote| &remote.members_name) {
         Some(Ok(probe)) => {
             out.push(row("Dedicated /members probe", "● loaded"));
-            out.push(row("/members roster members", probe.member_count.to_string()));
+            out.push(row(
+                "/members roster members",
+                probe.member_count.to_string(),
+            ));
             out.push(row(
                 "/members peer member",
                 yes_no(probe.peer_member_found, "found", "missing"),
@@ -741,7 +747,11 @@ pub fn contact_text(app: &App) -> String {
         )),
         None => out.push(row(
             "Dedicated /members probe",
-            if state.loading { "? loading" } else { "? not loaded" },
+            if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            },
         )),
     }
 
@@ -771,7 +781,11 @@ pub fn contact_text(app: &App) -> String {
         )),
         None => out.push(row(
             "Recent messages probe",
-            if state.loading { "? loading" } else { "? not loaded" },
+            if state.loading {
+                "? loading"
+            } else {
+                "? not loaded"
+            },
         )),
     }
     out.push(String::new());
@@ -1182,6 +1196,12 @@ pub fn text(app: &App) -> String {
     out.push(row(
         "Persistent cache limit",
         format!("{} MiB", app.session.config.cache_max_mb),
+    ));
+    out.push(row(
+        "Download directory",
+        crate::files::download_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("× {error:#}")),
     ));
     let teams_poll = app.teams_poll_diagnostics();
     out.push(row(

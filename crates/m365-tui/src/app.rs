@@ -9,9 +9,7 @@ use std::io::IsTerminal;
 
 use anyhow::Context;
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use m365_core::config::{NtfyMode, TeamsSystemEvents, TEAMS_POLL_BUDGET_MIN_RPS};
 use m365_core::events::{ChangeEvent, ChangeKind};
 use m365_core::models::{
@@ -192,6 +190,14 @@ pub enum AppMessage {
     Downloaded {
         name: String,
         bytes: Vec<u8>,
+        web_link: Option<String>,
+    },
+    /// Raw Graph attachment download failed. Keep the message web link so the
+    /// UI can fall back to the configured web-link opener.
+    AttachmentDownloadFailed {
+        name: String,
+        web_link: Option<String>,
+        error: String,
     },
     /// Push-notification health, for the status bar.
     /// Decoded image attachments for the currently open Outlook message.
@@ -419,10 +425,34 @@ pub enum ListUpdate {
 /// same physical navigation and familiar reaction set are available here.
 pub const REACTION_COLS: usize = 7;
 pub const REACTIONS: &[&str] = &[
-    "🤝", "🙏", "👍", "👌", "✍️", "😁", "😈",
-    "💯", "🖕", "❤️", "🫡", "👏", "👨‍💻", "👀",
-    "😎", "🏆", "🤔", "🤷", "😢", "🥰", "🦄",
-    "🤡", "🔥", "💩", "😱", "👎", "😡", "🤬",
+    "🤝",
+    "🙏",
+    "👍",
+    "👌",
+    "✍️",
+    "😁",
+    "😈",
+    "💯",
+    "🖕",
+    "❤️",
+    "🫡",
+    "👏",
+    "👨‍💻",
+    "👀",
+    "😎",
+    "🏆",
+    "🤔",
+    "🤷",
+    "😢",
+    "🥰",
+    "🦄",
+    "🤡",
+    "🔥",
+    "💩",
+    "😱",
+    "👎",
+    "😡",
+    "🤬",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,8 +525,7 @@ pub const PRESENCE_AVAILABLE_RENEW_AFTER: std::time::Duration =
 
 /// Non-Available sessions do not have Graph's five-minute Available activity
 /// timeout, so keep the existing low-frequency lease renewal for them.
-pub const PRESENCE_RENEW_AFTER: std::time::Duration =
-    std::time::Duration::from_secs(30 * 60);
+pub const PRESENCE_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn presence_renew_after(target: SessionTarget) -> std::time::Duration {
     if target == SessionTarget::Present(AVAILABLE) {
@@ -854,10 +883,7 @@ fn teams_message_is_incoming(message: &ChatMessage, me_id: Option<&str>) -> bool
     teams_sender_is_incoming(message.from.as_ref(), me_id)
 }
 
-fn teams_chat_is_archived(
-    chat: &Chat,
-    stay_archived: &std::collections::HashSet<String>,
-) -> bool {
+fn teams_chat_is_archived(chat: &Chat, stay_archived: &std::collections::HashSet<String>) -> bool {
     teams_chat_is_hidden(chat) || stay_archived.contains(&chat.id)
 }
 
@@ -1318,6 +1344,9 @@ pub struct App {
     /// Largest useful reading-pane scroll offset, set by the renderer once it
     /// knows the wrapped height of the open message.
     pub reading_max_scroll: std::cell::Cell<u16>,
+    /// First visible Outlook message row. Persisted across focus changes so
+    /// opening Reading does not make the message list jump around.
+    pub outlook_message_list_offset: std::cell::Cell<usize>,
     /// Current vertical scroll offset of the Help overlay.
     pub help_scroll: u16,
     /// Largest useful Help scroll offset, set by the renderer after wrapping.
@@ -1358,6 +1387,8 @@ pub struct App {
     chat_cache_warmup_started: bool,
     /// Last left-click target and timestamp used for application-level double-click detection.
     last_mouse_click: Option<(crate::ui::MouseTarget, std::time::Instant)>,
+    /// Attachment row selected by a mouse click in the Outlook attachment popup.
+    pub attachment_sel: Option<usize>,
     /// Selected Presence option for wheel/click navigation in the Presence popup.
     pub presence_sel: usize,
     /// Borderless full-width view for clean terminal text selection.
@@ -1794,9 +1825,7 @@ fn store_ui_state(
     std::fs::rename(temp_path, final_path)
 }
 
-fn load_stay_archived(
-    cache_dir: Option<&std::path::Path>,
-) -> std::collections::HashSet<String> {
+fn load_stay_archived(cache_dir: Option<&std::path::Path>) -> std::collections::HashSet<String> {
     let Some(cache_dir) = cache_dir else {
         return std::collections::HashSet::new();
     };
@@ -1827,8 +1856,7 @@ fn load_stay_archived(
         }
     };
 
-    if value.get("version").and_then(serde_json::Value::as_u64)
-        != Some(STAY_ARCHIVED_STATE_VERSION)
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(STAY_ARCHIVED_STATE_VERSION)
     {
         tracing::warn!(
             "unsupported Stay archived state version in {}",
@@ -2302,7 +2330,11 @@ mod persistent_cache_pruning_tests {
                 if !name.starts_with(image_key) {
                     return None;
                 }
-                entry.metadata().ok().filter(|metadata| metadata.is_file()).map(|metadata| metadata.len())
+                entry
+                    .metadata()
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .map(|metadata| metadata.len())
             })
             .sum::<u64>();
         let conversation_size = std::fs::read_dir(&conversations)
@@ -2692,6 +2724,7 @@ impl App {
             status_ticks: 0,
             text_width_hint: std::cell::Cell::new(60),
             reading_max_scroll: std::cell::Cell::new(0),
+            outlook_message_list_offset: std::cell::Cell::new(0),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
             diagnostics: DiagnosticsState::default(),
@@ -2711,6 +2744,7 @@ impl App {
             teams_unread: false,
             chat_cache_warmup_started: false,
             last_mouse_click: None,
+            attachment_sel: None,
             presence_sel: 0,
             copy_mode: false,
             copy_scroll: 0,
@@ -3403,10 +3437,7 @@ impl App {
         let now = std::time::Instant::now();
         let desired = self.presence_state.diagnostics(now).desired;
         let renew_after = presence_renew_after(desired);
-        let Some(write) = self
-            .presence_state
-            .next_write(now, renew_after, force_sync)
-        else {
+        let Some(write) = self.presence_state.next_write(now, renew_after, force_sync) else {
             return;
         };
 
@@ -3832,26 +3863,89 @@ impl App {
         });
     }
 
-    /// Download one attachment; the write to disk happens on the UI thread.
-    fn download_attachment(&mut self, index: usize) {
-        let (Some(msg), Some(att)) = (
-            self.outlook.reading.as_ref(),
-            self.outlook.reading_attachments.get(index),
-        ) else {
+    fn open_attachment_web_fallback(&mut self, name: &str, web_link: Option<String>, reason: &str) {
+        let Some(url) = web_link else {
+            self.status =
+                format!("could not download {name}: {reason}; no Outlook web link available");
             return;
         };
-        if !att.is_file() {
-            self.status = "only file attachments can be saved".into();
+
+        match self.open_web_link(&url) {
+            Ok(()) => {
+                self.status = format!("{reason}; opening Outlook Web for attachment {name}");
+            }
+            Err(open_error) => {
+                self.status = format!(
+                    "could not download {name}: {reason}; web fallback failed: {open_error:#}"
+                );
+            }
+        }
+    }
+
+    fn activate_outlook_attachment_summary(&mut self) {
+        match self.outlook.reading_attachments.len() {
+            0 => {
+                self.status = "no attachments on this message".into();
+            }
+            1 => {
+                self.download_attachment(0);
+            }
+            count => {
+                self.attachment_sel = None;
+                self.overlay = Some(Overlay::Attachments);
+                self.status = format!("{count} attachments · double-click one to download");
+            }
+        }
+    }
+
+    /// Download one attachment. File/item attachments use authenticated Graph
+    /// raw download. Reference attachments and failures fall back to the
+    /// message's Outlook webLink through M365_WEBLINK_OPENER / xdg-open.
+    fn download_attachment(&mut self, index: usize) {
+        let Some((message_id, web_link, attachment_id, name, is_reference)) =
+            self.outlook.reading.as_ref().and_then(|msg| {
+                self.outlook.reading_attachments.get(index).map(|att| {
+                    let is_reference = att
+                        .odata_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.ends_with("referenceAttachment"));
+                    (
+                        msg.id.clone(),
+                        msg.web_link.clone(),
+                        att.id.clone(),
+                        att.display_name(),
+                        is_reference,
+                    )
+                })
+            })
+        else {
+            return;
+        };
+
+        if is_reference {
+            self.open_attachment_web_fallback(
+                &name,
+                web_link,
+                "reference attachment has no raw Graph download",
+            );
             return;
         }
-        let message_id = msg.id.clone();
-        let attachment_id = att.id.clone();
-        let name = att.display_name();
+
         self.status = format!("downloading {name}…");
         let s = self.session.clone();
         self.spawn(async move {
-            let bytes = mail::download_attachment(&s.graph, &message_id, &attachment_id).await?;
-            Ok(AppMessage::Downloaded { name, bytes })
+            match mail::download_attachment(&s.graph, &message_id, &attachment_id).await {
+                Ok(bytes) => Ok(AppMessage::Downloaded {
+                    name,
+                    bytes,
+                    web_link,
+                }),
+                Err(error) => Ok(AppMessage::AttachmentDownloadFailed {
+                    name,
+                    web_link,
+                    error: format!("{error:#}"),
+                }),
+            }
         });
     }
 
@@ -4414,12 +4508,9 @@ impl App {
                     me_id
                         .map(|id| member.user_id.as_deref() != Some(id))
                         .unwrap_or(true)
-                        && member
-                            .odata_type
-                            .as_deref()
-                            .is_some_and(|kind| {
-                                kind.ends_with("microsoftAccountUserConversationMember")
-                            })
+                        && member.odata_type.as_deref().is_some_and(|kind| {
+                            kind.ends_with("microsoftAccountUserConversationMember")
+                        })
                 })
             })
             .and_then(|member| member.user_id.as_deref())
@@ -4468,11 +4559,9 @@ impl App {
             return learned_peer_id;
         };
 
-        if let Some(name) = peer_display_name_from_messages(
-            messages,
-            me_id,
-            personal_roster_peer_id.as_deref(),
-        ) {
+        if let Some(name) =
+            peer_display_name_from_messages(messages, me_id, personal_roster_peer_id.as_deref())
+        {
             self.teams
                 .contact_names
                 .insert(chat_id.to_string(), name.to_string());
@@ -5179,8 +5268,7 @@ impl App {
         let chat_id = chat.id.clone();
         let server_hidden = teams_chat_is_hidden(chat);
         if server_hidden && self.teams.stay_archived.contains(&chat_id) {
-            self.status =
-                "Stay archived is enabled; press X to disable it before restoring".into();
+            self.status = "Stay archived is enabled; press X to disable it before restoring".into();
             return;
         }
         let hidden = !server_hidden;
@@ -5298,14 +5386,9 @@ impl App {
 
             tokio::spawn(async move {
                 let permit = limiter.acquire(&s.graph, &task_chat_id).await;
-                let result = chats::set_hidden(
-                    &s.graph,
-                    &task_chat_id,
-                    &task_user_id,
-                    &tenant_id,
-                    true,
-                )
-                .await;
+                let result =
+                    chats::set_hidden(&s.graph, &task_chat_id, &task_user_id, &tenant_id, true)
+                        .await;
                 drop(permit);
 
                 let error = result.err().map(|error| format!("{error:#}"));
@@ -6124,8 +6207,8 @@ impl App {
             }
             AppMessage::Chats(c) => {
                 let selected_chat_id = self.teams_selected_chat().map(|chat| chat.id.clone());
-                let archive_selected = !self.teams.chats.is_empty()
-                    && self.teams.chat_sel == self.teams_archive_row();
+                let archive_selected =
+                    !self.teams.chats.is_empty() && self.teams.chat_sel == self.teams_archive_row();
 
                 self.sync_teams_hot_activity_from_chats(&c);
                 self.notify_for_chats(&c);
@@ -6214,18 +6297,13 @@ impl App {
                 self.load_chats();
             }
             AppMessage::StayArchivedRehideFinished { chat_id, error } => {
-                self.teams
-                    .stay_archived_rehide_in_flight
-                    .remove(&chat_id);
+                self.teams.stay_archived_rehide_in_flight.remove(&chat_id);
 
                 if let Some(error) = error {
-                    tracing::warn!(
-                        "Stay archived re-hide failed for {chat_id}: {error}"
-                    );
+                    tracing::warn!("Stay archived re-hide failed for {chat_id}: {error}");
                     self.status = "Stay archived re-hide failed; will retry".into();
                 } else {
-                    if let Some(chat) =
-                        self.teams.chats.iter_mut().find(|chat| chat.id == chat_id)
+                    if let Some(chat) = self.teams.chats.iter_mut().find(|chat| chat.id == chat_id)
                     {
                         chat.viewpoint
                             .get_or_insert_with(Default::default)
@@ -6551,14 +6629,32 @@ impl App {
                     }
                 }
             }
-            AppMessage::Downloaded { name, bytes } => {
+            AppMessage::Downloaded {
+                name,
+                bytes,
+                web_link,
+            } => {
                 let size = bytes.len();
                 match crate::files::save(&name, &bytes) {
                     Ok(path) => {
                         self.status = format!("saved {} ({size} bytes) to {}", name, path.display())
                     }
-                    Err(e) => self.status = format!("could not save {name}: {e:#}"),
+                    Err(error) => {
+                        self.open_attachment_web_fallback(
+                            &name,
+                            web_link,
+                            &format!("local save failed: {error:#}"),
+                        );
+                    }
                 }
+            }
+            AppMessage::AttachmentDownloadFailed {
+                name,
+                web_link,
+                error,
+            } => {
+                tracing::warn!("attachment download failed for {name}: {error}");
+                self.open_attachment_web_fallback(&name, web_link, &error);
             }
             AppMessage::Push(state) => {
                 // Surface a broken tunnel instead of silently falling back.
@@ -7643,14 +7739,60 @@ impl App {
         }
     }
 
+    fn open_mailto_compose(&mut self, url: &str) -> bool {
+        let Some(target) = parse_mailto_link(url) else {
+            return false;
+        };
+
+        let mut compose = empty_compose();
+        if !target.to.is_empty() {
+            compose.to.insert_str(&target.to);
+        }
+        if let Some(subject) = target.subject.as_deref() {
+            compose.subject.insert_str(subject);
+        }
+        if let Some(body) = target.body.as_deref() {
+            compose.body.insert_str(body);
+        }
+
+        compose.field = if target.to.trim().is_empty() {
+            0
+        } else if target
+            .subject
+            .as_deref()
+            .is_some_and(|subject| !subject.is_empty())
+        {
+            2
+        } else {
+            1
+        };
+        self.overlay = Some(Overlay::Compose(compose));
+
+        self.status = if target.has_cc || target.has_bcc {
+            "mailto opened in Compose; cc/bcc is not supported yet and was not imported".into()
+        } else if target.to.trim().is_empty() {
+            "mailto opened in Compose; add a recipient".into()
+        } else {
+            format!("composing mail to {}", target.to)
+        };
+        true
+    }
+
+    fn activate_link_url(&mut self, url: &str) {
+        if self.open_mailto_compose(url) {
+            return;
+        }
+        match self.open_web_link(url) {
+            Ok(()) => self.status = format!("opening {}", truncate_url(url)),
+            Err(error) => self.status = format!("could not open link: {error:#}"),
+        }
+    }
+
     fn open_link(&mut self, index: usize) {
         let Some(url) = self.focused_links().get(index).cloned() else {
             return;
         };
-        match self.open_web_link(&url) {
-            Ok(()) => self.status = format!("opening {}", truncate_url(&url)),
-            Err(e) => self.status = format!("could not open link: {e:#}"),
-        }
+        self.activate_link_url(&url);
     }
 
     pub fn ntfy_snooze_remaining(&self) -> Option<std::time::Duration> {
@@ -7735,17 +7877,16 @@ impl App {
         let tag = ntfy_tag_for_category(category);
 
         tokio::spawn(async move {
-            if let Err(error) =
-                m365_core::ntfy::send(
-                    &server,
-                    &topic,
-                    token.as_deref(),
-                    tag,
-                    priority.ntfy_priority(),
-                    &title,
-                    &body,
-                )
-                .await
+            if let Err(error) = m365_core::ntfy::send(
+                &server,
+                &topic,
+                token.as_deref(),
+                tag,
+                priority.ntfy_priority(),
+                &title,
+                &body,
+            )
+            .await
             {
                 tracing::warn!("ntfy forwarding failed: {error:#}");
             }
@@ -7822,10 +7963,7 @@ impl App {
                 && !self.own_sent_chat_message_ids.contains(&msg_id)
                 && from_id.is_some()
                 && from_id == my_id.as_deref();
-            if from_id.is_some()
-                && from_id == my_id.as_deref()
-                && !automation_sender
-            {
+            if from_id.is_some() && from_id == my_id.as_deref() && !automation_sender {
                 continue;
             }
 
@@ -7877,8 +8015,7 @@ impl App {
                 .unwrap_or_default();
             let mentioned =
                 crate::notify::mentions_me(&[], &body, my_id.as_deref(), my_name.as_deref());
-            let should_notify =
-                crate::notify::should_notify(chat.chat_type.as_deref(), mentioned);
+            let should_notify = crate::notify::should_notify(chat.chat_type.as_deref(), mentioned);
             if application_sender {
                 tracing::warn!(
                     "TEAMS_APP_DIAG source=chat-list-policy chat_id={} mentioned={} should_notify={} already_notified={}",
@@ -8000,9 +8137,7 @@ impl App {
         let value = self.automation_peer_config_value_with(&peer_id);
         tracing::info!("F7 automation peer ID: {peer_id}");
         tracing::info!("F7 automation peer .env: M365_TEAMS_AUTOMATION_PEERS={value}");
-        tracing::info!(
-            "F7 automation peer export: export M365_TEAMS_AUTOMATION_PEERS={value}"
-        );
+        tracing::info!("F7 automation peer export: export M365_TEAMS_AUTOMATION_PEERS={value}");
 
         match crate::clipboard::copy(&peer_id) {
             Ok(via) => self.status = format!("copied automation peer ID via {via}"),
@@ -8055,24 +8190,17 @@ impl App {
             Ok(()) => {
                 self.teams_automation_peers.insert(peer_id.clone());
                 if let Some(chat_id) = self.contact_diagnostics_chat_id.clone() {
-                    self.teams
-                        .contact_user_ids
-                        .insert(chat_id, peer_id.clone());
+                    self.teams.contact_user_ids.insert(chat_id, peer_id.clone());
                 }
                 self.contact_diagnostics.automation_peer_configured = true;
                 self.contact_diagnostics.automation_config_source = dotenv_path.clone();
-                tracing::info!(
-                    "F7 automation peer added: peer_id={peer_id} config={dotenv_path}"
-                );
-                tracing::info!(
-                    "F7 automation peer .env: M365_TEAMS_AUTOMATION_PEERS={value}"
-                );
+                tracing::info!("F7 automation peer added: peer_id={peer_id} config={dotenv_path}");
+                tracing::info!("F7 automation peer .env: M365_TEAMS_AUTOMATION_PEERS={value}");
                 tracing::info!(
                     "F7 automation peer export: export M365_TEAMS_AUTOMATION_PEERS={value}"
                 );
-                self.status = format!(
-                    "automation peer added and activated: {peer_id} ({dotenv_path})"
-                );
+                self.status =
+                    format!("automation peer added and activated: {peer_id} ({dotenv_path})");
             }
             Err(error) => {
                 tracing::warn!(
@@ -8241,7 +8369,12 @@ impl App {
     fn picker_overlay_mouse_enabled(&self) -> bool {
         matches!(
             self.overlay.as_ref(),
-            Some(Overlay::Presence | Overlay::NtfySnooze { .. })
+            Some(
+                Overlay::Presence
+                    | Overlay::NtfySnooze { .. }
+                    | Overlay::Links
+                    | Overlay::Attachments
+            )
         )
     }
 
@@ -8256,10 +8389,7 @@ impl App {
         !self.copy_mode && (self.overlay.is_none() || self.overlay_mouse_enabled())
     }
 
-    fn mouse_left_click_is_double(
-        &mut self,
-        target: Option<crate::ui::MouseTarget>,
-    ) -> bool {
+    fn mouse_left_click_is_double(&mut self, target: Option<crate::ui::MouseTarget>) -> bool {
         let timeout_ms = self.session.config.mouse_double_click_ms;
         if timeout_ms == 0 {
             self.last_mouse_click = None;
@@ -8343,6 +8473,43 @@ impl App {
                             }
                         }
                     }
+                    Some(crate::ui::MouseTarget::LinkOption(index))
+                        if matches!(self.overlay.as_ref(), Some(Overlay::Links)) =>
+                    {
+                        if index < self.focused_links().len() {
+                            let double_click = self.mouse_left_click_is_double(Some(
+                                crate::ui::MouseTarget::LinkOption(index),
+                            ));
+                            if double_click {
+                                self.overlay = None;
+                                self.open_link(index);
+                            }
+                        }
+                    }
+                    Some(crate::ui::MouseTarget::AttachmentOption(index))
+                        if matches!(self.overlay.as_ref(), Some(Overlay::Attachments)) =>
+                    {
+                        if let Some(name) = self
+                            .outlook
+                            .reading_attachments
+                            .get(index)
+                            .map(|attachment| attachment.display_name())
+                        {
+                            self.attachment_sel = Some(index);
+                            let double_click = self.mouse_left_click_is_double(Some(
+                                crate::ui::MouseTarget::AttachmentOption(index),
+                            ));
+                            if double_click {
+                                self.overlay = None;
+                                self.status = format!("starting download: {name}…");
+                                self.download_attachment(index);
+                            } else {
+                                self.status = format!(
+                                    "attachment selected: {name} · double-click to download"
+                                );
+                            }
+                        }
+                    }
                     _ => self.last_mouse_click = None,
                 }
             }
@@ -8354,11 +8521,45 @@ impl App {
         // Outlook/Teams/Calendar view. A double-click inside copies the complete
         // source text, but only when a native clipboard integration is available.
         if self.informational_overlay_mouse_enabled() {
-            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let inside = crate::ui::overlay_contains(mouse.column, mouse.row).unwrap_or(false);
+
+            if let Some(delta) = mouse_wheel_delta(mouse.kind) {
+                self.last_mouse_click = None;
+                if !inside {
+                    return;
+                }
+
+                let move_scroll = |current: u16, max: u16| {
+                    if delta > 0 {
+                        current.saturating_add(1).min(max)
+                    } else {
+                        current.saturating_sub(1)
+                    }
+                };
+
+                match self.overlay.as_ref() {
+                    Some(Overlay::Help) | Some(Overlay::TeamsCommands) => {
+                        self.help_scroll =
+                            move_scroll(self.help_scroll, self.help_max_scroll.get());
+                    }
+                    Some(Overlay::Diagnostics) => {
+                        self.diagnostics_scroll =
+                            move_scroll(self.diagnostics_scroll, self.diagnostics_max_scroll.get());
+                    }
+                    Some(Overlay::ContactDiagnostics) => {
+                        self.contact_diagnostics_scroll = move_scroll(
+                            self.contact_diagnostics_scroll,
+                            self.contact_diagnostics_max_scroll.get(),
+                        );
+                    }
+                    _ => {}
+                }
                 return;
             }
 
-            let inside = crate::ui::overlay_contains(mouse.column, mouse.row).unwrap_or(false);
+            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return;
+            }
             if !inside {
                 let was_notice = matches!(self.overlay.as_ref(), Some(Overlay::Notice(_)));
                 self.overlay = None;
@@ -8433,17 +8634,26 @@ impl App {
                         self.cancel_read_timer();
                     }
                     self.outlook_focus = OutlookFocus::Folders;
-                    if index < self.outlook.folders.len() {
+                    if let Some(folder_id) = self
+                        .outlook
+                        .folders
+                        .get(index)
+                        .map(|folder| folder.id.clone())
+                    {
                         self.outlook.folder_sel = index;
                         if double_click {
-                            self.outlook_enter();
+                            // The first click already started the folder load. The
+                            // second click only enters the Messages pane, avoiding
+                            // a duplicate Graph request for the same folder.
+                            self.outlook_focus = OutlookFocus::Messages;
+                        } else {
+                            self.outlook.msg_sel = 0;
+                            self.load_messages(folder_id, ListUpdate::Replace);
                         }
                     }
                     return;
                 }
-                Some(crate::ui::MouseTarget::OutlookFolders)
-                    if self.screen == Screen::Outlook =>
-                {
+                Some(crate::ui::MouseTarget::OutlookFolders) if self.screen == Screen::Outlook => {
                     if self.outlook_focus == OutlookFocus::Reading {
                         self.cancel_read_timer();
                     }
@@ -8468,13 +8678,82 @@ impl App {
                     }
                     return;
                 }
-                Some(crate::ui::MouseTarget::OutlookMessages)
-                    if self.screen == Screen::Outlook =>
-                {
+                Some(crate::ui::MouseTarget::OutlookMessages) if self.screen == Screen::Outlook => {
                     if self.outlook_focus == OutlookFocus::Reading {
                         self.cancel_read_timer();
                     }
                     self.outlook_focus = OutlookFocus::Messages;
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookInlineLink(index))
+                    if self.screen == Screen::Outlook =>
+                {
+                    if self.outlook_focus != OutlookFocus::Reading {
+                        self.outlook_focus = OutlookFocus::Reading;
+                        self.schedule_current_read_timer();
+                    }
+                    if let Some(url) = self.outlook.reading_links.get(index).cloned() {
+                        if double_click {
+                            self.open_link(index);
+                        } else {
+                            self.status =
+                                format!("link: {} · double-click to open", truncate_url(&url));
+                        }
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookAttachmentsSummary)
+                    if self.screen == Screen::Outlook =>
+                {
+                    if self.outlook_focus != OutlookFocus::Reading {
+                        self.outlook_focus = OutlookFocus::Reading;
+                        self.schedule_current_read_timer();
+                    }
+
+                    let count = self.outlook.reading_attachments.len();
+                    if double_click {
+                        self.activate_outlook_attachment_summary();
+                    } else {
+                        self.status = match count {
+                            0 => "no attachments on this message".into(),
+                            1 => {
+                                let name = self
+                                    .outlook
+                                    .reading_attachments
+                                    .first()
+                                    .map(|attachment| attachment.display_name())
+                                    .unwrap_or_else(|| "attachment".into());
+                                format!("1 attachment: {name} · double-click to download")
+                            }
+                            count => format!("{count} attachments · double-click to choose"),
+                        };
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::OutlookReading) if self.screen == Screen::Outlook => {
+                    if self.outlook_focus != OutlookFocus::Reading {
+                        self.outlook_focus = OutlookFocus::Reading;
+                        self.schedule_current_read_timer();
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::TeamsInlineLink(message_index, link_index))
+                    if self.screen == Screen::Teams =>
+                {
+                    if let Some(url) = self
+                        .teams
+                        .messages_links
+                        .get(message_index)
+                        .and_then(|links| links.get(link_index))
+                        .cloned()
+                    {
+                        if double_click {
+                            self.activate_link_url(&url);
+                        } else {
+                            self.status =
+                                format!("link: {} · double-click to open", truncate_url(&url));
+                        }
+                    }
                     return;
                 }
                 Some(crate::ui::MouseTarget::TeamsChatRow(index))
@@ -8493,16 +8772,37 @@ impl App {
                     }
                     return;
                 }
-                Some(crate::ui::MouseTarget::TeamsList)
+                Some(crate::ui::MouseTarget::TeamsBrowseRow(index))
                     if self.screen == Screen::Teams
+                        && self.teams.mode == TeamsMode::Channels
                         && self.teams.focus != TeamsFocus::Composer =>
+                {
+                    self.teams.focus = TeamsFocus::List;
+                    let valid = if self.teams.channels.is_empty() {
+                        if index < self.teams.teams.len() {
+                            self.teams.team_sel = index;
+                            true
+                        } else {
+                            false
+                        }
+                    } else if index < self.teams.channels.len() {
+                        self.teams.channel_sel = index;
+                        true
+                    } else {
+                        false
+                    };
+                    if valid && double_click {
+                        self.teams_enter();
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::TeamsList)
+                    if self.screen == Screen::Teams && self.teams.focus != TeamsFocus::Composer =>
                 {
                     self.teams.focus = TeamsFocus::List;
                     return;
                 }
-                Some(crate::ui::MouseTarget::TeamsComposer)
-                    if self.screen == Screen::Teams =>
-                {
+                Some(crate::ui::MouseTarget::TeamsComposer) if self.screen == Screen::Teams => {
                     if double_click && self.teams.focus != TeamsFocus::Composer {
                         self.teams_begin_compose();
                     }
@@ -8519,11 +8819,14 @@ impl App {
 
         match target {
             Some(crate::ui::MouseTarget::OutlookReading)
+            | Some(crate::ui::MouseTarget::OutlookAttachmentsSummary)
+            | Some(crate::ui::MouseTarget::OutlookInlineLink(_))
                 if self.screen == Screen::Outlook =>
             {
                 self.outlook_scroll_reading(delta);
             }
             Some(crate::ui::MouseTarget::TeamsMessages)
+            | Some(crate::ui::MouseTarget::TeamsInlineLink(_, _))
                 if self.screen == Screen::Teams
                     && self.teams.preview_chat_id.is_none()
                     && (self.teams.open_chat_id.is_some() || self.teams.open_channel.is_some()) =>
@@ -8554,8 +8857,8 @@ impl App {
             }
             Some(crate::ui::MouseTarget::TeamsList)
             | Some(crate::ui::MouseTarget::TeamsChatRow(_))
-                if self.screen == Screen::Teams
-                    && self.teams.focus != TeamsFocus::Composer =>
+            | Some(crate::ui::MouseTarget::TeamsBrowseRow(_))
+                if self.screen == Screen::Teams && self.teams.focus != TeamsFocus::Composer =>
             {
                 self.teams.focus = TeamsFocus::List;
                 self.teams_move(delta);
@@ -8685,6 +8988,7 @@ impl App {
                     if self.outlook.reading_attachments.is_empty() {
                         self.status = "no attachments on this message".into();
                     } else {
+                        self.attachment_sel = None;
                         self.overlay = Some(Overlay::Attachments);
                     }
                 }
@@ -9350,8 +9654,7 @@ impl App {
         }
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
-                self.teams.chat_sel =
-                    step(self.teams.chat_sel, delta, self.teams_chat_row_count());
+                self.teams.chat_sel = step(self.teams.chat_sel, delta, self.teams_chat_row_count());
                 self.preview_selected_teams_chat();
             }
             (TeamsMode::Channels, TeamsFocus::List) => {
@@ -9655,8 +9958,7 @@ impl App {
             return false;
         }
         if !self.session.config.can_write_out_of_office() {
-            self.status =
-                "Out of Office needs MailboxSettings.ReadWrite in M365_SCOPES".into();
+            self.status = "Out of Office needs MailboxSettings.ReadWrite in M365_SCOPES".into();
             return false;
         }
         true
@@ -9837,8 +10139,9 @@ impl App {
                         chat_type = %chat_type,
                         "Teams /rename failed locally: Graph can rename only group chats"
                     );
-                    self.status =
-                        format!("ERROR: /rename works only in group chats (this chat: {chat_type})");
+                    self.status = format!(
+                        "ERROR: /rename works only in group chats (this chat: {chat_type})"
+                    );
                     return;
                 }
 
@@ -9855,7 +10158,8 @@ impl App {
                 self.overlay = Some(Overlay::ConfirmRename { chat_id, name });
             }
             TeamsSlashCommand::Edit(text) => {
-                let Some((chat_id, message)) = self.selected_owned_chat_message("edit", "edited") else {
+                let Some((chat_id, message)) = self.selected_owned_chat_message("edit", "edited")
+                else {
                     return;
                 };
                 if let Err(reason) = validate_plain_message_edit(&message) {
@@ -9867,13 +10171,13 @@ impl App {
                 self.status = "saving message edit…".into();
                 self.spawn(async move {
                     chats::edit_message(
-                    &s.graph,
-                    &chat_id,
-                    &message_id,
-                    &text,
-                    s.config.teams_markdown,
-                )
-                .await?;
+                        &s.graph,
+                        &chat_id,
+                        &message_id,
+                        &text,
+                        s.config.teams_markdown,
+                    )
+                    .await?;
                     Ok(AppMessage::Done("message edited".into()))
                 });
             }
@@ -9946,7 +10250,9 @@ impl App {
                 });
             }
             TeamsSlashCommand::Delete => {
-                let Some((chat_id, message)) = self.selected_owned_chat_message("delete", "deleted") else {
+                let Some((chat_id, message)) =
+                    self.selected_owned_chat_message("delete", "deleted")
+                else {
                     return;
                 };
                 let Some(user_id) = self.me.as_ref().map(|me| me.id.clone()) else {
@@ -10420,7 +10726,9 @@ impl App {
                     self.status = "pinning message…".into();
                     self.spawn(async move {
                         chats::pin_message(&s.graph, &chat_id, &message_id).await?;
-                        Ok(AppMessage::Status("message pinned; previous pin replaced if present".into()))
+                        Ok(AppMessage::Status(
+                            "message pinned; previous pin replaced if present".into(),
+                        ))
                     });
                 }
                 _ => {
@@ -10873,14 +11181,9 @@ fn truncate_url(url: &str) -> String {
     format!("{head}…")
 }
 
-
-fn write_dotenv_assignment(
-    path: &std::path::Path,
-    key: &str,
-    value: &str,
-) -> anyhow::Result<()> {
-    let original = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+fn write_dotenv_assignment(path: &std::path::Path, key: &str, value: &str) -> anyhow::Result<()> {
+    let original =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let had_trailing_newline = original.ends_with('\n');
     let mut output = Vec::new();
     let mut replaced = false;
@@ -10923,8 +11226,7 @@ fn write_dotenv_assignment(
         rendered.push('\n');
     }
 
-    std::fs::write(path, rendered)
-        .with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, rendered).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Expand a leading `~` to the user's home directory.
@@ -11150,6 +11452,86 @@ fn sort_key(m: &ChatMessage) -> (i64, u64) {
     (at, m.id.parse::<u64>().unwrap_or(0))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailtoLink {
+    to: String,
+    subject: Option<String>,
+    body: Option<String>,
+    has_cc: bool,
+    has_bcc: bool,
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_mailto(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push((hi << 4) | lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn append_mailto_recipients(target: &mut String, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    if !target.trim().is_empty() {
+        target.push(',');
+    }
+    target.push_str(value);
+}
+
+fn parse_mailto_link(url: &str) -> Option<MailtoLink> {
+    let (scheme, rest) = url.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("mailto") {
+        return None;
+    }
+
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut result = MailtoLink {
+        to: percent_decode_mailto(path),
+        subject: None,
+        body: None,
+        has_cc: false,
+        has_bcc: false,
+    };
+
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode_mailto(key).to_ascii_lowercase();
+        let value = percent_decode_mailto(value);
+        match key.as_str() {
+            "to" => append_mailto_recipients(&mut result.to, &value),
+            "subject" if result.subject.is_none() => result.subject = Some(value),
+            "body" if result.body.is_none() => result.body = Some(value),
+            "cc" => result.has_cc |= !value.trim().is_empty(),
+            "bcc" => result.has_bcc |= !value.trim().is_empty(),
+            _ => {}
+        }
+    }
+
+    Some(result)
+}
+
 /// Split a comma/semicolon/space-separated recipients string into addresses.
 fn parse_recipients(s: &str) -> Vec<String> {
     s.split([',', ';', ' '])
@@ -11201,6 +11583,40 @@ pub fn filter_commands(query: &str) -> Vec<(&'static str, &'static str)> {
 }
 
 #[cfg(test)]
+mod mailto_link_tests {
+    use super::parse_mailto_link;
+
+    #[test]
+    fn parses_recipient_subject_and_body() {
+        let parsed = parse_mailto_link(
+            "mailto:user%2Btag@example.com?subject=Hello%20there&body=Line%201%0ALine%202",
+        )
+        .unwrap();
+        assert_eq!(parsed.to, "user+tag@example.com");
+        assert_eq!(parsed.subject.as_deref(), Some("Hello there"));
+        assert_eq!(parsed.body.as_deref(), Some("Line 1\nLine 2"));
+        assert!(!parsed.has_cc);
+        assert!(!parsed.has_bcc);
+    }
+
+    #[test]
+    fn detects_unsupported_cc_bcc_without_merging_them_into_to() {
+        let parsed = parse_mailto_link(
+            "mailto:to@example.com?cc=copy@example.com&bcc=hidden@example.com&to=two@example.com",
+        )
+        .unwrap();
+        assert_eq!(parsed.to, "to@example.com,two@example.com");
+        assert!(parsed.has_cc);
+        assert!(parsed.has_bcc);
+    }
+
+    #[test]
+    fn non_mailto_is_rejected() {
+        assert!(parse_mailto_link("https://example.com").is_none());
+    }
+}
+
+#[cfg(test)]
 mod teams_slash_command_tests {
     use super::{parse_teams_slash_command, validate_chat_topic, TeamsSlashCommand};
 
@@ -11214,12 +11630,18 @@ mod teams_slash_command_tests {
             parse_teams_slash_command("/edit corrected text"),
             Ok(Some(TeamsSlashCommand::Edit("corrected text".into())))
         );
-        assert_eq!(parse_teams_slash_command("/pin"), Ok(Some(TeamsSlashCommand::Pin)));
+        assert_eq!(
+            parse_teams_slash_command("/pin"),
+            Ok(Some(TeamsSlashCommand::Pin))
+        );
         assert_eq!(
             parse_teams_slash_command("/unpin"),
             Ok(Some(TeamsSlashCommand::Unpin))
         );
-        assert_eq!(parse_teams_slash_command("/pins"), Ok(Some(TeamsSlashCommand::Pins)));
+        assert_eq!(
+            parse_teams_slash_command("/pins"),
+            Ok(Some(TeamsSlashCommand::Pins))
+        );
         assert_eq!(
             parse_teams_slash_command("/unread"),
             Ok(Some(TeamsSlashCommand::Unread))
@@ -11240,7 +11662,10 @@ mod teams_slash_command_tests {
             parse_teams_slash_command("/ooo CLEAR"),
             Ok(Some(TeamsSlashCommand::OutOfOfficeClear))
         );
-        assert_eq!(parse_teams_slash_command("/help"), Ok(Some(TeamsSlashCommand::Help)));
+        assert_eq!(
+            parse_teams_slash_command("/help"),
+            Ok(Some(TeamsSlashCommand::Help))
+        );
         assert_eq!(
             parse_teams_slash_command("/help all"),
             Ok(Some(TeamsSlashCommand::HelpAll))
@@ -11312,7 +11737,10 @@ mod contact_name_learning_tests {
             message("3", "peer", None),
         ];
 
-        assert_eq!(peer_display_name_from_messages(&messages, Some("me"), None), None);
+        assert_eq!(
+            peer_display_name_from_messages(&messages, Some("me"), None),
+            None
+        );
     }
 
     #[test]
@@ -11333,11 +11761,7 @@ mod contact_name_learning_tests {
         ];
 
         assert_eq!(
-            peer_display_name_from_messages(
-                &messages,
-                Some("me"),
-                Some("47885ff3e9ffcead"),
-            ),
+            peer_display_name_from_messages(&messages, Some("me"), Some("47885ff3e9ffcead"),),
             Some("Jira Notifier")
         );
     }
@@ -11351,11 +11775,7 @@ mod contact_name_learning_tests {
         )];
 
         assert_eq!(
-            peer_display_name_from_messages(
-                &messages,
-                Some("me"),
-                Some("47885ff3e9ffcead"),
-            ),
+            peer_display_name_from_messages(&messages, Some("me"), Some("47885ff3e9ffcead"),),
             None
         );
     }
@@ -11767,12 +12187,7 @@ mod tests {
         assert_eq!(merged, vec!["e", "d", "c", "b", "a"]);
     }
 
-    fn cached_chat_message(
-        id: &str,
-        created: &str,
-        body: &str,
-        deleted: bool,
-    ) -> ChatMessage {
+    fn cached_chat_message(id: &str, created: &str, body: &str, deleted: bool) -> ChatMessage {
         serde_json::from_value(serde_json::json!({
             "id": id,
             "createdDateTime": created,
@@ -11885,10 +12300,7 @@ mod tests {
         let stay_archived = std::collections::HashSet::new();
 
         assert_eq!(super::teams_active_chat_count(&chats, &stay_archived), 2);
-        assert_eq!(
-            super::teams_archived_chat_count(&chats, &stay_archived),
-            2
-        );
+        assert_eq!(super::teams_archived_chat_count(&chats, &stay_archived), 2);
         assert_eq!(
             super::teams_chat_row_count(&chats, &stay_archived, false),
             3
@@ -11907,10 +12319,7 @@ mod tests {
             "drawer row is not a chat"
         );
 
-        assert_eq!(
-            super::teams_chat_row_count(&chats, &stay_archived, true),
-            5
-        );
+        assert_eq!(super::teams_chat_row_count(&chats, &stay_archived, true), 5);
         assert_eq!(
             super::teams_chat_index_for_row(&chats, &stay_archived, true, 2),
             None,
@@ -11952,14 +12361,10 @@ mod tests {
             chat("stay", false),
             chat("hidden", true),
         ];
-        let stay_archived =
-            std::collections::HashSet::from(["stay".to_string()]);
+        let stay_archived = std::collections::HashSet::from(["stay".to_string()]);
 
         assert_eq!(super::teams_active_chat_count(&chats, &stay_archived), 1);
-        assert_eq!(
-            super::teams_archived_chat_count(&chats, &stay_archived),
-            2
-        );
+        assert_eq!(super::teams_archived_chat_count(&chats, &stay_archived), 2);
         assert_eq!(
             super::teams_chat_row_for_id(&chats, &stay_archived, true, "stay"),
             Some(2)
@@ -11967,23 +12372,14 @@ mod tests {
 
         let in_flight = std::collections::HashSet::new();
         assert_eq!(
-            super::teams_stay_archived_rehide_candidates(
-                &chats,
-                &stay_archived,
-                &in_flight
-            ),
+            super::teams_stay_archived_rehide_candidates(&chats, &stay_archived, &in_flight),
             vec!["stay".to_string()]
         );
 
-        let in_flight =
-            std::collections::HashSet::from(["stay".to_string()]);
+        let in_flight = std::collections::HashSet::from(["stay".to_string()]);
         assert!(
-            super::teams_stay_archived_rehide_candidates(
-                &chats,
-                &stay_archived,
-                &in_flight
-            )
-            .is_empty()
+            super::teams_stay_archived_rehide_candidates(&chats, &stay_archived, &in_flight)
+                .is_empty()
         );
     }
 

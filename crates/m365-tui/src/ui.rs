@@ -10,9 +10,8 @@ use ratatui_image::{Resize, StatefulImage};
 use m365_core::models::SystemEventClass;
 
 use crate::app::{
-    filter_commands, App, CalendarView, ChatPollTier, Compose,
-    OutlookFocus, Overlay, Screen, TeamsFocus, TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS,
-    POLL_STALE_SECONDS,
+    filter_commands, App, CalendarView, ChatPollTier, Compose, OutlookFocus, Overlay, Screen,
+    TeamsFocus, TeamsMode, NTFY_SNOOZE_HOURS, POLL_SECONDS, POLL_STALE_SECONDS,
 };
 use crate::diagnostics;
 
@@ -98,15 +97,21 @@ pub(crate) enum MouseTarget {
     NtfyIndicator,
     PresenceOption(usize),
     NtfyOption(usize),
+    LinkOption(usize),
+    AttachmentOption(usize),
+    OutlookInlineLink(usize),
+    TeamsInlineLink(usize, usize),
     OutlookFolders,
     OutlookFolderRow(usize),
     OutlookMessages,
     OutlookMessageRow(usize),
+    OutlookAttachmentsSummary,
     OutlookReading,
     Calendar,
     CalendarEvent(usize),
     TeamsList,
     TeamsChatRow(usize),
+    TeamsBrowseRow(usize),
     TeamsMessages,
     TeamsComposer,
 }
@@ -119,6 +124,10 @@ struct MouseRegions {
     ntfy_indicator: Option<Rect>,
     presence_rows: Option<ListRows>,
     ntfy_rows: Option<ListRows>,
+    link_options: Vec<(Rect, usize)>,
+    attachment_rows: Option<ListRows>,
+    outlook_inline_links: Vec<(Rect, usize)>,
+    teams_inline_links: Vec<(Rect, usize, usize)>,
     outlook_tab: Option<Rect>,
     teams_tab: Option<Rect>,
     calendar_tab: Option<Rect>,
@@ -126,12 +135,14 @@ struct MouseRegions {
     outlook_folder_rows: Option<ListRows>,
     outlook_messages: Option<Rect>,
     outlook_message_rows: Option<ListRows>,
+    outlook_attachments_summary: Option<Rect>,
     outlook_reading: Option<Rect>,
     calendar: Option<Rect>,
     calendar_rows: Option<ListRows>,
     calendar_events: Vec<(Rect, usize)>,
     teams_list: Option<Rect>,
     teams_chat_rows: Option<ListRows>,
+    teams_browse_rows: Option<ListRows>,
     teams_messages: Option<Rect>,
     teams_composer: Option<Rect>,
 }
@@ -161,8 +172,10 @@ enum MouseList {
     OutlookMessages,
     CalendarAgenda,
     TeamsChats,
+    TeamsBrowse,
     PresenceOptions,
     NtfyOptions,
+    Attachments,
 }
 
 static MOUSE_REGIONS: std::sync::OnceLock<std::sync::Mutex<MouseRegions>> =
@@ -188,11 +201,7 @@ fn register_overlay_region(area: Rect) {
 }
 
 pub(crate) fn overlay_contains(column: u16, row: u16) -> Option<bool> {
-    with_mouse_regions(|regions| {
-        regions
-            .overlay
-            .map(|area| rect_contains(area, column, row))
-    })
+    with_mouse_regions(|regions| regions.overlay.map(|area| rect_contains(area, column, row)))
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -202,28 +211,108 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-fn register_list_rows(
-    target: MouseList,
+fn inline_link_marker_index(span: &Span<'_>) -> Option<usize> {
+    if span.style.fg != Some(Color::LightBlue)
+        || span.style.add_modifier.contains(Modifier::UNDERLINED)
+    {
+        return None;
+    }
+
+    let text = span.content.trim();
+    let number = text
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .parse::<usize>()
+        .ok()?;
+    number.checked_sub(1)
+}
+
+fn register_inline_link_regions<F>(
+    rows: &[Line<'static>],
     area: Rect,
-    offset: usize,
-    len: usize,
-) {
+    scroll: u16,
+    mut target_for: F,
+) where
+    F: FnMut(usize, usize) -> Option<MouseTarget>,
+{
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let viewport_start = usize::from(scroll);
+    let viewport_end = viewport_start.saturating_add(usize::from(area.height));
+    // A link can wrap over several terminal rows. Keep every underlined chunk
+    // until its trailing [n] marker tells us which URL index owns the chunks.
+    let mut pending: Vec<(usize, u16, u16)> = Vec::new();
+
+    for (row_index, line) in rows.iter().enumerate() {
+        let mut x = 0u16;
+        for span in &line.spans {
+            let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+            let is_link_text = span.style.fg == Some(Color::LightBlue)
+                && span.style.add_modifier.contains(Modifier::UNDERLINED);
+
+            if is_link_text {
+                if width > 0 {
+                    pending.push((row_index, x, width));
+                }
+            } else if let Some(link_index) = inline_link_marker_index(span) {
+                if width > 0 {
+                    pending.push((row_index, x, width));
+                }
+
+                if let Some(target) = target_for(row_index, link_index) {
+                    for (chunk_row, chunk_x, chunk_width) in pending.drain(..) {
+                        if chunk_row < viewport_start || chunk_row >= viewport_end {
+                            continue;
+                        }
+                        if chunk_x >= area.width {
+                            continue;
+                        }
+                        let width = chunk_width.min(area.width.saturating_sub(chunk_x));
+                        if width == 0 {
+                            continue;
+                        }
+                        register_mouse_region(
+                            target,
+                            Rect::new(
+                                area.x.saturating_add(chunk_x),
+                                area.y.saturating_add((chunk_row - viewport_start) as u16),
+                                width,
+                                1,
+                            ),
+                        );
+                    }
+                } else {
+                    pending.clear();
+                }
+            } else if !span.content.trim().is_empty() {
+                // Ordinary visible content ends any unfinished candidate. Pure
+                // whitespace is ignored because wrap_line() inserts indentation
+                // before a link continuation on the next terminal row.
+                pending.clear();
+            }
+
+            x = x.saturating_add(width);
+        }
+    }
+}
+
+fn register_list_rows(target: MouseList, area: Rect, offset: usize, len: usize) {
     if area.width == 0 || area.height == 0 || len == 0 {
         return;
     }
 
-    let rows = ListRows {
-        area,
-        offset,
-        len,
-    };
+    let rows = ListRows { area, offset, len };
     with_mouse_regions(|regions| match target {
         MouseList::OutlookFolders => regions.outlook_folder_rows = Some(rows),
         MouseList::OutlookMessages => regions.outlook_message_rows = Some(rows),
         MouseList::CalendarAgenda => regions.calendar_rows = Some(rows),
         MouseList::TeamsChats => regions.teams_chat_rows = Some(rows),
+        MouseList::TeamsBrowse => regions.teams_browse_rows = Some(rows),
         MouseList::PresenceOptions => regions.presence_rows = Some(rows),
         MouseList::NtfyOptions => regions.ntfy_rows = Some(rows),
+        MouseList::Attachments => regions.attachment_rows = Some(rows),
     });
 }
 
@@ -238,6 +327,7 @@ fn register_mouse_region(target: MouseTarget, area: Rect) {
         MouseTarget::Screen(Screen::Calendar) => regions.calendar_tab = Some(area),
         MouseTarget::OutlookFolders => regions.outlook_folders = Some(area),
         MouseTarget::OutlookMessages => regions.outlook_messages = Some(area),
+        MouseTarget::OutlookAttachmentsSummary => regions.outlook_attachments_summary = Some(area),
         MouseTarget::OutlookReading => regions.outlook_reading = Some(area),
         MouseTarget::Calendar => regions.calendar = Some(area),
         MouseTarget::CalendarEvent(index) => regions.calendar_events.push((area, index)),
@@ -247,17 +337,58 @@ fn register_mouse_region(target: MouseTarget, area: Rect) {
         MouseTarget::PresenceIndicator => regions.presence_indicator = Some(area),
         MouseTarget::PollIndicator => regions.poll_indicator = Some(area),
         MouseTarget::NtfyIndicator => regions.ntfy_indicator = Some(area),
+        MouseTarget::LinkOption(index) => regions.link_options.push((area, index)),
+        MouseTarget::OutlookInlineLink(index) => regions.outlook_inline_links.push((area, index)),
+        MouseTarget::TeamsInlineLink(message, index) => {
+            regions.teams_inline_links.push((area, message, index))
+        }
         MouseTarget::Overlay
         | MouseTarget::PresenceOption(_)
         | MouseTarget::NtfyOption(_)
+        | MouseTarget::AttachmentOption(_)
         | MouseTarget::OutlookFolderRow(_)
         | MouseTarget::OutlookMessageRow(_)
-        | MouseTarget::TeamsChatRow(_) => {}
+        | MouseTarget::TeamsChatRow(_)
+        | MouseTarget::TeamsBrowseRow(_) => {}
     });
 }
 
 pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
     with_mouse_regions(|regions| {
+        // Overlay-specific rows take precedence over the background panes they
+        // visually cover. Otherwise a link popup could accidentally resolve to
+        // an Outlook/Teams row underneath it.
+        if let Some((_, index)) = regions
+            .link_options
+            .iter()
+            .rev()
+            .find(|(area, _)| rect_contains(*area, column, row))
+        {
+            return Some(MouseTarget::LinkOption(*index));
+        }
+        if let Some(index) = regions
+            .attachment_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::AttachmentOption(index));
+        }
+        if let Some((_, index)) = regions
+            .outlook_inline_links
+            .iter()
+            .rev()
+            .find(|(area, _)| rect_contains(*area, column, row))
+        {
+            return Some(MouseTarget::OutlookInlineLink(*index));
+        }
+        if let Some((_, message, index)) = regions
+            .teams_inline_links
+            .iter()
+            .rev()
+            .find(|(area, _, _)| rect_contains(*area, column, row))
+        {
+            return Some(MouseTarget::TeamsInlineLink(*message, *index));
+        }
+
         if let Some(index) = regions
             .outlook_folder_rows
             .and_then(|rows| rows.index_at(column, row))
@@ -290,6 +421,12 @@ pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
         {
             return Some(MouseTarget::TeamsChatRow(index));
         }
+        if let Some(index) = regions
+            .teams_browse_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::TeamsBrowseRow(index));
+        }
 
         if let Some(index) = regions
             .presence_rows
@@ -310,6 +447,10 @@ pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
             (regions.calendar_tab, MouseTarget::Screen(Screen::Calendar)),
             (regions.outlook_folders, MouseTarget::OutlookFolders),
             (regions.outlook_messages, MouseTarget::OutlookMessages),
+            (
+                regions.outlook_attachments_summary,
+                MouseTarget::OutlookAttachmentsSummary,
+            ),
             (regions.outlook_reading, MouseTarget::OutlookReading),
             (regions.calendar, MouseTarget::Calendar),
             (regions.teams_list, MouseTarget::TeamsList),
@@ -485,13 +626,12 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     let hints = format!(" {} · ? help ", context_hints(app));
     let requested_hints_w = (hints.chars().count() as u16).min(area.width);
     let status_w = app.status.chars().count() as u16 + 2;
-    let hints_w = if app.status.is_empty()
-        || status_w.saturating_add(requested_hints_w) <= area.width
-    {
-        requested_hints_w
-    } else {
-        0
-    };
+    let hints_w =
+        if app.status.is_empty() || status_w.saturating_add(requested_hints_w) <= area.width {
+            requested_hints_w
+        } else {
+            0
+        };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -597,8 +737,8 @@ fn context_hints(app: &App) -> &'static str {
         return match overlay {
             Overlay::Notice(_) => "any key dismisses · auto-closes in 3s",
             Overlay::Compose(_) => "Ctrl+S send · Esc cancel",
-            Overlay::Links => "1-9 open · y copy · Esc close",
-            Overlay::Attachments => "1-9 save · Esc close",
+            Overlay::Links => "double-click open · 1-9 open · y copy · Esc close",
+            Overlay::Attachments => "double-click save · 1-9 save · Esc close",
             Overlay::React { .. } => "hjkl/arrows choose · Enter react · Esc close",
             Overlay::PinnedMessages { .. } => "j/k move · Enter jump · u unpin · Esc close",
             Overlay::ConfirmRename { .. } => "y rename · any other key cancel",
@@ -615,11 +755,11 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::CalendarEvent => "o open meeting · Esc close",
             Overlay::ContactProfile => "j/k scroll · Esc close",
-            Overlay::Diagnostics => "c copy · l log · r refresh · j/k scroll · Esc close",
-            Overlay::ContactDiagnostics => "i peer ID · a autom. · c copy · l log · r refresh · j/k scroll · Esc close",
+            Overlay::Diagnostics => "c copy · l log · r refresh · wheel/j/k scroll · Esc close",
+            Overlay::ContactDiagnostics => "i peer ID · a autom. · c copy · l log · r refresh · wheel/j/k scroll · Esc close",
             Overlay::Calendar => "Esc close",
-            Overlay::TeamsCommands => "j/k scroll · PgUp/PgDn · Home/End · Esc close",
-            Overlay::Help => "j/k scroll · PgUp/PgDn · Esc close",
+            Overlay::TeamsCommands => "wheel/j/k scroll · PgUp/PgDn · Home/End · Esc close",
+            Overlay::Help => "wheel/j/k scroll · PgUp/PgDn · Esc close",
         };
     }
     match app.screen {
@@ -754,8 +894,9 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
             ListItem::new(line)
         })
         .collect();
-    let mut mstate = ListState::default();
-    mstate.select(Some(app.outlook.msg_sel));
+    let mut mstate = ListState::default()
+        .with_offset(app.outlook_message_list_offset.get())
+        .with_selected(Some(app.outlook.msg_sel));
     let msg_title = if app.outlook.messages_next.is_some() {
         format!("Messages ({} · ↓ for more)", app.outlook.messages.len())
     } else {
@@ -770,6 +911,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
         cols[1],
         &mut mstate,
     );
+    app.outlook_message_list_offset.set(mstate.offset());
     let message_inner =
         panel_block(&msg_title, app.outlook_focus == OutlookFocus::Messages).inner(cols[1]);
     register_list_rows(
@@ -837,11 +979,38 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
 
     match email_lines(app) {
         Some(lines) => {
-            let (rows, _) = crate::wrap::wrap_all(&lines, text_area.width as usize);
+            let (rows, row_of_line) = crate::wrap::wrap_all(&lines, text_area.width as usize);
             // Tell the key handler how far it can usefully scroll.
             app.reading_max_scroll
                 .set((rows.len() as u16).saturating_sub(text_area.height));
             let scroll = app.outlook.reading_scroll.min(app.reading_max_scroll.get());
+
+            if !app.outlook.reading_attachments.is_empty() {
+                let attachment_start = row_of_line.get(3).copied().unwrap_or(0);
+                let attachment_end = row_of_line.get(4).copied().unwrap_or(rows.len());
+                let viewport_start = usize::from(scroll);
+                let viewport_end = viewport_start.saturating_add(usize::from(text_area.height));
+                let visible_start = attachment_start.max(viewport_start);
+                let visible_end = attachment_end.min(viewport_end);
+
+                if visible_start < visible_end {
+                    register_mouse_region(
+                        MouseTarget::OutlookAttachmentsSummary,
+                        Rect::new(
+                            text_area.x,
+                            text_area.y + (visible_start - viewport_start) as u16,
+                            text_area.width,
+                            (visible_end - visible_start) as u16,
+                        ),
+                    );
+                }
+            }
+
+            register_inline_link_regions(&rows, text_area, scroll, |_, link_index| {
+                (link_index < app.outlook.reading_links.len())
+                    .then_some(MouseTarget::OutlookInlineLink(link_index))
+            });
+
             f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), text_area);
         }
         None => {
@@ -874,11 +1043,16 @@ pub fn email_lines(app: &App) -> Option<Vec<Line<'static>>> {
             .iter()
             .map(|a| format!("{} ({})", a.display_name(), a.human_size()))
             .collect();
+        let action = if names.len() == 1 {
+            "double-click to download · A list"
+        } else {
+            "double-click to choose · A list"
+        };
         lines.insert(
             3,
             kv(
-                "Attach",
-                &format!("📎 {}  — press A to save", names.join(", ")),
+                "Attachments",
+                &format!("📎 {}  — {action}", names.join(", ")),
             ),
         );
     }
@@ -1026,10 +1200,7 @@ pub fn conversation_lines(
                     format!("{}: ", q.author),
                     Style::default().fg(Color::LightGreen),
                 ),
-                Span::styled(
-                    truncate(&q.preview, 70),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(truncate(&q.preview, 70), Style::default().fg(Color::White)),
             ]
         });
 
@@ -1534,8 +1705,7 @@ fn render_calendar_month_panel(
                     if *segment_lane != lane {
                         continue;
                     }
-                    let x_offset =
-                        widths.iter().take(*start_day).sum::<usize>() + *start_day;
+                    let x_offset = widths.iter().take(*start_day).sum::<usize>() + *start_day;
                     let span_width = widths[*start_day..=*end_day].iter().sum::<usize>()
                         + (*end_day).saturating_sub(*start_day);
                     register_mouse_region(
@@ -1957,16 +2127,18 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
                     let Some(c) = row else {
                         let marker = if selected { "▏" } else { " " };
-                        let arrow = if app.teams.archive_expanded { "▾" } else { "▸" };
+                        let arrow = if app.teams.archive_expanded {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
                         let label = format!("{arrow} Archive [{}]", app.teams_archive_count());
                         let label = truncate(&label, inner_width);
                         let padding = inner_width.saturating_sub(label.chars().count());
                         let style = if selected {
                             selection_style
                         } else {
-                            Style::default()
-                                .fg(DIM)
-                                .add_modifier(Modifier::BOLD)
+                            Style::default().fg(DIM).add_modifier(Modifier::BOLD)
                         };
 
                         return ListItem::new(Line::from(vec![
@@ -2121,12 +2293,21 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
                 ("Channels (c→chats)", items, app.teams.channel_sel)
             };
 
+            let item_count = items.len();
             let mut state = ListState::default();
             state.select(Some(sel));
             f.render_stateful_widget(
                 selectable_list(items, title, app.teams.focus == TeamsFocus::List),
                 cols[0],
                 &mut state,
+            );
+            let browse_inner =
+                panel_block(title, app.teams.focus == TeamsFocus::List).inner(cols[0]);
+            register_list_rows(
+                MouseList::TeamsBrowse,
+                browse_inner,
+                state.offset(),
+                item_count,
             );
         }
     }
@@ -2137,9 +2318,8 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     let composer_width = cols[1].width.saturating_sub(2).max(1) as usize;
     let composer_rows = app.teams.composer.wrap(composer_width).len().clamp(1, 6) as u16;
     // One extra row while a reply/edit is being composed, for its context banner.
-    let context_row = u16::from(
-        app.teams.replying_to.is_some() || app.teams.editing_message.is_some(),
-    );
+    let context_row =
+        u16::from(app.teams.replying_to.is_some() || app.teams.editing_message.is_some());
     let oof_row = u16::from(out_of_office.is_some());
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -2220,8 +2400,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
 
     // The dedicated pinned row above the conversation already carries the
     // first visible day. Keep later inline separators for day boundaries.
-    let (mut lines, msg_starts) =
-        conversation_lines(app, message_selection_visible, false);
+    let (mut lines, msg_starts) = conversation_lines(app, message_selection_visible, false);
     if lines.is_empty() {
         let empty = if previewing && app.teams.messages.is_empty() {
             "No cached conversation for the selected chat."
@@ -2276,6 +2455,20 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
     if let Some(label) = sticky_day_label(app, &msg_rows, scroll) {
         f.render_widget(Paragraph::new(day_separator(&label)), pane[0]);
     }
+
+    register_inline_link_regions(&rows, pane[1], scroll, |row_index, link_index| {
+        let message_index = msg_rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, start)| **start <= row_index)
+            .map(|(index, _)| index)?;
+        app.teams
+            .messages_links
+            .get(message_index)
+            .is_some_and(|links| link_index < links.len())
+            .then_some(MouseTarget::TeamsInlineLink(message_index, link_index))
+    });
 
     // Text first; the graphics protocol image is drawn over its reserved blank
     // rows afterwards.
@@ -2803,7 +2996,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let area = centered(72, 66, f.area());
             register_overlay_region(area);
             f.render_widget(Clear, area);
-            let block = popup_block("Teams commands — j/k scroll · Esc close");
+            let block = popup_block("Teams commands — wheel/j/k scroll · Esc close");
             let inner = block.inner(area);
             let text = TEAMS_COMMANDS_TEXT;
 
@@ -2823,7 +3016,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let area = centered(60, 60, f.area());
             register_overlay_region(area);
             f.render_widget(Clear, area);
-            let block = popup_block("Help — j/k scroll · Esc close");
+            let block = popup_block("Help — wheel/j/k scroll · Esc close");
             let inner = block.inner(area);
             let text = HELP_TEXT;
 
@@ -2845,7 +3038,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             f.render_widget(Clear, area);
 
             let block = popup_block(
-                "Diagnostics — c copy/export · l log · r refresh · j/k scroll · Esc close",
+                "Diagnostics — c copy/export · l log · r refresh · wheel/j/k scroll · Esc close",
             );
             let inner = block.inner(area);
             let text = diagnostics::text(app);
@@ -2913,7 +3106,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             register_overlay_region(area);
             f.render_widget(Clear, area);
 
-            let block = popup_block("Contact diagnostics");
+            let block = popup_block("Contact diagnostics — wheel/j/k scroll · Esc close");
             let inner = block.inner(area);
             let text = diagnostics::contact_text(app);
 
@@ -3279,8 +3472,9 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::Attachments => {
             let area = centered(70, 50, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
-            let block = popup_block("Attachments — press 1-9 to save · Esc close");
+            let block = popup_block("Attachments — double-click or 1-9 to save · Esc close");
             let inner = block.inner(area);
             f.render_widget(block, area);
             let items: Vec<ListItem> = app
@@ -3307,8 +3501,30 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                     ]))
                 })
                 .collect();
-            f.render_widget(List::new(items), inner);
-            let hint = format!("saves to {}", crate::files::download_dir().display());
+            let item_count = items.len();
+            let list_area = Rect {
+                height: inner.height.saturating_sub(1),
+                ..inner
+            };
+            let selected = app.attachment_sel.filter(|index| *index < item_count);
+            let mut state = ListState::default().with_selected(selected);
+            f.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▏"),
+                list_area,
+                &mut state,
+            );
+            register_list_rows(MouseList::Attachments, list_area, 0, item_count);
+            let download_dir = crate::files::download_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("INVALID: {error:#}"));
+            let hint = format!("click row · double-click download · target: {download_dir}");
             let hint_area = Rect {
                 y: inner.y + inner.height.saturating_sub(1),
                 height: 1,
@@ -3322,8 +3538,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         Overlay::Links => {
             let links = app.focused_links();
             let area = centered(80, 60, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
-            let block = popup_block("Links — press 1-9 to open · y copy first · Esc close");
+            let block =
+                popup_block("Links — double-click or 1-9 to open · y copy first · Esc close");
             let inner = block.inner(area);
             f.render_widget(block, area);
             let width = inner.width.saturating_sub(4).max(10) as usize;
@@ -3347,6 +3565,21 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 })
                 .collect();
             f.render_widget(List::new(items), inner);
+
+            let mut item_y = inner.y;
+            let max_y = inner.y.saturating_add(inner.height);
+            for (index, url) in links.iter().take(9).enumerate() {
+                let height = (1 + chunks_of(url, width).len()) as u16;
+                if item_y >= max_y {
+                    break;
+                }
+                let visible_height = height.min(max_y.saturating_sub(item_y));
+                register_mouse_region(
+                    MouseTarget::LinkOption(index),
+                    Rect::new(inner.x, item_y, inner.width, visible_height),
+                );
+                item_y = item_y.saturating_add(height);
+            }
         }
         Overlay::NtfySnooze { sel } => {
             let area = centered(42, 50, f.area());
@@ -4328,11 +4561,8 @@ mod tests {
         assert!(mouse_target_at(0, 0).is_none());
     }
 
-    use super::{
-        contact_presence_marker, day_label, local_time, presence_out_of_office_message,
-    };
+    use super::{contact_presence_marker, day_label, local_time, presence_out_of_office_message};
     use ratatui::style::Color;
-
 
     #[test]
     fn list_rows_map_visible_mouse_rows_to_model_indices() {
@@ -4428,16 +4658,15 @@ mod tests {
 
     #[test]
     fn contact_presence_marker_keeps_ooo_when_contact_is_offline() {
-        let presence: m365_core::models::Presence =
-            serde_json::from_value(serde_json::json!({
-                "availability": "Offline",
-                "activity": "Offline",
-                "outOfOfficeSettings": {
-                    "isOutOfOffice": true,
-                    "message": "Back tomorrow"
-                }
-            }))
-            .unwrap();
+        let presence: m365_core::models::Presence = serde_json::from_value(serde_json::json!({
+            "availability": "Offline",
+            "activity": "Offline",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": true,
+                "message": "Back tomorrow"
+            }
+        }))
+        .unwrap();
 
         assert_eq!(
             contact_presence_marker(Some(&presence)),
@@ -4488,21 +4717,19 @@ mod tests {
 
     #[test]
     fn deleted_message_does_not_anchor_day_marker() {
-        let live: m365_core::models::ChatMessage =
-            serde_json::from_value(serde_json::json!({
-                "id": "live",
-                "createdDateTime": "2026-09-29T10:00:00Z",
-                "body": { "contentType": "text", "content": "hello" }
-            }))
-            .unwrap();
-        let deleted: m365_core::models::ChatMessage =
-            serde_json::from_value(serde_json::json!({
-                "id": "deleted",
-                "createdDateTime": "2026-09-29T10:00:00Z",
-                "deletedDateTime": "2026-09-30T07:00:00Z",
-                "body": { "contentType": "text", "content": "" }
-            }))
-            .unwrap();
+        let live: m365_core::models::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "live",
+            "createdDateTime": "2026-09-29T10:00:00Z",
+            "body": { "contentType": "text", "content": "hello" }
+        }))
+        .unwrap();
+        let deleted: m365_core::models::ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "deleted",
+            "createdDateTime": "2026-09-29T10:00:00Z",
+            "deletedDateTime": "2026-09-30T07:00:00Z",
+            "body": { "contentType": "text", "content": "" }
+        }))
+        .unwrap();
 
         assert!(super::message_has_day_context(&live));
         assert!(!super::message_has_day_context(&deleted));

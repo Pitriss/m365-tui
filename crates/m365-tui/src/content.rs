@@ -35,14 +35,135 @@ pub fn render_body(content_type: Option<&str>, raw: &str) -> RenderedBody {
     if is_html {
         render_html(raw)
     } else {
-        RenderedBody {
-            text: Text::from(
-                raw.lines()
-                    .map(|l| Line::raw(l.to_string()))
-                    .collect::<Vec<_>>(),
-            ),
-            links: Vec::new(),
+        render_plain(raw)
+    }
+}
+
+fn render_plain(raw: &str) -> RenderedBody {
+    let mut links = Vec::new();
+    let lines = raw
+        .lines()
+        .map(|line| {
+            let mut spans = Vec::new();
+            push_autolink_spans(&mut spans, &mut links, line, Style::default());
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    RenderedBody {
+        text: Text::from(lines),
+        links,
+    }
+}
+
+fn link_number_in(links: &mut Vec<String>, url: &str) -> usize {
+    if let Some(index) = links.iter().position(|link| link == url) {
+        return index + 1;
+    }
+    links.push(url.to_string());
+    links.len()
+}
+
+fn find_autolink_start(text: &str) -> Option<usize> {
+    // ASCII lowercasing preserves byte offsets for the schemes we search for.
+    let lower = text.to_ascii_lowercase();
+    ["https://", "http://", "mailto:"]
+        .into_iter()
+        .filter_map(|scheme| lower.find(scheme))
+        .min()
+}
+
+fn trim_autolink_end(candidate: &str) -> usize {
+    let mut end = candidate.len();
+    while let Some(ch) = candidate[..end].chars().next_back() {
+        let body = &candidate[..end];
+        let strip = matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"')
+            || (ch == ')'
+                && body.chars().filter(|c| *c == ')').count()
+                    > body.chars().filter(|c| *c == '(').count())
+            || (ch == ']'
+                && body.chars().filter(|c| *c == ']').count()
+                    > body.chars().filter(|c| *c == '[').count())
+            || (ch == '}'
+                && body.chars().filter(|c| *c == '}').count()
+                    > body.chars().filter(|c| *c == '{').count());
+        if !strip {
+            break;
         }
+        end = end.saturating_sub(ch.len_utf8());
+    }
+    end
+}
+
+fn valid_autolink(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = lower.strip_prefix("http://") {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = lower.strip_prefix("mailto:") {
+        return !rest.is_empty();
+    }
+    false
+}
+
+fn push_autolink_spans(
+    spans: &mut Vec<Span<'static>>,
+    links: &mut Vec<String>,
+    text: &str,
+    style: Style,
+) {
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let Some(relative_start) = find_autolink_start(&text[cursor..]) else {
+            spans.push(Span::styled(text[cursor..].to_string(), style));
+            return;
+        };
+        let start = cursor + relative_start;
+        if start > cursor {
+            spans.push(Span::styled(text[cursor..start].to_string(), style));
+        }
+
+        let rest = &text[start..];
+        let token_end = rest
+            .char_indices()
+            .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+            .unwrap_or(rest.len());
+        let candidate = &rest[..token_end];
+        let link_end = trim_autolink_end(candidate);
+        if link_end == 0 {
+            // Defensive progress guarantee for malformed input.
+            let ch = rest.chars().next().expect("non-empty rest");
+            spans.push(Span::styled(ch.to_string(), style));
+            cursor = start + ch.len_utf8();
+            continue;
+        }
+
+        let displayed = &candidate[..link_end];
+        if !valid_autolink(displayed) {
+            spans.push(Span::styled(displayed.to_string(), style));
+            cursor = start + link_end;
+            continue;
+        }
+
+        let target = if displayed.to_ascii_lowercase().starts_with("http://")
+            || displayed.to_ascii_lowercase().starts_with("https://")
+        {
+            unwrap_safelink(displayed)
+        } else {
+            displayed.to_string()
+        };
+        let number = link_number_in(links, &target);
+        spans.push(Span::styled(
+            displayed.to_string(),
+            style.fg(LINK).add_modifier(Modifier::UNDERLINED),
+        ));
+        spans.push(Span::styled(
+            format!("[{number}]"),
+            Style::default().fg(LINK),
+        ));
+        cursor = start + link_end;
     }
 }
 
@@ -76,6 +197,9 @@ struct Renderer {
     in_pre: bool,
     /// Depth of skip-containers (script/style/head) currently open.
     skip: usize,
+    /// Depth inside an explicit HTML anchor. Naked-URL autodetection is disabled
+    /// there because the surrounding <a href> owns the target and numbering.
+    link_depth: usize,
     /// Link targets in numbering order; the inline text shows `[n]` instead of
     /// the URL, which keeps huge Safelinks out of the reading flow.
     links: Vec<String>,
@@ -121,7 +245,8 @@ impl Renderer {
             prefix.push_str("  ");
         }
         if !prefix.is_empty() {
-            self.spans.push(Span::styled(prefix, Style::default().fg(DIM)));
+            self.spans
+                .push(Span::styled(prefix, Style::default().fg(DIM)));
         }
     }
 
@@ -152,7 +277,11 @@ impl Renderer {
         if !self.line_has_content() {
             text = text.trim_start().to_string();
         }
-        self.spans.push(Span::styled(text, style));
+        if self.link_depth == 0 {
+            push_autolink_spans(&mut self.spans, &mut self.links, &text, style);
+        } else {
+            self.spans.push(Span::styled(text, style));
+        }
     }
 
     /// Number a link, reusing the number if the same target appears again.
@@ -213,8 +342,10 @@ impl Renderer {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.ensure_blank();
                 let hashes = "#".repeat(tag[1..].parse::<usize>().unwrap_or(1));
-                self.spans
-                    .push(Span::styled(format!("{hashes} "), Style::default().fg(ACCENT)));
+                self.spans.push(Span::styled(
+                    format!("{hashes} "),
+                    Style::default().fg(ACCENT),
+                ));
                 self.walk_children(node, style.fg(ACCENT).add_modifier(Modifier::BOLD));
                 self.ensure_blank();
             }
@@ -281,15 +412,22 @@ impl Renderer {
                 }
             }
             "a" => {
-                let link_style = style.fg(LINK).add_modifier(Modifier::UNDERLINED);
-                self.walk_children(node, link_style);
-                if let Some(href) = attr(attrs, "href") {
-                    let href = unwrap_safelink(href.trim());
-                    if !href.is_empty() && !href.starts_with('#') && !href.starts_with("mailto:") {
-                        let n = self.link_number(&href);
-                        self.spans
-                            .push(Span::styled(format!("[{n}]"), Style::default().fg(LINK)));
-                    }
+                let href = attr(attrs, "href")
+                    .map(|href| unwrap_safelink(href.trim()))
+                    .filter(|href| !href.is_empty());
+                let clickable = href.as_deref().is_some_and(|href| !href.starts_with('#'));
+                let child_style = if clickable {
+                    style.fg(LINK).add_modifier(Modifier::UNDERLINED)
+                } else {
+                    style
+                };
+                self.link_depth += 1;
+                self.walk_children(node, child_style);
+                self.link_depth = self.link_depth.saturating_sub(1);
+                if let Some(href) = href.filter(|_| clickable) {
+                    let n = self.link_number(&href);
+                    self.spans
+                        .push(Span::styled(format!("[{n}]"), Style::default().fg(LINK)));
                 }
             }
             "img" => {
@@ -305,7 +443,8 @@ impl Renderer {
             }
             "td" | "th" => {
                 self.walk_children(node, style);
-                self.spans.push(Span::styled("  ", Style::default().fg(DIM)));
+                self.spans
+                    .push(Span::styled("  ", Style::default().fg(DIM)));
             }
             // Inline/neutral wrappers: keep the current style.
             _ => self.walk_children(node, style),
@@ -488,13 +627,69 @@ mod tests {
         let text = flat(&out.text);
         // The anchor text stays, the URL does not appear in the flow.
         assert!(text.contains("login"));
-        assert!(!text.contains("https://example.com/login"), "url leaked: {text}");
+        assert!(
+            !text.contains("https://example.com/login"),
+            "url leaked: {text}"
+        );
         // Markers are numbered, and the repeated target reuses its number.
         assert!(text.contains("[1]"), "{text}");
         assert!(text.contains("[2]"), "{text}");
         assert_eq!(out.links.len(), 2, "duplicate targets share a number");
         assert_eq!(out.links[0], "https://example.com/login");
         assert_eq!(out.links[1], "https://other.example/x");
+    }
+
+    #[test]
+    fn plain_text_http_and_mailto_are_numbered_links() {
+        let out = render_body(
+            Some("text"),
+            "Draft https://example.com/path. Contact mailto:user@example.com?subject=Hello%20there",
+        );
+        let text = flat(&out.text);
+        assert!(text.contains("https://example.com/path[1]."), "{text}");
+        assert!(
+            text.contains("mailto:user@example.com?subject=Hello%20there[2]"),
+            "{text}"
+        );
+        assert_eq!(
+            out.links,
+            vec![
+                "https://example.com/path".to_string(),
+                "mailto:user@example.com?subject=Hello%20there".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn naked_url_inside_html_text_is_autolinked() {
+        let out = render_html("<p>Draft URL: https://example.com/draft</p>");
+        let text = flat(&out.text);
+        assert!(text.contains("https://example.com/draft[1]"), "{text}");
+        assert_eq!(out.links, vec!["https://example.com/draft"]);
+    }
+
+    #[test]
+    fn explicit_anchor_is_not_double_numbered_and_mailto_is_kept() {
+        let out = render_html(
+            r##"<p><a href="https://example.com/x">https://example.com/x</a> <a href="mailto:user@example.com">mail</a> <a href="#local">local</a></p>"##,
+        );
+        let text = flat(&out.text);
+        assert_eq!(text.matches("[1]").count(), 1, "{text}");
+        assert_eq!(text.matches("[2]").count(), 1, "{text}");
+        assert_eq!(out.links.len(), 2);
+        assert_eq!(out.links[0], "https://example.com/x");
+        assert_eq!(out.links[1], "mailto:user@example.com");
+        let local = out
+            .text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("local"))
+            .unwrap();
+        assert!(
+            !local.style.add_modifier.contains(Modifier::UNDERLINED),
+            "fragment-only anchor must not look externally clickable"
+        );
     }
 
     #[test]
@@ -509,7 +704,10 @@ mod tests {
         let out = render_html(html);
         let text = flat(&out.text);
         // Both the quoted original and the reply itself must survive.
-        assert!(text.contains("Alex Rivera"), "quoted author missing: {text}");
+        assert!(
+            text.contains("Alex Rivera"),
+            "quoted author missing: {text}"
+        );
         assert!(
             text.contains("Sounds good to me"),
             "quoted text missing: {text}"
@@ -521,14 +719,16 @@ mod tests {
 
     #[test]
     fn attachment_tag_body_still_renders_its_text() {
-        let out = render_html(r#"<attachment id="1785858892876"></attachment><p>Confirma por favor</p>"#);
+        let out =
+            render_html(r#"<attachment id="1785858892876"></attachment><p>Confirma por favor</p>"#);
         let s = flat(&out.text);
         assert!(s.contains("Confirma por favor"), "reply text lost: {s:?}");
     }
 
     #[test]
     fn script_and_style_are_dropped() {
-        let out = render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
+        let out =
+            render_html("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>");
         let s = flat(&out.text);
         assert!(s.contains("visible"));
         assert!(!s.contains("alert"));

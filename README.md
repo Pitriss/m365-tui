@@ -1252,10 +1252,30 @@ The application tab also indicates when unread mail exists.
 
 Incoming messages containing attachments show an attachment indicator.
 
-Press `A` and select an item with `1`–`9` to save it to the Downloads
-directory.
+Press `A` and select an item with `1`–`9` to save it. In the Outlook Reading
+pane, the rendered `Attachments` summary is also mouse-aware: double-clicking
+it downloads the attachment immediately when there is exactly one, or opens
+the attachment picker when there are multiple. A single click reports the
+available action in the status line.
 
-Existing files are not overwritten.
+Inside the attachment picker, clicking a full attachment row highlights it and
+a double-click starts the download; the status line immediately reports that
+the download has started.
+
+By default files are saved to the desktop/XDG Downloads directory. Override the
+target with `M365_DOWNLOAD_DIR`. Absolute paths are used directly; `~/...` and
+all other relative values are resolved against the user's home directory, never
+the current working directory:
+
+```dotenv
+M365_DOWNLOAD_DIR=Downloads/m365-tui
+```
+
+For example, with `$HOME=/home/user`, the value above resolves to
+`/home/user/Downloads/m365-tui`. Existing files are not overwritten. If a raw
+Graph attachment download is not available (for example a reference attachment),
+or the download/save fails, m365-tui falls back to the message's Outlook Web
+link using `M365_WEBLINK_OPENER` or the operating-system URL handler.
 
 While composing mail, use the attachment field to stage files before sending.
 
@@ -1268,8 +1288,23 @@ Links are rendered as text with numbered references rather than long raw URLs.
 
 Press `o` to display the link list and `1`–`9` to open a link.
 
-Microsoft Safelinks wrappers are reduced back to their actual destination when
-possible.
+Rendered links in both Outlook Reading and Teams conversations are also
+mouse-aware. The underlined link text and its `[n]` marker are one clickable
+target: a single click reports the destination in the status line and a
+double-click activates it. Wheel input over a link keeps the normal
+scrolling/navigation behaviour of its pane.
+
+HTTP/HTTPS URLs are detected both in explicit HTML `<a>` elements and when they
+appear as bare text, including bare URLs inside HTML-formatted Outlook drafts.
+They open through `M365_WEBLINK_OPENER` (or the operating-system handler when no
+override is configured). Microsoft Safelinks wrappers are reduced back to their
+actual destination when possible.
+
+`mailto:` links use m365-tui's own **Compose mail** overlay instead of launching
+an external mail client. The recipient plus standard `subject` and `body`
+parameters are prefilled. `cc` and `bcc` are detected but are not silently
+merged into `To`; until Compose gains dedicated Cc/Bcc fields the status line
+warns that those recipients were not imported.
 
 ### Image previews
 
@@ -1294,6 +1329,11 @@ M365_TEAMS_CHANNELS=1
 ```
 
 plus `Team.ReadBasic.All`.
+
+> **Experimental / untested mouse navigation:** clicking individual Team/Channel
+> rows and opening them with a double-click is implemented, but has not been
+> validated against a tenant with `M365_TEAMS_CHANNELS=1`. Keyboard navigation
+> remains the validated fallback for this optional path.
 
 One-to-one chats display unread counts.
 
