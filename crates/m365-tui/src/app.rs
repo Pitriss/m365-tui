@@ -8518,6 +8518,19 @@ impl App {
         self.last_mouse_click = None;
 
         match target {
+            Some(crate::ui::MouseTarget::OutlookReading)
+                if self.screen == Screen::Outlook =>
+            {
+                self.outlook_scroll_reading(delta);
+            }
+            Some(crate::ui::MouseTarget::TeamsMessages)
+                if self.screen == Screen::Teams
+                    && self.teams.preview_chat_id.is_none()
+                    && (self.teams.open_chat_id.is_some() || self.teams.open_channel.is_some()) =>
+            {
+                self.teams_move_message_selection(delta);
+                self.refresh_selected_teams_images();
+            }
             Some(crate::ui::MouseTarget::Calendar)
             | Some(crate::ui::MouseTarget::CalendarEvent(_))
                 if self.screen == Screen::Calendar =>
@@ -9070,19 +9083,7 @@ impl App {
                     step(self.outlook.folder_sel, delta, self.outlook.folders.len());
             }
             // In the reading pane, j/k scroll the message body.
-            OutlookFocus::Reading => {
-                let max = self.reading_max_scroll.get();
-                self.outlook.reading_scroll = if delta > 0 {
-                    self.outlook
-                        .reading_scroll
-                        .saturating_add(delta as u16)
-                        .min(max)
-                } else {
-                    self.outlook
-                        .reading_scroll
-                        .saturating_sub(delta.unsigned_abs() as u16)
-                };
-            }
+            OutlookFocus::Reading => self.outlook_scroll_reading(delta),
             OutlookFocus::Messages => {
                 let len = self.outlook.messages.len();
                 self.outlook.msg_sel = step(self.outlook.msg_sel, delta, len);
@@ -9092,6 +9093,20 @@ impl App {
                 }
             }
         }
+    }
+
+    fn outlook_scroll_reading(&mut self, delta: i32) {
+        let max = self.reading_max_scroll.get();
+        self.outlook.reading_scroll = if delta > 0 {
+            self.outlook
+                .reading_scroll
+                .saturating_add(delta as u16)
+                .min(max)
+        } else {
+            self.outlook
+                .reading_scroll
+                .saturating_sub(delta.unsigned_abs() as u16)
+        };
     }
 
     /// Move focus one pane left: Reading → Messages → Folders.
@@ -9330,37 +9345,8 @@ impl App {
         // In the conversation pane, j/k move the selected message (skipping
         // deleted ones); the selection drives both scroll and reactions.
         if self.teams.focus == TeamsFocus::Messages {
-            let n = self.teams.messages.len() as i32;
-            if n == 0 {
-                return;
-            }
-            let mut i = self.teams.msg_sel as i32;
-            loop {
-                i += delta.signum();
-                if i < 0 {
-                    // Past the oldest loaded message — pull the previous page.
-                    self.load_more_teams_messages();
-                    return;
-                }
-                if i >= n {
-                    return; // already on the newest
-                }
-                if self.teams_message_selectable(&self.teams.messages[i as usize]) {
-                    self.teams.msg_sel = i as usize;
-                    if self.last_selectable_teams_message() == Some(self.teams.msg_sel) {
-                        self.teams.unseen = 0;
-                        self.teams.replying_to = None; // caught up with the newest
-                    }
-                    // Prefetch when there are no more visible messages above.
-                    if delta < 0
-                        && !(0..self.teams.msg_sel)
-                            .any(|index| self.teams_message_selectable(&self.teams.messages[index]))
-                    {
-                        self.load_more_teams_messages();
-                    }
-                    return;
-                }
-            }
+            self.teams_move_message_selection(delta);
+            return;
         }
         match (self.teams.mode, self.teams.focus) {
             (TeamsMode::Chats, TeamsFocus::List) => {
@@ -9378,6 +9364,40 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn teams_move_message_selection(&mut self, delta: i32) {
+        let n = self.teams.messages.len() as i32;
+        if n == 0 || delta == 0 {
+            return;
+        }
+        let mut i = self.teams.msg_sel as i32;
+        loop {
+            i += delta.signum();
+            if i < 0 {
+                // Past the oldest loaded message — pull the previous page.
+                self.load_more_teams_messages();
+                return;
+            }
+            if i >= n {
+                return; // already on the newest
+            }
+            if self.teams_message_selectable(&self.teams.messages[i as usize]) {
+                self.teams.msg_sel = i as usize;
+                if self.last_selectable_teams_message() == Some(self.teams.msg_sel) {
+                    self.teams.unseen = 0;
+                    self.teams.replying_to = None; // caught up with the newest
+                }
+                // Prefetch when there are no more visible messages above.
+                if delta < 0
+                    && !(0..self.teams.msg_sel)
+                        .any(|index| self.teams_message_selectable(&self.teams.messages[index]))
+                {
+                    self.load_more_teams_messages();
+                }
+                return;
+            }
         }
     }
 

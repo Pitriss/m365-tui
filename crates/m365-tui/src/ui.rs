@@ -102,10 +102,12 @@ pub(crate) enum MouseTarget {
     OutlookFolderRow(usize),
     OutlookMessages,
     OutlookMessageRow(usize),
+    OutlookReading,
     Calendar,
     CalendarEvent(usize),
     TeamsList,
     TeamsChatRow(usize),
+    TeamsMessages,
     TeamsComposer,
 }
 
@@ -124,11 +126,13 @@ struct MouseRegions {
     outlook_folder_rows: Option<ListRows>,
     outlook_messages: Option<Rect>,
     outlook_message_rows: Option<ListRows>,
+    outlook_reading: Option<Rect>,
     calendar: Option<Rect>,
     calendar_rows: Option<ListRows>,
     calendar_events: Vec<(Rect, usize)>,
     teams_list: Option<Rect>,
     teams_chat_rows: Option<ListRows>,
+    teams_messages: Option<Rect>,
     teams_composer: Option<Rect>,
 }
 
@@ -234,9 +238,11 @@ fn register_mouse_region(target: MouseTarget, area: Rect) {
         MouseTarget::Screen(Screen::Calendar) => regions.calendar_tab = Some(area),
         MouseTarget::OutlookFolders => regions.outlook_folders = Some(area),
         MouseTarget::OutlookMessages => regions.outlook_messages = Some(area),
+        MouseTarget::OutlookReading => regions.outlook_reading = Some(area),
         MouseTarget::Calendar => regions.calendar = Some(area),
         MouseTarget::CalendarEvent(index) => regions.calendar_events.push((area, index)),
         MouseTarget::TeamsList => regions.teams_list = Some(area),
+        MouseTarget::TeamsMessages => regions.teams_messages = Some(area),
         MouseTarget::TeamsComposer => regions.teams_composer = Some(area),
         MouseTarget::PresenceIndicator => regions.presence_indicator = Some(area),
         MouseTarget::PollIndicator => regions.poll_indicator = Some(area),
@@ -304,8 +310,10 @@ pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
             (regions.calendar_tab, MouseTarget::Screen(Screen::Calendar)),
             (regions.outlook_folders, MouseTarget::OutlookFolders),
             (regions.outlook_messages, MouseTarget::OutlookMessages),
+            (regions.outlook_reading, MouseTarget::OutlookReading),
             (regions.calendar, MouseTarget::Calendar),
             (regions.teams_list, MouseTarget::TeamsList),
+            (regions.teams_messages, MouseTarget::TeamsMessages),
             (regions.teams_composer, MouseTarget::TeamsComposer),
             (regions.presence_indicator, MouseTarget::PresenceIndicator),
             (regions.poll_indicator, MouseTarget::PollIndicator),
@@ -621,12 +629,12 @@ fn context_hints(app: &App) -> &'static str {
                 "j/k move · l read · u read/unread · h back · c compose · r reply · / search"
             }
             OutlookFocus::Reading => {
-                "j/k scroll · u read/unread · h back · o links · A attach · y copy"
+                "wheel/j/k scroll · u read/unread · h back · o links · A attach · y copy"
             }
         },
         Screen::Teams => match app.teams.focus {
             TeamsFocus::List => "j/k move · Enter open/drawer · x archive/restore · X stay · g profile · c chats/channels",
-            TeamsFocus::Messages => "j/k select · h back · r reply · t react · e edit · i write",
+            TeamsFocus::Messages => "wheel/j/k select · h back · r reply · t react · e edit · i write",
             TeamsFocus::Composer => "Enter send/run/save · ▶ selected target · Shift+Enter newline · Esc leave",
         },
         Screen::Calendar => match app.calendar.view {
@@ -664,6 +672,7 @@ fn render_outlook(f: &mut Frame, area: Rect, app: &App) {
 
     register_mouse_region(MouseTarget::OutlookFolders, cols[0]);
     register_mouse_region(MouseTarget::OutlookMessages, cols[1]);
+    register_mouse_region(MouseTarget::OutlookReading, cols[2]);
 
     // Folders
     let folder_inner_width = cols[0].width.saturating_sub(3) as usize;
@@ -2140,6 +2149,7 @@ fn render_teams(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(composer_rows + context_row + 2),
         ])
         .split(cols[1]);
+    register_mouse_region(MouseTarget::TeamsMessages, right[0]);
 
     let focused = app.teams.focus == TeamsFocus::Messages;
     let message_selection_visible =
