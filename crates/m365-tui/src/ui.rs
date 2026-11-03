@@ -93,6 +93,11 @@ const TAB_GAP_WIDTH: u16 = 2;
 pub(crate) enum MouseTarget {
     Screen(Screen),
     Overlay,
+    PresenceIndicator,
+    PollIndicator,
+    NtfyIndicator,
+    PresenceOption(usize),
+    NtfyOption(usize),
     OutlookFolders,
     OutlookFolderRow(usize),
     OutlookMessages,
@@ -107,6 +112,11 @@ pub(crate) enum MouseTarget {
 #[derive(Default)]
 struct MouseRegions {
     overlay: Option<Rect>,
+    presence_indicator: Option<Rect>,
+    poll_indicator: Option<Rect>,
+    ntfy_indicator: Option<Rect>,
+    presence_rows: Option<ListRows>,
+    ntfy_rows: Option<ListRows>,
     outlook_tab: Option<Rect>,
     teams_tab: Option<Rect>,
     calendar_tab: Option<Rect>,
@@ -147,6 +157,8 @@ enum MouseList {
     OutlookMessages,
     CalendarAgenda,
     TeamsChats,
+    PresenceOptions,
+    NtfyOptions,
 }
 
 static MOUSE_REGIONS: std::sync::OnceLock<std::sync::Mutex<MouseRegions>> =
@@ -206,6 +218,8 @@ fn register_list_rows(
         MouseList::OutlookMessages => regions.outlook_message_rows = Some(rows),
         MouseList::CalendarAgenda => regions.calendar_rows = Some(rows),
         MouseList::TeamsChats => regions.teams_chat_rows = Some(rows),
+        MouseList::PresenceOptions => regions.presence_rows = Some(rows),
+        MouseList::NtfyOptions => regions.ntfy_rows = Some(rows),
     });
 }
 
@@ -224,7 +238,12 @@ fn register_mouse_region(target: MouseTarget, area: Rect) {
         MouseTarget::CalendarEvent(index) => regions.calendar_events.push((area, index)),
         MouseTarget::TeamsList => regions.teams_list = Some(area),
         MouseTarget::TeamsComposer => regions.teams_composer = Some(area),
+        MouseTarget::PresenceIndicator => regions.presence_indicator = Some(area),
+        MouseTarget::PollIndicator => regions.poll_indicator = Some(area),
+        MouseTarget::NtfyIndicator => regions.ntfy_indicator = Some(area),
         MouseTarget::Overlay
+        | MouseTarget::PresenceOption(_)
+        | MouseTarget::NtfyOption(_)
         | MouseTarget::OutlookFolderRow(_)
         | MouseTarget::OutlookMessageRow(_)
         | MouseTarget::TeamsChatRow(_) => {}
@@ -266,6 +285,19 @@ pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
             return Some(MouseTarget::TeamsChatRow(index));
         }
 
+        if let Some(index) = regions
+            .presence_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::PresenceOption(index));
+        }
+        if let Some(index) = regions
+            .ntfy_rows
+            .and_then(|rows| rows.index_at(column, row))
+        {
+            return Some(MouseTarget::NtfyOption(index));
+        }
+
         [
             (regions.outlook_tab, MouseTarget::Screen(Screen::Outlook)),
             (regions.teams_tab, MouseTarget::Screen(Screen::Teams)),
@@ -275,6 +307,9 @@ pub(crate) fn mouse_target_at(column: u16, row: u16) -> Option<MouseTarget> {
             (regions.calendar, MouseTarget::Calendar),
             (regions.teams_list, MouseTarget::TeamsList),
             (regions.teams_composer, MouseTarget::TeamsComposer),
+            (regions.presence_indicator, MouseTarget::PresenceIndicator),
+            (regions.poll_indicator, MouseTarget::PollIndicator),
+            (regions.ntfy_indicator, MouseTarget::NtfyIndicator),
         ]
         .into_iter()
         .find_map(|(area, target)| {
@@ -383,6 +418,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
 
     // Right-hand state: presence · poll health · ntfy · memory · local clock.
     let (dot, avail) = presence_indicator(app);
+    let presence_label = format!("{dot} {avail}");
     let (poll_label, poll_colour) = poll_indicator(app.poll_elapsed());
     let (ntfy_label, ntfy_colour) = ntfy_indicator(app);
     let ram = match app.rss_kb {
@@ -393,11 +429,11 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     let clock = chrono::Local::now().format("%H:%M").to_string();
     let sep = || Span::styled(" · ", Style::default().fg(DIM));
     let state = Line::from(vec![
-        Span::styled(format!("{dot} {avail}"), presence_style(app)),
+        Span::styled(presence_label.clone(), presence_style(app)),
         sep(),
-        Span::styled(poll_label, Style::default().fg(poll_colour)),
+        Span::styled(poll_label.as_str(), Style::default().fg(poll_colour)),
         sep(),
-        Span::styled(ntfy_label, Style::default().fg(ntfy_colour)),
+        Span::styled(ntfy_label.as_str(), Style::default().fg(ntfy_colour)),
         sep(),
         Span::styled(format!("rss {ram}"), Style::default().fg(Color::Gray)),
         sep(),
@@ -410,6 +446,26 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(state_w)])
         .split(area);
+
+    // Register only the visible spans, not the separators between them.
+    let presence_w = presence_label.chars().count() as u16;
+    let poll_w = poll_label.chars().count() as u16;
+    let ntfy_w = ntfy_label.chars().count() as u16;
+    let poll_offset = presence_w.saturating_add(3);
+    let ntfy_offset = poll_offset.saturating_add(poll_w).saturating_add(3);
+    register_mouse_region(
+        MouseTarget::PresenceIndicator,
+        clipped_tab_rect(cols[1], 0, presence_w),
+    );
+    register_mouse_region(
+        MouseTarget::PollIndicator,
+        clipped_tab_rect(cols[1], poll_offset, poll_w),
+    );
+    register_mouse_region(
+        MouseTarget::NtfyIndicator,
+        clipped_tab_rect(cols[1], ntfy_offset, ntfy_w),
+    );
+
     f.render_widget(Paragraph::new(tabs), cols[0]);
     f.render_widget(Paragraph::new(state), cols[1]);
 }
@@ -541,12 +597,12 @@ fn context_hints(app: &App) -> &'static str {
             Overlay::ConfirmReplacePin { .. } => "y replace current pin · any other key cancel",
             Overlay::ConfirmDelete { .. } => "y delete · any other key cancel",
             Overlay::ConfirmAutomationPeer { .. } => "y add automation peer · any other key cancel",
-            Overlay::Presence => "1-6 set · m message · c clear message · a auto · Esc close",
+            Overlay::Presence => "wheel choose · double-click set · 1-6 set · m message · c clear · a auto · Esc close",
             Overlay::PresenceMessage(_) => "Enter set · Esc cancel",
             Overlay::OutOfOffice(_) => "s set/edit · c clear · w web · Esc close",
             Overlay::OutOfOfficeEdit(_) => "Tab next · ←/→ audience · PgUp/PgDn scroll · Enter save · Space types normally",
             Overlay::ConfirmOutOfOfficeClear => "y clear · any other key cancel",
-            Overlay::NtfySnooze { .. } => "j/k choose · Enter apply · c/0 resume · Esc close",
+            Overlay::NtfySnooze { .. } => "wheel/j/k choose · double-click/Enter apply · c/0 resume · Esc close",
             Overlay::Search { .. } => "Enter search · Esc cancel",
             Overlay::Palette { .. } => "↑↓ choose · Enter run · Esc close",
             Overlay::CalendarEvent => "o open meeting · Esc close",
@@ -3284,6 +3340,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::NtfySnooze { sel } => {
             let area = centered(42, 50, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
             let block = popup_block("ntfy snooze — F4");
             let inner = block.inner(area);
@@ -3317,6 +3374,7 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 })
                 .collect();
             items.push(ListItem::new("Resume now"));
+            let item_count = items.len();
             let mut state = ListState::default();
             state.select(Some((*sel).min(NTFY_SNOOZE_HOURS.len())));
             f.render_stateful_widget(
@@ -3331,9 +3389,10 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
                 rows[1],
                 &mut state,
             );
+            register_list_rows(MouseList::NtfyOptions, rows[1], state.offset(), item_count);
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    "Enter set · c/0 resume now · Esc cancel",
+                    "wheel/j/k choose · double-click/Enter set · c/0 resume · Esc cancel",
                     Style::default().fg(DIM),
                 )),
                 rows[2],
@@ -3685,42 +3744,92 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
         }
         Overlay::Presence => {
             let area = centered(64, 82, f.area());
+            register_overlay_region(area);
             f.render_widget(Clear, area);
-            let mut body = String::new();
-            if let Some(a) = app
+            let block = popup_block("Set presence");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let current = app
                 .my_presence
                 .as_ref()
                 .and_then(|p| p.availability.as_deref())
-            {
-                body.push_str(&format!("Current: {a}\n"));
-            }
+                .unwrap_or("unknown");
             let status_message = app
                 .my_presence
                 .as_ref()
                 .and_then(m365_core::models::Presence::status_message_text)
                 .map(|message| truncate(message, 48))
                 .unwrap_or_else(|| "(none)".to_string());
-            body.push_str(&format!("Status message: {status_message}\n\n"));
-            for (i, opt) in crate::app::PRESENCE_OPTIONS.iter().enumerate() {
-                let label = if i == 0 && app.session.config.presence_primary {
-                    "Available (automatic)"
-                } else {
-                    opt.label
-                };
-                body.push_str(&format!("{}  {}\n", i + 1, label));
-            }
-            body.push_str(
-                "\nm  Set/edit status message\nc  Clear status message\na  Automatic (clear manual presence)\nEsc cancel",
+
+            let option_count = crate::app::PRESENCE_OPTIONS.len();
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(option_count as u16),
+                    Constraint::Min(1),
+                ])
+                .split(inner);
+
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Current: {current}
+Status message: {status_message}
+"
+                )),
+                rows[0],
+            );
+
+            let items: Vec<ListItem> = crate::app::PRESENCE_OPTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, opt)| {
+                    let label = if i == 0 && app.session.config.presence_primary {
+                        "Available (automatic)"
+                    } else {
+                        opt.label
+                    };
+                    ListItem::new(format!("{}  {label}", i + 1))
+                })
+                .collect();
+            let mut state = ListState::default();
+            state.select(Some(app.presence_sel.min(option_count.saturating_sub(1))));
+            f.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▏"),
+                rows[1],
+                &mut state,
+            );
+            register_list_rows(
+                MouseList::PresenceOptions,
+                rows[1],
+                state.offset(),
+                option_count,
+            );
+
+            let mut actions = String::from(
+                "
+m  Set/edit status message
+c  Clear status message
+a  Automatic (clear manual presence)
+Esc cancel",
             );
             if !app.session.config.can_write_presence() {
-                body.push_str("\n\nread-only: set M365_PRESENCE_WRITE=1 and grant\nPresence.ReadWrite to enable changing status");
+                actions.push_str(
+                    "
+
+read-only: set M365_PRESENCE_WRITE=1 and grant
+Presence.ReadWrite to enable changing status",
+                );
             }
-            f.render_widget(
-                Paragraph::new(body)
-                    .wrap(Wrap { trim: false })
-                    .block(popup_block("Set presence")),
-                area,
-            );
+            f.render_widget(Paragraph::new(actions).wrap(Wrap { trim: false }), rows[2]);
         }
         Overlay::PresenceMessage(input) => {
             let area = centered(72, 28, f.area());
@@ -4132,8 +4241,9 @@ mod tests {
     #[test]
     fn mouse_regions_follow_rendered_rectangles() {
         use super::{
-            mouse_target_at, overlay_contains, register_mouse_region, register_overlay_region,
-            register_tab_regions, reset_mouse_regions, MouseTarget,
+            mouse_target_at, overlay_contains, register_list_rows, register_mouse_region,
+            register_overlay_region, register_tab_regions, reset_mouse_regions, MouseList,
+            MouseTarget,
         };
         use crate::app::Screen;
         use ratatui::layout::Rect;
@@ -4144,6 +4254,11 @@ mod tests {
         register_mouse_region(MouseTarget::OutlookMessages, Rect::new(20, 5, 30, 12));
         register_mouse_region(MouseTarget::TeamsList, Rect::new(2, 20, 16, 10));
         register_mouse_region(MouseTarget::TeamsComposer, Rect::new(20, 20, 40, 4));
+        register_mouse_region(MouseTarget::PresenceIndicator, Rect::new(60, 3, 8, 1));
+        register_mouse_region(MouseTarget::PollIndicator, Rect::new(69, 3, 12, 1));
+        register_mouse_region(MouseTarget::NtfyIndicator, Rect::new(82, 3, 7, 1));
+        register_list_rows(MouseList::PresenceOptions, Rect::new(30, 30, 20, 6), 0, 6);
+        register_list_rows(MouseList::NtfyOptions, Rect::new(55, 30, 20, 7), 0, 7);
         register_overlay_region(Rect::new(30, 10, 20, 8));
 
         assert_eq!(overlay_contains(35, 12), Some(true));
@@ -4175,6 +4290,30 @@ mod tests {
         assert!(matches!(
             mouse_target_at(25, 22),
             Some(MouseTarget::TeamsComposer)
+        ));
+        assert!(matches!(
+            mouse_target_at(61, 3),
+            Some(MouseTarget::PresenceIndicator)
+        ));
+        assert!(matches!(
+            mouse_target_at(70, 3),
+            Some(MouseTarget::PollIndicator)
+        ));
+        assert!(matches!(
+            mouse_target_at(83, 3),
+            Some(MouseTarget::NtfyIndicator)
+        ));
+        assert!(matches!(
+            mouse_target_at(30, 30),
+            Some(MouseTarget::PresenceOption(0))
+        ));
+        assert!(matches!(
+            mouse_target_at(30, 35),
+            Some(MouseTarget::PresenceOption(5))
+        ));
+        assert!(matches!(
+            mouse_target_at(55, 36),
+            Some(MouseTarget::NtfyOption(6))
         ));
         assert!(mouse_target_at(0, 0).is_none());
     }

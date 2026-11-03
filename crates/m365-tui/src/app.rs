@@ -1358,6 +1358,8 @@ pub struct App {
     chat_cache_warmup_started: bool,
     /// Last left-click target and timestamp used for application-level double-click detection.
     last_mouse_click: Option<(crate::ui::MouseTarget, std::time::Instant)>,
+    /// Selected Presence option for wheel/click navigation in the Presence popup.
+    pub presence_sel: usize,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -2709,6 +2711,7 @@ impl App {
             teams_unread: false,
             chat_cache_warmup_started: false,
             last_mouse_click: None,
+            presence_sel: 0,
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
@@ -8183,7 +8186,43 @@ impl App {
 
     // -- input handling ----------------------------------------------------
 
-    fn overlay_mouse_enabled(&self) -> bool {
+    fn open_presence_overlay(&mut self) {
+        self.presence_sel = 0;
+        self.last_mouse_click = None;
+        self.overlay = Some(Overlay::Presence);
+    }
+
+    fn open_ntfy_snooze_overlay(&mut self) {
+        self.last_mouse_click = None;
+        if self.session.config.ntfy.enabled() {
+            self.overlay = Some(Overlay::NtfySnooze { sel: 0 });
+        } else {
+            self.status = "ntfy forwarding is disabled (M365_NTFY=never)".into();
+        }
+    }
+
+    fn apply_presence_option(&mut self, index: usize) {
+        let Some(opt) = PRESENCE_OPTIONS.get(index) else {
+            return;
+        };
+        if !self.session.config.can_write_presence() {
+            self.status =
+                "setting presence needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
+            return;
+        }
+        self.status = format!("setting presence to {}…", opt.label);
+        self.set_presence(opt);
+    }
+
+    fn apply_ntfy_snooze_selection(&mut self, sel: usize) {
+        if let Some(&hours) = NTFY_SNOOZE_HOURS.get(sel) {
+            self.set_ntfy_snooze(hours);
+        } else if sel == NTFY_SNOOZE_HOURS.len() {
+            self.clear_ntfy_snooze();
+        }
+    }
+
+    fn informational_overlay_mouse_enabled(&self) -> bool {
         matches!(
             self.overlay.as_ref(),
             Some(
@@ -8199,9 +8238,20 @@ impl App {
         )
     }
 
-    /// Capture mouse input in the normal application view and in read-only
-    /// informational overlays that support click-away and native clipboard copy.
-    /// Editing/confirmation overlays still release capture for terminal selection.
+    fn picker_overlay_mouse_enabled(&self) -> bool {
+        matches!(
+            self.overlay.as_ref(),
+            Some(Overlay::Presence | Overlay::NtfySnooze { .. })
+        )
+    }
+
+    fn overlay_mouse_enabled(&self) -> bool {
+        self.informational_overlay_mouse_enabled() || self.picker_overlay_mouse_enabled()
+    }
+
+    /// Capture mouse input in the normal application view, read-only informational
+    /// overlays, and the Presence/ntfy picker overlays. Editing/confirmation
+    /// overlays still release capture for ordinary terminal selection.
     pub fn wants_mouse_capture(&self) -> bool {
         !self.copy_mode && (self.overlay.is_none() || self.overlay_mouse_enabled())
     }
@@ -8241,11 +8291,69 @@ impl App {
 
         self.note_presence_activity();
 
+        // Presence and ntfy are interactive picker overlays. They capture the
+        // mouse without inheriting Part 3 click-away/copy behaviour: wheel moves
+        // exactly one option, one click selects a row, double-click activates it.
+        if self.picker_overlay_mouse_enabled() {
+            let inside = crate::ui::overlay_contains(mouse.column, mouse.row).unwrap_or(false);
+            if !inside {
+                self.last_mouse_click = None;
+                return;
+            }
+
+            if let Some(delta) = mouse_wheel_delta(mouse.kind) {
+                self.last_mouse_click = None;
+                if matches!(self.overlay.as_ref(), Some(Overlay::Presence)) {
+                    self.presence_sel = step(self.presence_sel, delta, PRESENCE_OPTIONS.len());
+                } else if let Some(Overlay::NtfySnooze { sel }) = self.overlay.as_ref() {
+                    let next = step(*sel, delta, NTFY_SNOOZE_HOURS.len() + 1);
+                    self.overlay = Some(Overlay::NtfySnooze { sel: next });
+                }
+                return;
+            }
+
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let target = crate::ui::mouse_target_at(mouse.column, mouse.row);
+                match target {
+                    Some(crate::ui::MouseTarget::PresenceOption(index))
+                        if matches!(self.overlay.as_ref(), Some(Overlay::Presence)) =>
+                    {
+                        if index < PRESENCE_OPTIONS.len() {
+                            self.presence_sel = index;
+                            let double_click = self.mouse_left_click_is_double(Some(
+                                crate::ui::MouseTarget::PresenceOption(index),
+                            ));
+                            if double_click {
+                                self.overlay = None;
+                                self.apply_presence_option(index);
+                            }
+                        }
+                    }
+                    Some(crate::ui::MouseTarget::NtfyOption(index))
+                        if matches!(self.overlay.as_ref(), Some(Overlay::NtfySnooze { .. })) =>
+                    {
+                        if index <= NTFY_SNOOZE_HOURS.len() {
+                            self.overlay = Some(Overlay::NtfySnooze { sel: index });
+                            let double_click = self.mouse_left_click_is_double(Some(
+                                crate::ui::MouseTarget::NtfyOption(index),
+                            ));
+                            if double_click {
+                                self.overlay = None;
+                                self.apply_ntfy_snooze_selection(index);
+                            }
+                        }
+                    }
+                    _ => self.last_mouse_click = None,
+                }
+            }
+            return;
+        }
+
         // Read-only informational overlays own the mouse completely. A click
         // outside closes the overlay without falling through to the underlying
         // Outlook/Teams/Calendar view. A double-click inside copies the complete
         // source text, but only when a native clipboard integration is available.
-        if self.overlay_mouse_enabled() {
+        if self.informational_overlay_mouse_enabled() {
             if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 return;
             }
@@ -8289,6 +8397,20 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let double_click = self.mouse_left_click_is_double(target);
             match target {
+                Some(crate::ui::MouseTarget::PresenceIndicator) => {
+                    self.open_presence_overlay();
+                    return;
+                }
+                Some(crate::ui::MouseTarget::PollIndicator) => {
+                    if double_click {
+                        self.force_poll();
+                    }
+                    return;
+                }
+                Some(crate::ui::MouseTarget::NtfyIndicator) => {
+                    self.open_ntfy_snooze_overlay();
+                    return;
+                }
                 Some(crate::ui::MouseTarget::Screen(screen)) => {
                     self.switch_screen(screen);
                     return;
@@ -8522,11 +8644,7 @@ impl App {
                 return;
             }
             (KeyCode::F(4), _) => {
-                if self.session.config.ntfy.enabled() {
-                    self.overlay = Some(Overlay::NtfySnooze { sel: 0 });
-                } else {
-                    self.status = "ntfy forwarding is disabled (M365_NTFY=never)".into();
-                }
+                self.open_ntfy_snooze_overlay();
                 return;
             }
             (KeyCode::F(5), _) => {
@@ -8546,7 +8664,7 @@ impl App {
                 return;
             }
             (KeyCode::Char('p'), KeyModifiers::NONE) if !typing => {
-                self.overlay = Some(Overlay::Presence);
+                self.open_presence_overlay();
                 return;
             }
             (KeyCode::Char('A'), _) if !typing => {
@@ -10328,15 +10446,8 @@ impl App {
             Some(Overlay::Presence) => match key.code {
                 KeyCode::Char(c @ '1'..='6') => {
                     let idx = (c as u8 - b'1') as usize;
-                    if let Some(opt) = PRESENCE_OPTIONS.get(idx) {
-                        if !self.session.config.can_write_presence() {
-                            self.status =
-                                "setting presence needs M365_PRESENCE_WRITE=1 + Presence.ReadWrite consent".into();
-                        } else {
-                            self.status = format!("setting presence to {}…", opt.label);
-                            self.set_presence(opt);
-                        }
-                    }
+                    self.presence_sel = idx.min(PRESENCE_OPTIONS.len().saturating_sub(1));
+                    self.apply_presence_option(idx);
                 }
                 KeyCode::Char('m') => {
                     if !self.session.config.can_write_presence() {
@@ -10439,13 +10550,7 @@ impl App {
                         sel = sel.saturating_add(1).min(max);
                         self.overlay = Some(Overlay::NtfySnooze { sel });
                     }
-                    KeyCode::Enter => {
-                        if let Some(&hours) = NTFY_SNOOZE_HOURS.get(sel) {
-                            self.set_ntfy_snooze(hours);
-                        } else if sel == NTFY_SNOOZE_HOURS.len() {
-                            self.clear_ntfy_snooze();
-                        }
-                    }
+                    KeyCode::Enter => self.apply_ntfy_snooze_selection(sel),
                     KeyCode::Char('c') | KeyCode::Char('0') => self.clear_ntfy_snooze(),
                     _ => self.overlay = Some(Overlay::NtfySnooze { sel }),
                 }
