@@ -1356,6 +1356,8 @@ pub struct App {
     pub teams_unread: bool,
     /// Whether the automatic Teams conversation-cache warm-up has been queued.
     chat_cache_warmup_started: bool,
+    /// Last left-click target and timestamp used for application-level double-click detection.
+    last_mouse_click: Option<(crate::ui::MouseTarget, std::time::Instant)>,
     /// Borderless full-width view for clean terminal text selection.
     pub copy_mode: bool,
     pub copy_scroll: u16,
@@ -2706,6 +2708,7 @@ impl App {
             read_timer_generation: 0,
             teams_unread: false,
             chat_cache_warmup_started: false,
+            last_mouse_click: None,
             copy_mode: false,
             copy_scroll: 0,
             should_quit: false,
@@ -8187,6 +8190,34 @@ impl App {
         !self.copy_mode && self.overlay.is_none()
     }
 
+    fn mouse_left_click_is_double(
+        &mut self,
+        target: Option<crate::ui::MouseTarget>,
+    ) -> bool {
+        let timeout_ms = self.session.config.mouse_double_click_ms;
+        if timeout_ms == 0 {
+            self.last_mouse_click = None;
+            return false;
+        }
+
+        let now = std::time::Instant::now();
+        let is_double = match (target, self.last_mouse_click) {
+            (Some(target), Some((previous_target, previous_at))) => {
+                target == previous_target
+                    && now.duration_since(previous_at)
+                        <= std::time::Duration::from_millis(timeout_ms)
+            }
+            _ => false,
+        };
+
+        self.last_mouse_click = if is_double {
+            None
+        } else {
+            target.map(|target| (target, now))
+        };
+        is_double
+    }
+
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         if !self.wants_mouse_capture() {
             return;
@@ -8197,6 +8228,7 @@ impl App {
         let target = crate::ui::mouse_target_at(mouse.column, mouse.row);
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let double_click = self.mouse_left_click_is_double(target);
             match target {
                 Some(crate::ui::MouseTarget::Screen(screen)) => {
                     self.switch_screen(screen);
@@ -8207,6 +8239,9 @@ impl App {
                 {
                     if index < self.calendar.events.len() {
                         self.calendar.selected = index;
+                        if double_click {
+                            self.overlay = Some(Overlay::CalendarEvent);
+                        }
                     }
                     return;
                 }
@@ -8219,6 +8254,9 @@ impl App {
                     self.outlook_focus = OutlookFocus::Folders;
                     if index < self.outlook.folders.len() {
                         self.outlook.folder_sel = index;
+                        if double_click {
+                            self.outlook_enter();
+                        }
                     }
                     return;
                 }
@@ -8243,6 +8281,9 @@ impl App {
                         if index + 1 == self.outlook.messages.len() {
                             self.load_more_messages();
                         }
+                        if double_click {
+                            self.outlook_enter();
+                        }
                     }
                     return;
                 }
@@ -8265,6 +8306,9 @@ impl App {
                         self.teams.chat_sel = index;
                         self.preview_selected_teams_chat();
                         self.refresh_selected_teams_images();
+                        if double_click {
+                            self.teams_enter();
+                        }
                     }
                     return;
                 }
@@ -8282,6 +8326,7 @@ impl App {
         let Some(delta) = mouse_wheel_delta(mouse.kind) else {
             return;
         };
+        self.last_mouse_click = None;
 
         match target {
             Some(crate::ui::MouseTarget::Calendar)
@@ -8321,6 +8366,7 @@ impl App {
     // -- key handling ------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        self.last_mouse_click = None;
         // F6 is deliberately global, including while another overlay or
         // the Teams composer has focus.
         if key.code == KeyCode::F(6) {

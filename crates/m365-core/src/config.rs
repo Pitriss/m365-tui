@@ -19,6 +19,10 @@ pub const TEAMS_POLL_BUDGET_MIN_RPS: f64 = 0.5;
 pub const TEAMS_POLL_BUDGET_MAX_RPS: f64 = 8.0;
 /// Reject combinations that would make an accelerated chat slower than this.
 pub const TEAMS_POLL_MAX_EFFECTIVE_INTERVAL_SECS: f64 = 5.0;
+/// Default interval in which two left clicks on the same mouse target count as a double click.
+pub const MOUSE_DOUBLE_CLICK_DEFAULT_MS: u64 = 400;
+/// Upper bound preventing very distant clicks from becoming an accidental double click.
+pub const MOUSE_DOUBLE_CLICK_MAX_MS: u64 = 2_000;
 
 /// The Graph endpoint to talk to, overridable with `M365_GRAPH_BASE`.
 ///
@@ -293,6 +297,9 @@ pub struct Config {
     /// Seconds an unread message must remain open before it is marked read.
     /// Zero marks it read immediately after the body is displayed.
     pub read_msg_timeout: u64,
+    /// Maximum interval in milliseconds between two left clicks on the same target.
+    /// Zero disables double-click actions.
+    pub mouse_double_click_ms: u64,
     /// Show presence indicators for contacts in one-to-one Teams chats.
     pub presence_read: bool,
     /// Keep an Available application presence session active while the TUI runs.
@@ -508,6 +515,9 @@ impl Config {
                 .context("M365_READ_MSG_TIMEOUT must be an integer number of seconds")?,
             _ => 0,
         };
+        let mouse_double_click_ms = parse_mouse_double_click_ms(
+            std::env::var("M365_MOUSE_DOUBLE_CLICK_MS").ok().as_deref(),
+        )?;
         let presence_read = env_flag("M365_PRESENCE_READ");
 
         Ok(Self {
@@ -525,6 +535,7 @@ impl Config {
             ntfy_token,
             calendar_notify,
             read_msg_timeout,
+            mouse_double_click_ms,
             presence_read,
             presence_primary,
             presence_available_timeout_min,
@@ -644,6 +655,21 @@ impl Config {
             .as_ref()
             .map(|b| format!("{b}/lifecycle"))
     }
+}
+
+fn parse_mouse_double_click_ms(raw: Option<&str>) -> Result<u64> {
+    let value = match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<u64>()
+            .context("M365_MOUSE_DOUBLE_CLICK_MS must be an integer number of milliseconds")?,
+        None => MOUSE_DOUBLE_CLICK_DEFAULT_MS,
+    };
+
+    anyhow::ensure!(
+        value <= MOUSE_DOUBLE_CLICK_MAX_MS,
+        "M365_MOUSE_DOUBLE_CLICK_MS must be between 0 and {MOUSE_DOUBLE_CLICK_MAX_MS} milliseconds (0 disables double-click actions; got {value})"
+    );
+    Ok(value)
 }
 
 fn parse_teams_automation_peers(
@@ -914,6 +940,7 @@ mod tests {
             ntfy_token: None,
             calendar_notify: CalendarNotify::All,
             read_msg_timeout: 0,
+            mouse_double_click_ms: MOUSE_DOUBLE_CLICK_DEFAULT_MS,
             presence_read: false,
             presence_primary: false,
             presence_available_timeout_min: 5,
@@ -938,6 +965,18 @@ mod tests {
             web_link_opener: None,
             web_link_opener_source: WebLinkOpenerSource::None,
         }
+    }
+
+    #[test]
+    fn parses_mouse_double_click_interval() {
+        assert_eq!(
+            parse_mouse_double_click_ms(None).unwrap(),
+            MOUSE_DOUBLE_CLICK_DEFAULT_MS
+        );
+        assert_eq!(parse_mouse_double_click_ms(Some("350")).unwrap(), 350);
+        assert_eq!(parse_mouse_double_click_ms(Some("0")).unwrap(), 0);
+        assert!(parse_mouse_double_click_ms(Some("nope")).is_err());
+        assert!(parse_mouse_double_click_ms(Some("2001")).is_err());
     }
 
     #[test]
