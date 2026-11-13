@@ -3645,12 +3645,22 @@ fn render_overlay(f: &mut Frame, app: &App, overlay: &Overlay) {
             let area = centered(82, 74, f.area());
             register_overlay_region(area);
             f.render_widget(Clear, area);
-            f.render_widget(
-                Paragraph::new(view.text())
-                    .wrap(Wrap { trim: false })
-                    .block(popup_block("Out of office")),
-                area,
-            );
+
+            let block = popup_block("Out of office · wheel/j/k scroll");
+            let inner = block.inner(area);
+            let lines: Vec<Line<'static>> = view
+                .text()
+                .split('\n')
+                .map(|line| Line::raw(line.to_string()))
+                .collect();
+            let (rows, _) = crate::wrap::wrap_all(&lines, inner.width.max(1) as usize);
+            let row_count = rows.len().min(u16::MAX as usize) as u16;
+            let max = row_count.saturating_sub(inner.height);
+            app.out_of_office_max_scroll.set(max);
+            let scroll = app.out_of_office_scroll.min(max);
+
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(rows).scroll((scroll, 0)), inner);
         }
         Overlay::ConfirmOutOfOfficeClear => {
             let area = centered(62, 26, f.area());

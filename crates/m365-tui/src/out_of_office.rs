@@ -5,8 +5,11 @@
 //! validated when leaving the minute field so DST gaps/overlaps are rejected.
 //! Graph is sent UTC instants, avoiding Windows/IANA time-zone ambiguity.
 
+use std::path::{Path, PathBuf};
+
 use chrono::{
-  DateTime, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
+  format::{Item, Locale, StrftimeItems}, DateTime, Duration, Local, LocalResult, NaiveDate,
+  NaiveDateTime, NaiveTime, TimeZone, Utc,
 };
 use m365_core::models::{
   AutomaticRepliesSetting, DateTimeTimeZone, MailboxSettingsSnapshot,
@@ -17,6 +20,519 @@ use crate::editor::TextInput;
 
 pub const OUTLOOK_OOO_URL: &str =
   "https://outlook.office.com/mail/options/accounts-category/automaticReply";
+
+const OOO_TEMPLATE_STATE_FILE: &str = "ooo-template.json";
+const OOO_TEMPLATE_STATE_VERSION: u64 = 1;
+const TEMPLATE_FUZZY_SLOT_MAX_CHARS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateRestore {
+  None,
+  Current,
+  Previous,
+  Structure,
+}
+
+impl TemplateRestore {
+  pub fn status_message(self) -> Option<&'static str> {
+    match self {
+      Self::None | Self::Current => None,
+      Self::Previous => Some(
+        "OOO template restored; stored message still contains previous template values",
+      ),
+      Self::Structure => Some(
+        "OOO template restored from matching message structure; review dates before saving",
+      ),
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct TemplateState {
+  template: String,
+  locale: String,
+  markdown: bool,
+  last_rendered: String,
+}
+
+pub struct PreparedOutOfOffice {
+  pub setting: AutomaticRepliesSetting,
+  pub template_state: Option<TemplateState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TemplateSlot {
+  Start,
+  End,
+}
+
+#[derive(Debug, Clone)]
+enum TemplateSegment {
+  Literal(String),
+  Slot {
+    slot: TemplateSlot,
+    format: String,
+  },
+}
+
+#[derive(Debug, Clone)]
+enum MatchSegment {
+  Literal(String),
+  Slot,
+}
+
+struct RenderedTemplate {
+  html: String,
+  plain: String,
+  templated: bool,
+}
+
+fn placeholder_prefix(after_open: &str) -> Option<(TemplateSlot, usize, &'static str)> {
+  for (name, slot) in [("end", TemplateSlot::End), ("st", TemplateSlot::Start)] {
+    if !after_open.starts_with(name) {
+      continue;
+    }
+    let tail = &after_open[name.len()..];
+    match tail.chars().next() {
+      Some('}') => return Some((slot, name.len(), name)),
+      Some(ch) if ch.is_whitespace() => return Some((slot, name.len(), name)),
+      _ => {}
+    }
+  }
+  None
+}
+
+fn validate_template_format(format: &str, name: &str) -> Result<(), String> {
+  if format.is_empty() {
+    return Err(format!("OOO template {{{name} ...}} needs a date format"));
+  }
+  if StrftimeItems::new(format).any(|item| matches!(item, Item::Error)) {
+    return Err(format!(
+      "OOO template {{{name} {format}}} contains an unsupported date format"
+    ));
+  }
+  Ok(())
+}
+
+fn parse_template(input: &str) -> Result<Vec<TemplateSegment>, String> {
+  let mut segments = Vec::new();
+  let mut search = 0usize;
+  let mut literal_start = 0usize;
+
+  while let Some(relative_open) = input[search..].find('{') {
+    let open = search + relative_open;
+    let after_open = &input[open + 1..];
+    let Some((slot, name_len, name)) = placeholder_prefix(after_open) else {
+      search = open + 1;
+      continue;
+    };
+
+    let Some(relative_close) = after_open.find('}') else {
+      return Err(format!("OOO template {{{name} ... is missing closing }}"));
+    };
+    let inner = &after_open[..relative_close];
+    let format = inner[name_len..].trim();
+    validate_template_format(format, name)?;
+
+    if open > literal_start {
+      segments.push(TemplateSegment::Literal(input[literal_start..open].to_string()));
+    }
+    segments.push(TemplateSegment::Slot {
+      slot,
+      format: format.to_string(),
+    });
+
+    let close = open + 1 + relative_close;
+    search = close + 1;
+    literal_start = search;
+  }
+
+  if literal_start < input.len() {
+    segments.push(TemplateSegment::Literal(input[literal_start..].to_string()));
+  }
+
+  Ok(segments)
+}
+
+fn template_has_slots(segments: &[TemplateSegment]) -> bool {
+  segments
+    .iter()
+    .any(|segment| matches!(segment, TemplateSegment::Slot { .. }))
+}
+
+fn expand_segments(
+  segments: &[TemplateSegment],
+  start: &DateTime<Local>,
+  end: &DateTime<Local>,
+  locale: Locale,
+) -> String {
+  let mut out = String::new();
+  for segment in segments {
+    match segment {
+      TemplateSegment::Literal(text) => out.push_str(text),
+      TemplateSegment::Slot { slot, format } => {
+        let value = match slot {
+          TemplateSlot::Start => start,
+          TemplateSlot::End => end,
+        };
+        out.push_str(&value.format_localized(format, locale).to_string());
+      }
+    }
+  }
+  out
+}
+
+fn normalize_locale_name(raw: &str) -> Option<String> {
+  let raw = raw.trim();
+  if raw.is_empty() {
+    return None;
+  }
+
+  let (base_with_encoding, modifier) = raw
+    .split_once('@')
+    .map(|(base, modifier)| (base, Some(modifier)))
+    .unwrap_or((raw, None));
+  let base = base_with_encoding
+    .split_once('.')
+    .map(|(base, _)| base)
+    .unwrap_or(base_with_encoding)
+    .trim();
+
+  if base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
+    return Some("POSIX".into());
+  }
+  if base.is_empty() {
+    return None;
+  }
+
+  Some(match modifier.map(str::trim).filter(|value| !value.is_empty()) {
+    Some(modifier) => format!("{base}@{modifier}"),
+    None => base.to_string(),
+  })
+}
+
+fn current_locale() -> (String, Locale) {
+  for key in ["LC_ALL", "LC_TIME", "LANG"] {
+    let Ok(raw) = std::env::var(key) else {
+      continue;
+    };
+    let Some(name) = normalize_locale_name(&raw) else {
+      continue;
+    };
+    if let Ok(locale) = Locale::try_from(name.as_str()) {
+      return (locale.to_string(), locale);
+    }
+  }
+  (Locale::POSIX.to_string(), Locale::POSIX)
+}
+
+fn render_template_message(
+  template: &str,
+  start: &DateTime<Local>,
+  end: &DateTime<Local>,
+  locale: Locale,
+  markdown: bool,
+) -> Result<RenderedTemplate, String> {
+  let segments = parse_template(template)?;
+  let templated = template_has_slots(&segments);
+  let expanded = expand_segments(&segments, start, end, locale);
+  let html = m365_core::teams_format::outgoing_body(&expanded, markdown).html_fragment();
+  let plain = html_to_plain(&html);
+  Ok(RenderedTemplate {
+    html,
+    plain,
+    templated,
+  })
+}
+
+fn normalize_match_text(input: &str) -> String {
+  let mut out = String::with_capacity(input.len());
+  let mut whitespace = false;
+  for ch in input.chars() {
+    if ch.is_whitespace() {
+      whitespace = true;
+      continue;
+    }
+    if whitespace && !out.is_empty() {
+      out.push(' ');
+    }
+    whitespace = false;
+    out.push(ch);
+  }
+  out
+}
+
+fn visible_match_segments(template: &str, markdown: bool) -> Result<Vec<MatchSegment>, String> {
+  const TOKEN_PREFIX: &str = "M365OOOTEMPLATESLOT9F3C";
+
+  if template.contains(TOKEN_PREFIX) {
+    return Err("OOO template contains a reserved internal marker".into());
+  }
+
+  let segments = parse_template(template)?;
+  if !template_has_slots(&segments) {
+    return Ok(Vec::new());
+  }
+
+  let mut source = String::new();
+  let mut tokens = Vec::new();
+  for segment in segments {
+    match segment {
+      TemplateSegment::Literal(text) => source.push_str(&text),
+      TemplateSegment::Slot { .. } => {
+        let token = format!("{TOKEN_PREFIX}{}X", tokens.len());
+        source.push_str(&token);
+        tokens.push(token);
+      }
+    }
+  }
+
+  let html = m365_core::teams_format::outgoing_body(&source, markdown).html_fragment();
+  let plain = html_to_plain(&html);
+  let mut result = Vec::new();
+  let mut cursor = 0usize;
+
+  for token in tokens {
+    let Some(relative) = plain[cursor..].find(&token) else {
+      return Ok(Vec::new());
+    };
+    let start = cursor + relative;
+    if start > cursor {
+      let literal = normalize_match_text(&plain[cursor..start]);
+      if !literal.is_empty() {
+        result.push(MatchSegment::Literal(literal));
+      }
+    }
+    result.push(MatchSegment::Slot);
+    cursor = start + token.len();
+  }
+
+  if cursor < plain.len() {
+    let literal = normalize_match_text(&plain[cursor..]);
+    if !literal.is_empty() {
+      result.push(MatchSegment::Literal(literal));
+    }
+  }
+
+  Ok(result)
+}
+
+fn valid_fuzzy_capture(value: &str) -> bool {
+  let value = value.trim();
+  !value.is_empty() && value.chars().count() <= TEMPLATE_FUZZY_SLOT_MAX_CHARS
+}
+
+fn match_visible_segments(
+  segments: &[MatchSegment],
+  segment_index: usize,
+  text: &str,
+  text_index: usize,
+) -> bool {
+  if segment_index == segments.len() {
+    return text[text_index..].trim().is_empty();
+  }
+
+  match &segments[segment_index] {
+    MatchSegment::Literal(literal) => text[text_index..]
+      .strip_prefix(literal)
+      .is_some_and(|remaining| {
+        let next_index = text.len() - remaining.len();
+        match_visible_segments(segments, segment_index + 1, text, next_index)
+      }),
+    MatchSegment::Slot => {
+      if matches!(segments.get(segment_index + 1), Some(MatchSegment::Slot)) {
+        return false;
+      }
+
+      let Some(MatchSegment::Literal(next_literal)) = segments.get(segment_index + 1) else {
+        return valid_fuzzy_capture(&text[text_index..]);
+      };
+
+      for (relative, _) in text[text_index..].match_indices(next_literal) {
+        let next_index = text_index + relative;
+        let capture = &text[text_index..next_index];
+        if capture.chars().count() > TEMPLATE_FUZZY_SLOT_MAX_CHARS {
+          break;
+        }
+        if valid_fuzzy_capture(capture)
+          && match_visible_segments(segments, segment_index + 1, text, next_index)
+        {
+          return true;
+        }
+      }
+      false
+    }
+  }
+}
+
+fn template_structure_matches(template: &str, server_plain: &str, markdown: bool) -> bool {
+  let Ok(segments) = visible_match_segments(template, markdown) else {
+    return false;
+  };
+  if segments.is_empty() {
+    return false;
+  }
+  let server = normalize_match_text(server_plain);
+  match_visible_segments(&segments, 0, &server, 0)
+}
+
+fn restore_template(
+  state: &TemplateState,
+  server_plain: &str,
+  start: &DateTime<Local>,
+  end: &DateTime<Local>,
+) -> Option<(String, TemplateRestore)> {
+  let locale = Locale::try_from(state.locale.as_str()).ok()?;
+  let current = render_template_message(&state.template, start, end, locale, state.markdown).ok()?;
+  if !current.templated {
+    return None;
+  }
+
+  let server = normalize_match_text(server_plain);
+  if normalize_match_text(&current.plain) == server {
+    return Some((state.template.clone(), TemplateRestore::Current));
+  }
+  if !state.last_rendered.trim().is_empty()
+    && normalize_match_text(&state.last_rendered) == server
+  {
+    return Some((state.template.clone(), TemplateRestore::Previous));
+  }
+  if template_structure_matches(&state.template, server_plain, state.markdown) {
+    return Some((state.template.clone(), TemplateRestore::Structure));
+  }
+  None
+}
+
+fn template_state_path(token_cache_path: &Path) -> PathBuf {
+  token_cache_path.with_file_name(OOO_TEMPLATE_STATE_FILE)
+}
+
+pub fn load_template_state(token_cache_path: &Path) -> std::io::Result<Option<TemplateState>> {
+  let path = template_state_path(token_cache_path);
+  let text = match std::fs::read_to_string(&path) {
+    Ok(text) => text,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error),
+  };
+
+  let value: serde_json::Value = serde_json::from_str(&text)
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+  let version = value.get("version").and_then(serde_json::Value::as_u64);
+  if version != Some(OOO_TEMPLATE_STATE_VERSION) {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "unsupported OOO template state version",
+    ));
+  }
+
+  let required_string = |key: &str| -> std::io::Result<String> {
+    value
+      .get(key)
+      .and_then(serde_json::Value::as_str)
+      .map(str::to_string)
+      .ok_or_else(|| {
+        std::io::Error::new(
+          std::io::ErrorKind::InvalidData,
+          format!("OOO template state is missing {key}"),
+        )
+      })
+  };
+
+  let template = required_string("template")?;
+  let locale = required_string("locale")?;
+  let last_rendered = required_string("last_rendered")?;
+  let markdown = value
+    .get("markdown")
+    .and_then(serde_json::Value::as_bool)
+    .ok_or_else(|| {
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "OOO template state is missing markdown",
+      )
+    })?;
+
+  let segments = parse_template(&template)
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+  if !template_has_slots(&segments) || Locale::try_from(locale.as_str()).is_err() {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "OOO template state contains an invalid template or locale",
+    ));
+  }
+
+  Ok(Some(TemplateState {
+    template,
+    locale,
+    markdown,
+    last_rendered,
+  }))
+}
+
+#[cfg(unix)]
+fn write_private_template_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+  use std::io::Write;
+  use std::os::unix::fs::OpenOptionsExt;
+
+  let mut file = std::fs::OpenOptions::new()
+    .create(true)
+    .truncate(true)
+    .write(true)
+    .mode(0o600)
+    .open(path)?;
+  file.write_all(bytes)?;
+  file.flush()
+}
+
+#[cfg(not(unix))]
+fn write_private_template_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+  use std::io::Write;
+
+  let mut file = std::fs::OpenOptions::new()
+    .create(true)
+    .truncate(true)
+    .write(true)
+    .open(path)?;
+  file.write_all(bytes)?;
+  file.flush()
+}
+
+pub fn persist_template_state(
+  token_cache_path: &Path,
+  state: Option<&TemplateState>,
+) -> std::io::Result<()> {
+  let path = template_state_path(token_cache_path);
+  let Some(state) = state else {
+    return match std::fs::remove_file(path) {
+      Ok(()) => Ok(()),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      Err(error) => Err(error),
+    };
+  };
+
+  let value = serde_json::json!({
+    "version": OOO_TEMPLATE_STATE_VERSION,
+    "template": state.template.as_str(),
+    "locale": state.locale.as_str(),
+    "markdown": state.markdown,
+    "last_rendered": state.last_rendered.as_str(),
+  });
+  let bytes = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+  let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+  write_private_template_file(&temp, &bytes)?;
+
+  #[cfg(unix)]
+  std::fs::rename(&temp, &path)?;
+
+  #[cfg(not(unix))]
+  {
+    if path.exists() {
+      std::fs::remove_file(&path)?;
+    }
+    std::fs::rename(&temp, &path)?;
+  }
+
+  Ok(())
+}
 
 pub const START_YEAR: usize = 0;
 pub const START_MONTH: usize = 1;
@@ -90,6 +606,7 @@ pub struct Editor {
   pub local_zone: String,
   pub mailbox_zone: Option<String>,
   pub stored_zone: Option<String>,
+  pub template_restore: TemplateRestore,
   replace_on_type: bool,
   original_plain: String,
   original_internal_html: Option<String>,
@@ -99,6 +616,13 @@ impl Editor {
   pub const FIELD_COUNT: usize = 12;
 
   pub fn from_settings(settings: &MailboxSettingsSnapshot) -> Self {
+    Self::from_settings_with_template(settings, None)
+  }
+
+  pub fn from_settings_with_template(
+    settings: &MailboxSettingsSnapshot,
+    template_state: Option<&TemplateState>,
+  ) -> Self {
     let setting = &settings.automatic_replies_setting;
     let (default_start, default_end) = default_range();
 
@@ -119,6 +643,12 @@ impl Editor {
       .map(html_to_plain)
       .unwrap_or_default();
 
+    let (message, template_restore) = template_state
+      .and_then(|state| restore_template(state, &original_plain, &start, &end))
+      .unwrap_or_else(|| {
+        (original_plain.clone(), TemplateRestore::None)
+      });
+
     Self {
       start_year: input(start.format("%Y")),
       start_month: input(start.format("%m")),
@@ -131,7 +661,7 @@ impl Editor {
       end_hour: input(end.format("%H")),
       end_minute: input(end.format("%M")),
       audience: audience_from_setting(setting),
-      message: TextInput::from(original_plain.as_str()),
+      message: TextInput::from(message.as_str()),
       field: START_YEAR,
       scroll: 0,
       validation_error: None,
@@ -141,6 +671,7 @@ impl Editor {
         .scheduled_start_date_time
         .as_ref()
         .and_then(|value| value.time_zone.clone()),
+      template_restore,
       replace_on_type: true,
       original_plain,
       original_internal_html,
@@ -297,7 +828,10 @@ impl Editor {
     start.offset().local_minus_utc() != end.offset().local_minus_utc()
   }
 
-  pub fn setting(&self, markdown: bool) -> Result<AutomaticRepliesSetting, String> {
+  pub fn prepare(
+    &self,
+    markdown: bool,
+  ) -> Result<PreparedOutOfOffice, String> {
     let start = self.start_local()?;
     let end = self.end_local()?;
     if end <= start {
@@ -309,23 +843,33 @@ impl Editor {
       return Err("OOO message cannot be empty".into());
     }
 
-    let html = if message == self.original_plain {
+    let (locale_name, locale) = current_locale();
+    let rendered = render_template_message(&message, &start, &end, locale, markdown)?;
+    let templated = rendered.templated;
+    let last_rendered = rendered.plain.clone();
+
+    let html = if !templated && message == self.original_plain {
       self.original_internal_html
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-          m365_core::teams_format::outgoing_body(&message, markdown).html_fragment()
-        })
+        .unwrap_or(rendered.html)
     } else {
-      m365_core::teams_format::outgoing_body(&message, markdown).html_fragment()
+      rendered.html
     };
+
+    let template_state = templated.then_some(TemplateState {
+      template: message,
+      locale: locale_name,
+      markdown,
+      last_rendered,
+    });
 
     let external = match self.audience {
       Audience::Internal => String::new(),
       Audience::All => html.clone(),
     };
 
-    Ok(AutomaticRepliesSetting {
+    let setting = AutomaticRepliesSetting {
       status: "scheduled".into(),
       external_audience: Some(
         match self.audience {
@@ -350,7 +894,16 @@ impl Editor {
       }),
       internal_reply_message: Some(html),
       external_reply_message: Some(external),
+    };
+
+    Ok(PreparedOutOfOffice {
+      setting,
+      template_state,
     })
+  }
+
+  pub fn setting(&self, markdown: bool) -> Result<AutomaticRepliesSetting, String> {
+    self.prepare(markdown).map(|prepared| prepared.setting)
   }
 
   fn leave_field(&mut self, delta: isize) {
@@ -837,6 +1390,136 @@ fn audience_from_setting(setting: &AutomaticRepliesSetting) -> Audience {
 fn html_to_plain(value: &str) -> String {
   let rendered = content::render_body(Some("html"), value);
   content::plain(&rendered.text).trim().to_string()
+}
+
+#[cfg(test)]
+mod template_tests {
+  use super::*;
+
+  fn local_datetime(year: i32, month: u32, day: u32) -> DateTime<Local> {
+    Local
+      .with_ymd_and_hms(year, month, day, 9, 0, 0)
+      .single()
+      .expect("test date must exist in local time")
+  }
+
+  fn template_state(template: &str, last_rendered: &str) -> TemplateState {
+    TemplateState {
+      template: template.into(),
+      locale: Locale::POSIX.to_string(),
+      markdown: false,
+      last_rendered: last_rendered.into(),
+    }
+  }
+
+  #[test]
+  fn expands_start_end_with_non_padded_dates() {
+    let start = local_datetime(2026, 10, 28);
+    let end = local_datetime(2026, 11, 1);
+    let rendered = render_template_message(
+      "Away {st %-d.%-m} - {end %-d.%-m}",
+      &start,
+      &end,
+      Locale::POSIX,
+      false,
+    )
+    .unwrap();
+    assert_eq!(rendered.plain, "Away 28.10 - 1.11");
+  }
+
+  #[test]
+  fn localized_textual_day_and_month_are_supported() {
+    let start = local_datetime(2026, 11, 13);
+    let end = local_datetime(2026, 11, 17);
+    let rendered = render_template_message(
+      "{st %A %-d. %B}",
+      &start,
+      &end,
+      Locale::cs_CZ,
+      false,
+    )
+    .unwrap();
+    assert!(rendered.plain.contains("13."));
+    assert!(!rendered.plain.contains("Friday"));
+    assert!(!rendered.plain.contains("November"));
+  }
+
+  #[test]
+  fn malformed_known_placeholder_is_rejected() {
+    let start = local_datetime(2026, 11, 13);
+    let end = local_datetime(2026, 11, 17);
+    assert!(render_template_message(
+      "Away until {end %Q}",
+      &start,
+      &end,
+      Locale::POSIX,
+      false,
+    )
+    .is_err());
+    assert!(render_template_message(
+      "Away until {end %d.%m",
+      &start,
+      &end,
+      Locale::POSIX,
+      false,
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn unrelated_braces_remain_literal() {
+    let start = local_datetime(2026, 11, 13);
+    let end = local_datetime(2026, 11, 17);
+    let rendered = render_template_message(
+      "Ticket {customer} until {end %-d.%-m}",
+      &start,
+      &end,
+      Locale::POSIX,
+      false,
+    )
+    .unwrap();
+    assert_eq!(rendered.plain, "Ticket {customer} until 17.11");
+  }
+
+  #[test]
+  fn restores_previous_render_after_schedule_only_change() {
+    let old_start = local_datetime(2026, 10, 28);
+    let old_end = local_datetime(2026, 11, 1);
+    let new_start = local_datetime(2026, 11, 13);
+    let new_end = local_datetime(2026, 11, 17);
+    let template = "Away {st %-d.%-m} - {end %-d.%-m} incl. Contact colleagues.";
+    let old = render_template_message(template, &old_start, &old_end, Locale::POSIX, false)
+      .unwrap()
+      .plain;
+    let state = template_state(template, &old);
+    let restored = restore_template(&state, &old, &new_start, &new_end).unwrap();
+    assert_eq!(restored.1, TemplateRestore::Previous);
+  }
+
+  #[test]
+  fn fuzzy_restore_accepts_changed_slot_values_but_not_changed_body() {
+    let start = local_datetime(2026, 11, 13);
+    let end = local_datetime(2026, 11, 17);
+    let template = "Hello, away {st %-d.%-m} - {end %-d.%-m} incl. Contact colleagues. Petr";
+    let state = template_state(template, "something deliberately different");
+
+    let restored = restore_template(
+      &state,
+      "Hello, away 28.10 - 1.11 incl. Contact colleagues. Petr",
+      &start,
+      &end,
+    )
+    .unwrap();
+    assert_eq!(restored.1, TemplateRestore::Structure);
+
+    assert!(restore_template(
+      &state,
+      "Hello, away 28.10 - 1.11 incl. Contact the manager. Petr",
+      &start,
+      &end,
+    )
+    .is_none());
+  }
 }
 
 #[cfg(test)]

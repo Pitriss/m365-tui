@@ -284,6 +284,9 @@ pub struct Config {
     pub client_state: String,
     /// Desktop notifications for direct messages and `@mentions`.
     pub notifications: bool,
+    /// Expose Outlook, Teams and Calendar desktop notifications under separate
+    /// application names. Off by default to preserve the historical identity.
+    pub notify_split_apps: bool,
     /// Forward notification events to ntfy.
     pub ntfy: NtfyMode,
     /// ntfy server root URL, e.g. https://ntfy.example.com.
@@ -478,6 +481,7 @@ impl Config {
             std::env::var("M365_NOTIFY").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         );
+        let notify_split_apps = env_flag("M365_NOTIFY_SPLIT_APPS");
         let ntfy = parse_ntfy_mode(std::env::var("M365_NTFY").ok().as_deref())?;
         let ntfy_server = std::env::var("M365_NTFY_SERVER")
             .ok()
@@ -529,6 +533,7 @@ impl Config {
             token_cache_path,
             client_state,
             notifications,
+            notify_split_apps,
             ntfy,
             ntfy_server,
             ntfy_topic,
@@ -934,6 +939,7 @@ mod tests {
             token_cache_path: PathBuf::from("/tmp/x.json"),
             client_state: "secret".into(),
             notifications: true,
+            notify_split_apps: false,
             ntfy: NtfyMode::Never,
             ntfy_server: None,
             ntfy_topic: None,

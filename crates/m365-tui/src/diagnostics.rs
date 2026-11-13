@@ -1052,6 +1052,14 @@ pub fn text(app: &App) -> String {
 
     out.push("Optional features".into());
     out.push(row(
+        "Desktop notify apps",
+        yes_no(
+            app.session.config.notify_split_apps,
+            "split by source",
+            "single m365-tui",
+        ),
+    ));
+    out.push(row(
         "Contact presence",
         yes_no(app.session.config.presence_read, "enabled", "disabled"),
     ));

@@ -1351,6 +1351,10 @@ pub struct App {
     pub help_scroll: u16,
     /// Largest useful Help scroll offset, set by the renderer after wrapping.
     pub help_max_scroll: std::cell::Cell<u16>,
+    /// Current vertical scroll offset of the read-only Out of Office overlay.
+    pub out_of_office_scroll: u16,
+    /// Largest useful read-only Out of Office scroll offset, set by the renderer.
+    pub out_of_office_max_scroll: std::cell::Cell<u16>,
     /// Read-only F6 diagnostics state.
     pub diagnostics: DiagnosticsState,
     /// Current vertical scroll offset of the diagnostics overlay.
@@ -2727,6 +2731,8 @@ impl App {
             outlook_message_list_offset: std::cell::Cell::new(0),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            out_of_office_scroll: 0,
+            out_of_office_max_scroll: std::cell::Cell::new(0),
             diagnostics: DiagnosticsState::default(),
             diagnostics_scroll: 0,
             diagnostics_max_scroll: std::cell::Cell::new(0),
@@ -6575,14 +6581,32 @@ impl App {
                 self.ntfy_working_now = Some(working);
             }
             AppMessage::OutOfOfficeLoaded { settings, edit } => {
-                self.status.clear();
-                self.overlay = Some(if edit {
-                    Overlay::OutOfOfficeEdit(Box::new(out_of_office::Editor::from_settings(
+                if edit {
+                    let template_state = match out_of_office::load_template_state(
+                        &self.session.config.token_cache_path,
+                    ) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            tracing::warn!("could not load OOO template state: {error}");
+                            None
+                        }
+                    };
+                    let editor = out_of_office::Editor::from_settings_with_template(
                         &settings,
-                    )))
+                        template_state.as_ref(),
+                    );
+                    self.status = editor
+                        .template_restore
+                        .status_message()
+                        .unwrap_or_default()
+                        .to_string();
+                    self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(editor)));
                 } else {
-                    Overlay::OutOfOffice(Box::new(out_of_office::View::from_settings(settings)))
-                });
+                    self.status.clear();
+                    self.overlay = Some(Overlay::OutOfOffice(Box::new(
+                        out_of_office::View::from_settings(settings),
+                    )));
+                }
             }
             AppMessage::OutOfOfficeSaved(status) => {
                 self.overlay = None;
@@ -7859,7 +7883,11 @@ impl App {
         priority: NotificationPriority,
     ) {
         if self.session.config.notifications {
-            crate::notify::send(&title, &body, priority);
+            let app_name = crate::notify::desktop_app_name(
+                category,
+                self.session.config.notify_split_apps,
+            );
+            crate::notify::send(&title, &body, priority, app_name);
         }
 
         if !self.ntfy_should_forward() {
@@ -8550,6 +8578,12 @@ impl App {
                         self.contact_diagnostics_scroll = move_scroll(
                             self.contact_diagnostics_scroll,
                             self.contact_diagnostics_max_scroll.get(),
+                        );
+                    }
+                    Some(Overlay::OutOfOffice(_)) => {
+                        self.out_of_office_scroll = move_scroll(
+                            self.out_of_office_scroll,
+                            self.out_of_office_max_scroll.get(),
                         );
                     }
                     _ => {}
@@ -9968,6 +10002,9 @@ impl App {
         if !self.out_of_office_ready() {
             return;
         }
+        if !edit {
+            self.out_of_office_scroll = 0;
+        }
         let s = self.session.clone();
         self.status = "loading Out of Office…".into();
         self.spawn(async move {
@@ -9983,7 +10020,7 @@ impl App {
             self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(editor)));
             return;
         }
-        let setting = match editor.setting(self.session.config.teams_markdown) {
+        let prepared = match editor.prepare(self.session.config.teams_markdown) {
             Ok(setting) => setting,
             Err(error) => {
                 self.status = error;
@@ -9995,12 +10032,22 @@ impl App {
         let s = self.session.clone();
         self.status = "saving Out of Office…".into();
         self.spawn(async move {
-            mailbox::set_automatic_replies(&s.graph, &setting)
+            mailbox::set_automatic_replies(&s.graph, &prepared.setting)
                 .await
                 .context("saving Out of Office settings")?;
-            Ok(AppMessage::OutOfOfficeSaved(
-                "Out of Office scheduled".into(),
-            ))
+
+            let status = match out_of_office::persist_template_state(
+                &s.config.token_cache_path,
+                prepared.template_state.as_ref(),
+            ) {
+                Ok(()) => "Out of Office scheduled".into(),
+                Err(error) => {
+                    tracing::warn!("Out of Office saved but template state update failed: {error}");
+                    "Out of Office scheduled; local template state could not be updated".into()
+                }
+            };
+
+            Ok(AppMessage::OutOfOfficeSaved(status))
         });
     }
 
@@ -10429,21 +10476,41 @@ impl App {
                 }
                 self.overlay = Some(Overlay::ContactProfile);
             }
-            Some(Overlay::OutOfOffice(view)) => match key.code {
-                KeyCode::Char('s') => {
-                    self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(
-                        out_of_office::Editor::from_settings(&view.settings),
-                    )));
+            Some(Overlay::OutOfOffice(view)) => {
+                let max = self.out_of_office_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.out_of_office_scroll = self.out_of_office_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.out_of_office_scroll =
+                            self.out_of_office_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        self.out_of_office_scroll =
+                            self.out_of_office_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.out_of_office_scroll =
+                            self.out_of_office_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.out_of_office_scroll = 0,
+                    KeyCode::End => self.out_of_office_scroll = max,
+                    KeyCode::Char('s') => {
+                        self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(
+                            out_of_office::Editor::from_settings(&view.settings),
+                        )));
+                        return;
+                    }
+                    KeyCode::Char('c') => {
+                        self.overlay = Some(Overlay::ConfirmOutOfOfficeClear);
+                        return;
+                    }
+                    KeyCode::Char('w') => self.open_out_of_office_web(),
+                    _ => {}
                 }
-                KeyCode::Char('c') => {
-                    self.overlay = Some(Overlay::ConfirmOutOfOfficeClear);
-                }
-                KeyCode::Char('w') => {
-                    self.open_out_of_office_web();
-                    self.overlay = Some(Overlay::OutOfOffice(view));
-                }
-                _ => self.overlay = Some(Overlay::OutOfOffice(view)),
-            },
+                self.overlay = Some(Overlay::OutOfOffice(view));
+            }
             Some(Overlay::ConfirmOutOfOfficeClear) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.clear_out_of_office(),
                 _ => self.status = "Out of Office clear cancelled".into(),

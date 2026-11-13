@@ -352,6 +352,7 @@ M365_CLIENT_ID=00000000-0000-0000-0000-000000000000
 | `M365_TEAMS_IMAGE_CACHE_DIR` | unset | Deprecated fallback for `M365_CACHE_DIR` |
 | `M365_GRAPH_BASE` | Microsoft Graph | Alternate Graph endpoint, mainly for testing |
 | `M365_NOTIFY` | enabled | Set to `0`, `false`, `no`, or `off` to disable desktop notifications |
+| `M365_NOTIFY_SPLIT_APPS` | disabled | Opt in to separate desktop app names for Outlook, Teams and Calendar notifications |
 | `M365_TEAMS_AUTOMATION_PEERS` | unset | Comma- or whitespace-separated one-to-one peer IDs whose Workflows `Post as User` messages should be treated as incoming automation events |
 | `M365_TEAMS_APPLICATION_HIGH_PRIORITY` | disabled | Give eligible Teams application/bot and configured automation-peer notifications desktop critical urgency and ntfy priority 4 |
 | `M365_NTFY` | `never` | ntfy forwarding mode: `never`, `always`, `away`, `alwayswd`, or `awaywd` |
@@ -1181,11 +1182,23 @@ Out of Office commands are account-global even though they are entered in the
 Teams composer. Enable them with `M365_OUT_OF_OFFICE=1`. `/ooo set` edits a
 scheduled start/end, `Internal` or `All` audience, and one message. The existing
 safe Markdown formatter is reused when `M365_TEAMS_MARKDOWN=1`; raw HTML remains
-escaped. Date/time input uses separate year/month/day/hour/minute fields. Each segment is
+escaped.
+
+The message can use `{st FORMAT}` and `{end FORMAT}` placeholders. `FORMAT`
+uses chrono/strftime syntax, for example `{st %-d.%-m}`, `{end %A %-d. %B %Y}`,
+or `{st %F %R}`. Textual weekday/month names follow `LC_ALL`, `LC_TIME`, then
+`LANG`. Only the expanded message is sent to Graph. The local template is stored
+as `ooo-template.json` beside the token cache and is restored on later edits
+when the server message still corresponds to it, including a schedule-only
+change that left the previously rendered dates in the message. A real external
+message-text change takes precedence over the local template.
+
+Date/time input uses separate year/month/day/hour/minute fields. Each segment is
 validated as focus leaves it, complete timestamps are checked for local DST
 gaps/overlaps, and the effective abbreviation/UTC offset is shown for both
-endpoints. Graph stores the validated instants as UTC. The read-only
-OOO view also offers `w` to open Outlook Web automatic-reply settings.
+endpoints. Graph stores the validated instants as UTC. The read-only `/ooo`
+view scrolls with the mouse wheel, `j`/`k`, arrows, `PageUp`/`PageDown`, and
+`Home`/`End`; `w` opens Outlook Web automatic-reply settings.
 
 ### Calendar agenda
 
@@ -1704,6 +1717,25 @@ Disable desktop notifications globally with:
 ```dotenv
 M365_NOTIFY=0
 ```
+
+By default all desktop notifications keep the historical application name
+`m365-tui`. To expose notification sources separately to the desktop
+notification daemon, opt in with:
+
+```dotenv
+M365_NOTIFY_SPLIT_APPS=1
+```
+
+This changes only the desktop notification application name:
+
+```text
+Outlook m365-tui
+Teams m365-tui
+Calendar m365-tui
+```
+
+It does not change notification eligibility, urgency, icons, ntfy routing, or
+ntfy tags. Leaving the option unset preserves the existing behaviour.
 
 m365-tui can send desktop notifications for:
 

@@ -86,11 +86,28 @@ fn body_mentions_name(body_html: &str, my_name: &str) -> bool {
     false
 }
 
+/// Application name exposed to the desktop notification daemon.
+///
+/// Keep the historical single application identity unless the split mode is
+/// explicitly enabled. Unknown categories deliberately fall back to m365-tui.
+pub fn desktop_app_name(category: &str, split_apps: bool) -> &'static str {
+    if !split_apps {
+        return "m365-tui";
+    }
+
+    match category {
+        "Mail" => "Outlook m365-tui",
+        "Teams" => "Teams m365-tui",
+        "Calendar" => "Calendar m365-tui",
+        _ => "m365-tui",
+    }
+}
+
 /// Raise a desktop notification, falling back to the terminal bell.
-pub fn send(title: &str, body: &str, priority: NotificationPriority) {
+pub fn send(title: &str, body: &str, priority: NotificationPriority, app_name: &str) {
     let body = summarise(body);
     let mut command = Command::new("notify-send");
-    command.args(["--app-name=m365-tui", "--icon=mail-message-new"]);
+    command.args(["--app-name", app_name, "--icon", "mail-message-new"]);
     if priority == NotificationPriority::High {
         command.arg("--urgency=critical");
     }
@@ -180,6 +197,17 @@ mod tests {
     fn maps_notification_priority_to_ntfy_priority() {
         assert_eq!(NotificationPriority::Normal.ntfy_priority(), None);
         assert_eq!(NotificationPriority::High.ntfy_priority(), Some(4));
+    }
+
+    #[test]
+    fn desktop_app_names_preserve_default_and_split_known_sources() {
+        assert_eq!(desktop_app_name("Mail", false), "m365-tui");
+        assert_eq!(desktop_app_name("Teams", false), "m365-tui");
+        assert_eq!(desktop_app_name("Calendar", false), "m365-tui");
+        assert_eq!(desktop_app_name("Mail", true), "Outlook m365-tui");
+        assert_eq!(desktop_app_name("Teams", true), "Teams m365-tui");
+        assert_eq!(desktop_app_name("Calendar", true), "Calendar m365-tui");
+        assert_eq!(desktop_app_name("Other", true), "m365-tui");
     }
 
     #[test]
