@@ -10497,9 +10497,7 @@ impl App {
                     KeyCode::Home => self.out_of_office_scroll = 0,
                     KeyCode::End => self.out_of_office_scroll = max,
                     KeyCode::Char('s') => {
-                        self.overlay = Some(Overlay::OutOfOfficeEdit(Box::new(
-                            out_of_office::Editor::from_settings(&view.settings),
-                        )));
+                        self.load_out_of_office(true);
                         return;
                     }
                     KeyCode::Char('c') => {
